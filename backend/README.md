@@ -9,9 +9,9 @@ Linux backend service на C++20. Процесс работает без Electro
 snapshot, затем сборка и отладчик работают только с этим snapshot и артефактом.
 Пути ограничены workspace, команды компилятора запускаются без shell, а stdout,
 stderr, JSON, страницы переменных, память и история имеют явные лимиты.
-Аргументы inferior проходят проверку границ MI, а POSIX-окружение задаётся
-самой отлаживаемой программе после запуска GDB; `PATH`/`LD_*` из запроса не
-меняют процесс отладчика.
+Аргументы inferior проходят проверку границ MI. Wrapper применяет POSIX-окружение
+непосредственно перед `exec` отлаживаемой программы; `PATH`/`LD_*`/`BASH_ENV`
+из запроса не меняют GDB, его стартовую оболочку или загрузку самого wrapper.
 
 ## Сборка и проверки
 
@@ -26,11 +26,28 @@ ctest --preset linux-debug
 ./out/linux-debug/phantom-backend --self-check
 ```
 
-CTest включает CLI doctor, SHA-256, process/MI parser, strict DTO validation,
-bounded NDJSON transport и headless service integration. Последний тест компилирует небольшую C++20
-программу, запускает её через настоящий GDB и проверяет порядок событий,
-source identity, UTF-16 location, step, variables, history, stop, target-only
-environment и same-packet control для долгого continue.
+CTest включает CLI, SHA-256, process/MI parser, DTO validation, NDJSON transport
+и интеграционные сценарии с настоящим GDB: шаги, история, отмена, смерть
+отладчика, таймауты, бинарные управляющие байты stdin и раздельный вывод.
+Если доступен `tsc`, реальные кадры также проверяются по frontend TypeScript
+DTO; для этой проверки Electron и React не нужны. См.
+[frontend-compatibility.md](docs/frontend-compatibility.md).
+
+Отдельная сборка с AddressSanitizer и UndefinedBehaviorSanitizer (из `backend`):
+
+```bash
+cmake -S . -B out/linux-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+cmake --build out/linux-asan -j2
+ctest --test-dir out/linux-asan --output-on-failure
+```
+
+Санитайзеры проверяют service, engine, wrapper и тестовые executable. Только
+отлаживаемая fixture собирается без них: LeakSanitizer не работает под ptrace
+и меняет её stderr/код завершения. Пользовательские программы в интеграционных
+тестах также собираются обычным compiler-профилем.
 
 Для ручного запуска:
 
@@ -50,15 +67,21 @@ protocol capabilities.
   (`over/into/out/instruction`) и immutable in-memory history работают через
   GDB/MI. Location — zero-width span в начале подтверждённой строки: GDB обычно
   не даёт колонку.
-- `inputTracking` равно `transport-only`. Inferior получает отдельный PTY, а MI
+- `inputTracking` равно `transport-only`. Inferior получает stdin, stdout и
+  stderr через отдельный доверенный `phantom-io-wrapper` и приватные FIFO; MI
   pipe никогда не доступен пользовательской программе. Submitted input
-  сохраняет точный текст и ID, а принятые PTY bytes получают deterministic EOF;
+  сохраняет точный текст и ID, а доставленные bytes получают deterministic EOF;
   backend не выдаёт запись bytes за доказательство успешного C++ extraction.
-  Канонический PTY ограничивает каждую строку системным `MAX_CANON` (на
-  текущем Linux обычно 255 bytes); такой ввод отклоняется до запуска. Ввод с
-  PTY EOF control byte также отклоняется, чтобы не потерять байт молча.
-  PTY объединяет stdout/stderr, поэтому stderr snapshot пока пуст и отдельный
-  stream capture будет отдельным transport-профилем.
+  У pipe нет терминального `MAX_CANON`: NUL, Ctrl-D, CR/LF и длинные строки
+  передаются без редактирования. v1 принимает UTF-8 текст до 1 MiB, а не
+  произвольный массив невалидных UTF-8 байтов.
+  stdout и stderr сохраняются раздельно: до 1 MiB исходных байтов на поток с
+  `retainedFromByte` и `truncated`. В текстовом DTO невалидные байты вывода
+  заменяются U+FFFD; счётчики сохраняют размеры исходного потока.
+  На остановке сохраняется весь уже ожидающий хвост, включая увеличенные FIFO.
+- MI обрабатывается потоково: потреблённые ответы GDB не накапливаются за всё
+  время сессии. Лимит отдельной записи и ограниченные порции чтения сохраняют
+  границы памяти и возможность вовремя обработать timeout/cancel.
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
   expression traces, source disassembly и verified restore выключены и отвечают
   `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес
@@ -67,9 +90,11 @@ protocol capabilities.
   выдаются за типизированный результат. Оптимизированные/неизвестные значения
   сохраняют явную причину неполноты.
 
-После EOF transport отменяет активную операцию, дренирует уже принятую очередь
-и только затем освобождает GDB/process group. Отмена и stop не оставляют
-принадлежащих сессии дочерних процессов.
+После EOF transport отменяет активную операцию и отклоняет ещё не начатые
+build/launch/execution команды. Ответы на принятые запросы чтения дренируются.
+GDB и непосредственно отлаживаемый процесс освобождаются, в том числе после
+аварии GDB (pidfd и parent-death signal). Изоляция произвольно демонизирующихся
+потомков требует отдельного supervisor/cgroup-профиля; backend не является sandbox.
 
 ## Структура
 
@@ -79,11 +104,15 @@ protocol capabilities.
 | `src/validation.cpp` | pre-DOM bounds, duplicate keys, UTF-8/UTF-16 и DTO validation |
 | `src/process.cpp` | shell-free fork/exec, pipes, deadlines, process groups, SIGPIPE safety |
 | `src/mi.cpp` | strict reusable GDB/MI records и line buffering |
-| `src/gdb.cpp` | GDB/MI adapter, source mapping, stack/variables/memory/asm |
+| `src/gdb.cpp` | GDB/MI adapter, pipe capture, source mapping, stack/variables/memory/asm |
+| `src/io_wrapper.cpp` | shell-free inferior fd wrapper for separate binary streams |
 | `src/service.cpp` | build identity, lifecycle, events, history и capability gate |
 | `src/sha256.cpp` | dependency-free SHA-256 для source/artifact identity |
 | `tests/service_integration.py` | headless real-debugger acceptance path |
 | `tests/transport_test.py` | bounded NDJSON framing, EOF and signal cleanup |
+| `tests/io_integration.py` | exact stdin, stream limits, invalid UTF-8, early close |
+| `tests/lifecycle_integration.py` | control races, state after debugger failure |
+| `tests/frontend_contract_test.py` | real wire traffic checked by TypeScript |
 
 Главный план, DTO semantics, recorder/instrumentation research и P0–P10 остаются
 в [BACKEND_HANDOFF.md](../docs/BACKEND_HANDOFF.md). Документ проверки контрактов
@@ -92,10 +121,10 @@ Linux toolchain и результаты rr probe сохранены в `.phantom
 
 ## Следующие backend-профили
 
-Следующий transport-профиль может заменить PTY на доверенный pipe-wrapper: это
-даст раздельные stdout/stderr, произвольные бинарные bytes и half-close без
-канонического лимита строки. Он должен быть отдельным capability-gated режимом,
-а текущий merged PTY нельзя выдавать за него.
+Транспорт inferior уже использует доверенный pipe-wrapper. Wrapper не принимает
+команды от target: он только открывает одноразовые FIFO, делает `dup2` на fd
+0/1/2 и выполняет target напрямую. Если helper недоступен, запуск завершается
+явной `LAUNCH_FAILED`, а backend не подменяет семантику pipe старым merged PTY.
 
 После этого можно добавлять rr только с manifest артефакта, проверкой PMU/ptrace
 ограничений и явным `REPLAY_DIVERGED`; отсутствие rr не должно маскироваться

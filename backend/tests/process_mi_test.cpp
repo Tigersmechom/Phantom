@@ -200,9 +200,53 @@ void test_process() {
   }
   if (base_fd >= 0) ::close(base_fd);
 }
+
+void test_streaming_process() {
+  // MI is a long-lived stream: successfully consumed bytes must not exhaust
+  // a lifetime output limit. Drain more than the old 4 MiB GDB limit on both
+  // streams, while checking the amount allocated by each individual poll.
+  auto options = shell("dd if=/dev/zero bs=8192 count=768 2>/dev/null & "
+                       "dd if=/dev/zero bs=8192 count=768 >&2 2>/dev/null; wait", 16384);
+  options.capture_output = false;
+  auto original = Process::spawn(options);
+  auto stream = std::move(original);
+  std::size_t out_bytes = 0, err_bytes = 0;
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  for (;;) {
+    assert(std::chrono::steady_clock::now() < deadline);
+    const auto part = stream.poll(5ms);
+    assert(part.out.size() <= 64 * 1024 && part.err.size() <= 64 * 1024);
+    assert(part.out.find_first_not_of('\0') == std::string::npos);
+    assert(part.err.find_first_not_of('\0') == std::string::npos);
+    out_bytes += part.out.size(); err_bytes += part.err.size();
+    if (part.exit) {
+      assert(part.stdout_eof && part.stderr_eof && part.exit->exit_code == 0);
+      break;
+    }
+  }
+  assert(out_bytes == 6 * 1024 * 1024 && err_bytes == 6 * 1024 * 1024);
+  const auto final = stream.wait(deadline);
+  assert(final.out.empty() && final.err.empty() && final.exit->exit_code == 0);
+
+  // A continuously writable stream must return control so deadlines and
+  // cancellation can be handled, even with no cumulative byte cap.
+  options = shell("exec yes streaming");
+  options.capture_output = false;
+  auto noisy = Process::spawn(options);
+  const auto start = std::chrono::steady_clock::now();
+  const auto part = noisy.poll(50ms);
+  assert(!part.out.empty() && part.out.size() <= 64 * 1024);
+  assert(std::chrono::steady_clock::now() - start < 1s);
+  std::stop_source cancellation;
+  cancellation.request_stop();
+  bool cancelled = false;
+  try { (void)noisy.poll(50ms, cancellation.get_token()); }
+  catch (const ProcessError& error) { cancelled = error.code() == ProcessErrorCode::cancelled; }
+  assert(cancelled);
+}
 }  // namespace
 
 int main() {
-  test_mi(); test_process();
+  test_mi(); test_process(); test_streaming_process();
   std::cout << "process/MI tests passed\n";
 }

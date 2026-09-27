@@ -27,6 +27,12 @@ beside the request queue. If a control line races dequeue of its target, the
 adapter waits for the active operation hand-off and carries an early interrupt
 across the GDB/MI command write. This prevents a same-packet control from
 being lost when `resume` is about to start.
+Controls check workspace, session and any `expectedStop` before signalling.
+When several controls target the same operation, precedence is
+`stop > cancel > pause`: a later pause cannot erase a confirmed cancellation.
+An applied control is acknowledged once even when its own effect has already
+changed the current stop. EOF cancels active work and prevents queued build,
+launch or execution requests from starting a new process.
 
 ## Runtime invariants
 
@@ -47,10 +53,11 @@ budgets. Unknown fields in requests/commands and scalar DTOs are errors.
 
 Inferior argument strings cannot contain NUL or a physical line break because
 they are serialized into one GDB/MI command. Environment names use the POSIX
-`[A-Za-z_][A-Za-z0-9_]*` form and values reject NUL. The environment is applied
-to the inferior through GDB before `-exec-run`; it is not used to alter the
-debugger process itself (so a target `PATH` or `LD_*` value cannot change GDB
-lookup/loading).
+`[A-Za-z_][A-Za-z0-9_]*` form and values reject NUL. The environment is stored
+in a private NUL-delimited manifest and applied by the wrapper immediately
+before target exec. A target `PATH`, `LD_*`, `SHELL` or `BASH_ENV` value cannot
+change GDB, its startup shell or wrapper loading. Leading/trailing whitespace,
+quotes and newlines in environment values are preserved literally.
 
 Source ranges use zero-based UTF-16 code-unit offsets and one-based UTF-16 line
 and column coordinates. Conversion helpers reject byte offsets inside a UTF-8
@@ -63,16 +70,35 @@ duplicate active IDs and dependency cycles. A range/document revision mismatch
 is invalid. The validator checks shape and evidence fields; it does not invent
 debugger observations or source locations.
 
-The current Linux GDB adapter gives the inferior a private canonical PTY.
-Submitted input is written once followed by two deterministic terminal VEOF
-markers (the first flushes an unterminated line; the second makes the next read
-observe EOF) and is reported as `transport-only`; the byte count is not
-presented as proof that `cin` or a raw read consumed it. The adapter rejects the
-PTY's EOF control byte and lines longer than the host's `MAX_CANON`, so a writer
-cannot block forever on a line the inferior cannot receive. PTY output is
-bounded and retained as stdout, while stdout and stderr are intentionally merged
-by this profile. A separate stream capture must be capability-gated rather than
-silently inferred from the merged bytes.
+The current Linux GDB adapter gives the inferior fd 0/1/2 through a trusted
+`phantom-io-wrapper` and private one-shot FIFOs. Submitted input is written
+once and the backend closes the write side after the exact bytes are delivered;
+it is reported as `transport-only`, and the byte count is not presented as proof
+that `cin` or a raw read consumed it. NUL bytes, unterminated input and long
+lines are ordinary pipe data subject only to the DTO input budget. stdout and
+stderr are drained independently, each with its own bounded retained snapshot
+and truncation metadata. If the helper is unavailable, launch fails closed
+instead of silently falling back to a merged PTY profile.
+
+The ready handshake keeps the parent stdin writer open until the wrapper has
+opened its reader, including for empty input. It then removes the bootstrap
+reader so a target `close(0)` produces EPIPE. The owning command loop pumps at
+most 64 KiB per stream per turn; a continuous stdout writer cannot starve MI,
+stderr or cancellation. At a stop, `FIONREAD` fixes the queued output budget
+so an enlarged FIFO's final tail is captured without waiting for all writers
+to close. A closed writer delivers real pipe EOF. See the
+[Linux FIFO semantics](https://man7.org/linux/man-pages/man7/fifo.7.html) and
+[pipe EOF/SIGPIPE rules](https://man7.org/linux/man-pages/man7/pipe.7.html).
+
+Each output stream retains up to 1 MiB of raw bytes by default (independent of
+the 16 MiB input wire-frame budget). `text` replaces each invalid UTF-8 byte
+with U+FFFD, including a partial codepoint at a retained-tail boundary; byte
+counts and truncation offsets remain raw stream offsets. Protocol v1 input
+remains UTF-8 text, with embedded NUL/control characters permitted.
+
+GDB requires shell quoting of the wrapper paths; the helper executes the target
+directly after redirecting descriptors. This follows the documented
+[GDB exec-wrapper lifecycle](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
 
 ## Compatibility extensions kept out of v1
 

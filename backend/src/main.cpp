@@ -130,8 +130,19 @@ int stdio_mode(std::filesystem::path workspace) {
     std::cerr << "Cannot configure nonblocking stdio transport.\n";
     return 1;
   }
-  phantom::BackendService service({std::move(workspace), {}, PHANTOM_BACKEND_VERSION, {}});
+  std::filesystem::path ioWrapper;
+  std::error_code executableError;
+  const auto executable = std::filesystem::read_symlink("/proc/self/exe", executableError);
+  if (!executableError) ioWrapper = executable.parent_path() / "phantom-io-wrapper";
+  phantom::BackendService service({std::move(workspace), {}, PHANTOM_BACKEND_VERSION, {}, std::move(ioWrapper)});
   Queue queue;
+  std::atomic<std::size_t> pendingFrames{0};
+  const auto enqueue = [&](Frame frame) {
+    pendingFrames.fetch_add(1);
+    if (queue.push(std::move(frame))) return true;
+    pendingFrames.fetch_sub(1);
+    return false;
+  };
   std::atomic<bool> outputFailed{false};
   auto writeFrames = [&](const std::vector<Json>& frames) {
     for (const auto& frame : frames) {
@@ -158,6 +169,10 @@ int stdio_mode(std::filesystem::path workspace) {
     while (!caughtSignal && !outputFailed.load()) {
       auto incoming = queue.pop();
       if (!incoming || caughtSignal) break;
+      struct PendingFrame {
+        std::atomic<std::size_t>& count;
+        ~PendingFrame() { count.fetch_sub(1); }
+      } pending{pendingFrames};
       try {
         if (incoming->oversized) {
           if (!writeFrames({wireError("LIMIT_EXCEEDED", "NDJSON frame exceeds 16 MiB")})) break;
@@ -250,13 +265,15 @@ int stdio_mode(std::filesystem::path workspace) {
               const auto kind = candidate.at("command").value("kind", "");
               if (kind == "cancel" || kind == "pause" || kind == "stop") {
                 phantom::validate_request(candidate);
-                (void)service.control(candidate);
+                // With no earlier frame in flight there is no dequeue race.
+                // A standalone pause/stop can go straight to the worker.
+                (void)service.control(candidate, pendingFrames.load() != 0);
               }
             }
           } catch (...) {
             // The worker owns the canonical validation/error response.
           }
-          if (!queue.push({std::move(buffer), false})) break;
+          if (!enqueue({std::move(buffer), false})) break;
         }
         buffer.clear();
         discarding = false;
@@ -266,7 +283,7 @@ int stdio_mode(std::filesystem::path workspace) {
           // valid JSON suffix in this same physical line must never execute.
           discarding = true;
           buffer.clear();
-          if (!queue.push({{}, true})) break;
+          if (!enqueue({{}, true})) break;
         } else {
           buffer.push_back(ch);
         }
@@ -278,7 +295,7 @@ int stdio_mode(std::filesystem::path workspace) {
   // debugger operation and drains already accepted frames in order; a signal
   // or I/O failure additionally drops queued work.
   if (eof && !discarding && !buffer.empty() && !caughtSignal && !outputFailed.load())
-    (void)queue.push({std::move(buffer), false});
+    (void)enqueue({std::move(buffer), false});
   const bool abort = caughtSignal || inputFailed || outputFailed.load();
   if (eof && !abort) service.interrupt(2);
   queue.close(abort);

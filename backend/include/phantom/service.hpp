@@ -20,6 +20,7 @@ struct ServiceOptions {
   std::filesystem::path buildDirectory;
   std::string backendVersion = "0.1.0";
   ValidationLimits limits{};
+  std::filesystem::path ioWrapper;
 };
 
 // The service is intentionally transport-agnostic. One caller owns the
@@ -38,7 +39,7 @@ class BackendService final {
   std::vector<Json> request(const Json& request, FrameSink publish = {});
   // The transport may submit a validated control request while the worker is
   // executing. Context and target matching happen before any signal is sent.
-  bool control(const Json& request);
+  bool control(const Json& request, bool waitForActive = true);
   // May be called by the transport reader while the serialized worker is in
   // a long-running GDB command. It never waits for the service mutex; when a
   // control frame races dequeue of its target, it waits briefly on the
@@ -67,8 +68,9 @@ class BackendService final {
   std::filesystem::path safePath(const std::string& supplied, bool allowMissing) const;
   void appendHistory(const Json& observation, const Json& state);
   void clearActive(std::string_view requestId) noexcept;
-  std::string activeInterruption(std::string_view requestId) const;
+  std::string activeInterruption(std::string_view requestId);
   void publishFailedState(std::vector<Json>& frames, const Json& request);
+  std::vector<Json> engineError(const Json& request, const GdbError& error);
   void emitCommandFinished(std::vector<Json>& frames, const Json& request,
                            std::string_view outcome,
                            std::optional<Json> error = std::nullopt);
@@ -85,6 +87,7 @@ class BackendService final {
     std::stop_source stop;
     std::string interruption;
     bool ready = false;
+    Json expectedStop = nullptr;
   };
   std::optional<ActiveRequest> active_;
   std::map<std::string, Json> appliedControls_;

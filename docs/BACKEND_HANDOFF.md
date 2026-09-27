@@ -2,7 +2,7 @@
 
 Дата актуализации: **27 сентября 2026**. Этот документ — основной вход для отдельного backend-агента и полный реестр согласованных направлений phantom. Приоритет — необычный, глубокий **однопоточный** учебный debugger: история исполнения, вычисления, время жизни объектов, запросы к прошлому, replay/what-if и память. CF/stress-инфраструктура, специальные графовые представления, широкая многопоточность и обучение модели русского языка остаются в программе, но выполняются позже.
 
-Основной backend: **отдельный процесс на Linux, C++20**, Clang/clangd, адаптер rr/GDB; нативный LLDB — дополнительный адаптер macOS. Существующие React/TypeScript, Electron и Three.js сохраняются. Разработка интерфейса на Mac не требует переезда всей рабочей системы на Linux. Развёртывание описывает [`docs/LINUX_BACKEND.md` в ветке `backend/linux`](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md), состояние standalone-каркаса и команды сборки — [`backend/README.md` в той же ветке](https://github.com/Tigersmechom/Phantom/blob/backend/linux/backend/README.md). Эти файлы доступны локально после checkout `backend/linux`; в `main` их может не быть. Наличие каркаса не означает, что recorder или debugger уже реализованы.
+Основной backend: **отдельный процесс на Linux, C++20**, Clang/clangd, адаптер rr/GDB; нативный LLDB — дополнительный адаптер macOS. Существующие React/TypeScript, Electron и Three.js можно использовать выборочно: backend не зависит от текущей реализации интерфейса. Разработка интерфейса на Mac не требует переезда всей рабочей системы на Linux. Развёртывание описывает [`docs/LINUX_BACKEND.md` в ветке `backend/linux`](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md), состояние service и команды сборки — [`backend/README.md` в той же ветке](https://github.com/Tigersmechom/Phantom/blob/backend/linux/backend/README.md). Эти файлы доступны локально после checkout `backend/linux`; в `main` их может не быть. Текущий GDB engine не означает готовность recorder rr или подключение UI.
 
 Версия существующих DTO: **1**, [`src/backend-contract.ts`](../src/backend-contract.ts). Это **контракт будущей интеграции**, а не уже подключённый backend или новый доступный `window` API. Разделы 3–8 сохраняют точные инварианты v1; последующие разделы определяют программу и предлагаемые расширения. Пока изменение не внесено в DTO, runtime-валидаторы и fixtures, оно не является новым wire API. Использовать совместимую часть v1 независимо; необходимые общие изменения выносить отдельным patch с причиной, продолжая работу без ожидания необязательного подтверждения.
 
@@ -40,7 +40,23 @@ phantom — Electron-приложение с React/TypeScript и отдельн�
 | Наблюдение значений/выражений в UI | Сейчас готовые demo-данные, анимации, история, позиции камеры; это не наблюдения процесса |
 | Hover ASM и breakpoint в редакторе | Демонстрация; настоящий ASM и остановки ещё не подключены |
 
-Для ветки `backend/linux` отдельно подготовлен **каркас**, а не engine: standalone C++20 CLI `--version`/`--self-check`, CMake presets и smoke test. Он сообщает `scaffold-only`, отсутствие реализации протокола и выключенные capabilities. Проверенная локальная сборка на Mac не является проверкой Linux rr; fixture для reverse smoke тоже не заменяет recorder integration. Фактические команды/проверки этой ветки приведены в её `backend/README.md`.
+В ветке `backend/linux` реализован самостоятельный **C++20 service с GDB/MI**:
+сборка неизменяемого snapshot исходников, запуск, шаги, breakpoints, стек/значения,
+чтение памяти/ASM, ограниченная история наблюдений и replay транспортных событий.
+Это реальные наблюдения процесса; recorder rr и trace выражений ещё не подключены.
+`--self-check` сообщает `ready` и `v1-stdio-ndjson`; работоспособность engine
+проверяют интеграционные тесты с GDB, а не сам статус CLI.
+
+Текущий checkpoint закрывает три задачи: устойчивость lifecycle/отмены и очистку
+после сбоев; отдельный pipe-wrapper для точного stdin → EOF и независимых stdout/
+stderr; проверку реальных wire DTO против frontend `5630853`. Покрыты таймаут,
+смерть GDB, отключение клиента, управляющие команды в одном пакете с исполнением,
+длинный ввод, управляющие байты, усечение потоков и невалидный UTF-8 вывода.
+Frontend целиком переносить не требуется; адаптер приложения и native bridge
+остаются отдельной работой. Подробности и воспроизводимые команды:
+[backend/README.md](../backend/README.md) и
+[frontend-compatibility.md](../backend/docs/frontend-compatibility.md).
+Этот checkpoint не означает завершение всей программы P0–P10 ниже.
 
 Сохраняем бренд **phantom**, но не переименовываем совместимые внутренние `window.frameNative`, `FRAME_*` и `.frame/build.json`. Старый профиль FRAME переносится в phantom без перезаписи имеющихся настроек. Не ломать защиту close/reload, сохранение флагов перед сборкой и изоляцию IPC.
 

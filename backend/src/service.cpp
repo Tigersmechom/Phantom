@@ -46,7 +46,8 @@ BackendService::BackendService(ServiceOptions options) : options_(std::move(opti
   options_.buildDirectory = std::filesystem::weakly_canonical(options_.buildDirectory);
   std::filesystem::create_directories(options_.buildDirectory);
   GdbOptions gdbOptions;
-  gdbOptions.maxOutputBytes = options_.limits.maxWireBytes;
+  gdbOptions.execWrapper = options_.ioWrapper;
+  gdbOptions.maxOutputBytes = std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16);
   gdbOptions.maxVariablesPerPage = options_.limits.maxPageSize;
   gdbOptions.maxMemoryReadBytes = options_.limits.maxMemoryReadBytes;
   gdbOptions.maxInstructions = options_.limits.maxInstructions;
@@ -63,21 +64,34 @@ void BackendService::clearActive(std::string_view requestId) noexcept {
   controlWake_.notify_all();
 }
 
-std::string BackendService::activeInterruption(std::string_view requestId) const {
+std::string BackendService::activeInterruption(std::string_view requestId) {
   std::lock_guard lock(controlMutex_);
-  return active_ && active_->id == requestId ? active_->interruption : std::string{};
+  if (!active_ || active_->id != requestId) return {};
+  // Close the control handoff before publishing the final checkpoint. A
+  // control that arrives later must execute against that checkpoint itself.
+  active_->ready = false;
+  engine_->clearInterrupt();
+  return active_->interruption;
 }
 
 void BackendService::publishFailedState(std::vector<Json>& frames, const Json& request) {
   // A fatal GDB/MI failure closes the owned debugger. Do not leave the last
   // stopped snapshot looking live after the process has already disappeared.
   if (engine_->live()) return;
-  if (liveState_.is_object()) {
+  if (liveState_.is_object() && liveState_.value("phase", "") != "failed" &&
+      liveState_.value("phase", "") != "terminated") {
     liveState_["phase"] = "failed";
     liveState_["live"] = nullptr;
     liveState_["exit"] = nullptr;
     frames.push_back(event({{"kind", "state"}, {"state", liveState_}}, processInstanceId_, string_at(request, "requestId")));
   }
+}
+
+std::vector<Json> BackendService::engineError(const Json& request, const GdbError& error) {
+  std::vector<Json> frames{errorResponse(request, error.code.empty() ? "INTERNAL" : error.code,
+                                        error.message, error.retryable)};
+  publishFailedState(frames, request);
+  return frames;
 }
 
 Json BackendService::capabilities() const {
@@ -90,7 +104,7 @@ Json BackendService::capabilities() const {
       {"inputTracking", "transport-only"}, {"expressionGroups", false}, {"history", true},
       {"restore", "none"}, {"asm", {{"currentPc", true}, {"sourceRange", false}}},
       {"memoryRead", true}, {"eventReplay", true},
-      {"limits", {{"maxOutputBytes", options_.limits.maxWireBytes},
+      {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
                    {"maxResidentSnapshots", 4096},
                    {"maxVariablesPerPage", options_.limits.maxPageSize},
@@ -121,7 +135,7 @@ Json BackendService::event(const Json& payload, std::optional<std::string> proce
                            std::optional<std::string> causedBy) {
   Json frame = {{"protocolVersion", 1}, {"workspace", workspace_},
                 {"session", sessionId_.empty() ? Json(nullptr) : Json{{"id", sessionId_}, {"generation", sessionGeneration_}}},
-                {"processInstanceId", process ? Json(*process) : Json(nullptr)}, {"sequence", ++sequence_},
+                {"processInstanceId", process && !process->empty() ? Json(*process) : Json(nullptr)}, {"sequence", ++sequence_},
                 {"payload", payload}};
   if (causedBy) frame["causedByRequestId"] = *causedBy;
   const auto frameBytes = frame.dump().size();
@@ -165,8 +179,8 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
     if (stop.input.is_object()) for (auto it = stop.input.begin(); it != stop.input.end(); ++it) input[it.key()] = it.value();
     observation["input"] = std::move(input);
   }
-  if (!observation.contains("stdout")) observation["stdout"] = stop.stdoutSnapshot.is_object() ? stop.stdoutSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
-  if (!observation.contains("stderr")) observation["stderr"] = stop.stderrSnapshot.is_object() ? stop.stderrSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
+  if (!observation.contains("stdout")) observation["stdout"] = stop.stdoutSnapshot.is_object() && stop.stdoutSnapshot.contains("text") ? stop.stdoutSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
+  if (!observation.contains("stderr")) observation["stderr"] = stop.stderrSnapshot.is_object() && stop.stderrSnapshot.contains("text") ? stop.stderrSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
   if (!observation.contains("expressions")) observation["expressions"] = Json::array();
   if (!observation.contains("coverage")) observation["coverage"] = {{"variables", "partial"}, {"expressions", "none"}, {"memory", "none"}};
   return observation;
@@ -224,6 +238,16 @@ std::filesystem::path BackendService::safePath(const std::string& supplied, bool
 }
 
 Json BackendService::handleBuild(const Json& request) {
+  std::stop_token cancellation;
+  {
+    std::lock_guard controlLock(controlMutex_);
+    if (active_ && active_->id == string_at(request, "requestId")) {
+      active_->ready = true;
+      cancellation = active_->stop.get_token();
+    }
+  }
+  controlWake_.notify_all();
+  if (cancellation.stop_requested()) throw ProcessError(ProcessErrorCode::cancelled, "build cancelled");
   const auto& command = request.at("command");
   const auto& source = command.at("source");
   const auto& config = command.at("configuration");
@@ -274,9 +298,10 @@ Json BackendService::handleBuild(const Json& request) {
   std::vector<std::string> argv{compiler}; argv.insert(argv.end(), flags.begin(), flags.end());
   for (const auto& translationUnit : translationUnits) argv.push_back(translationUnit.string());
   argv.push_back("-o"); argv.push_back(binary.string());
+  if (cancellation.stop_requested()) throw ProcessError(ProcessErrorCode::cancelled, "build cancelled");
   Process process = Process::spawn({argv, options_.workspace.string(), {}, true, options_.limits.maxWireBytes});
   process.close_stdin();
-  const auto result = process.wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(120000));
+  const auto result = process.wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(120000), cancellation);
   const bool success = result.exit && result.exit->exit_code == 0 && std::filesystem::is_regular_file(binary);
   Json artifact = nullptr;
   if (success) {
@@ -285,8 +310,9 @@ Json BackendService::handleBuild(const Json& request) {
     Json compilerInfo = {{"path", compiler}, {"version", "unknown"}};
     try {
       Process version = Process::spawn({{compiler, "--version"}, options_.workspace.string(), {}, true, 65536}); version.close_stdin();
-      const auto v = version.wait(std::chrono::steady_clock::now() + std::chrono::seconds(5)); compilerInfo["version"] = first_line(v.out);
+      const auto v = version.wait(std::chrono::steady_clock::now() + std::chrono::seconds(5), cancellation); compilerInfo["version"] = first_line(v.out);
     } catch (...) { /* Build success is still useful; capability reports unknown version. */ }
+    if (cancellation.stop_requested()) throw ProcessError(ProcessErrorCode::cancelled, "build cancelled");
     const auto id = sha256_hex(stamp + binaryHash + json_text(config));
     artifact = {{"id", id}, {"sourceBundleId", bundleId}, {"configurationRevisionId", config.at("revisionId")},
                 {"architecture", architecture}, {"targetTriple", "x86_64-pc-linux-gnu"}, {"compiler", compilerInfo},
@@ -312,18 +338,35 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   for (const auto& arg : command.at("argv")) launch.argv.push_back(arg.get<std::string>());
   for (auto it = command.at("environment").begin(); it != command.at("environment").end(); ++it) launch.environment.emplace_back(it.key(), it.value().get<std::string>());
   launch.input = command.at("input").at("text").get<std::string>();
-  submittedInputId_ = command.at("input").at("id").get<std::string>();
-  submittedInput_ = launch.input;
   launch.sourceBundle.id = string_at(artifact_->dto, "sourceBundleId");
   for (const auto& document : artifact_->source.at("documents")) {
     launch.sourceBundle.documents.push_back({document.at("documentId"), document.at("revisionId"),
                                              safePath(document.at("path"), true), document.at("text")});
   }
-  GdbError error; GdbStop stop;
-  if (!engine_->launch(launch, stop, error)) {
-    const auto code = (error.code.empty() || error.code == "READ_FAILED") ? "LAUNCH_FAILED" : error.code;
-    frames.push_back(errorResponse(request, code, error.message, error.retryable)); return frames;
+  std::stop_token cancellation;
+  {
+    std::lock_guard controlLock(controlMutex_);
+    if (active_ && active_->id == string_at(request, "requestId")) {
+      active_->ready = true;
+      cancellation = active_->stop.get_token();
+    }
   }
+  controlWake_.notify_all();
+  GdbError error; GdbStop stop;
+  const bool launched = engine_->launch(launch, stop, error, cancellation);
+  const auto interruption = activeInterruption(string_at(request, "requestId"));
+  if (launched && !interruption.empty()) {
+    engine_->stop();
+    error = {"CANCELLED", "launch interrupted before it was accepted", true};
+  }
+  if (!launched || !interruption.empty()) {
+    const auto code = (error.code.empty() || error.code == "READ_FAILED") ? "LAUNCH_FAILED" : error.code;
+    frames.push_back(errorResponse(request, code, error.message, error.retryable));
+    publishFailedState(frames, request);
+    return frames;
+  }
+  submittedInputId_ = command.at("input").at("id").get<std::string>();
+  submittedInput_ = launch.input;
   if (stop.exited) engine_->stop();
   // Sequence and history ordinals belong to a session generation. A fresh
   // launch must not replay frames or expose points from the previous run.
@@ -346,6 +389,7 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   std::vector<Json> frames;
   const auto accepted = okResponse(request, {{"kind", "accepted"}});
   if (publish) publish(accepted); else frames.push_back(accepted);
+  try {
   std::string interruption;
   {
     std::lock_guard controlLock(controlMutex_);
@@ -358,8 +402,19 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
     }
   }
   controlWake_.notify_all();
-  if (kind == "stop") { engine_->interrupt(2); engine_->stop(); }
   GdbError error; GdbStop stop;
+  if (kind == "stop") {
+    stop = engine_->stopAndSnapshot();
+    stop.exited = true;
+    stop.processInstanceId = processInstanceId_;
+  }
+  // All execution requests are serialized. If pause reaches this path the
+  // inferior is already stopped; an asynchronous interrupt would have no new
+  // stop record to wait for and would incorrectly time out.
+  if (kind == "pause" && liveState_.value("phase", "") == "stopped") {
+    emitCommandFinished(frames, request, "completed");
+    return frames;
+  }
   if (kind == "pause" && !engine_->pause(stop, error)) {
     interruption = activeInterruption(string_at(request, "requestId"));
     publishFailedState(frames, request);
@@ -369,8 +424,8 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   if (kind != "stop" && kind != "pause" && !engine_->resume(kind == "step" ? request.at("command").at("stepKind").get<std::string>() : "continue", stop, error)) {
     interruption = activeInterruption(string_at(request, "requestId"));
     if (interruption == "stop") {
-      engine_->stop();
-      stop = GdbStop{}; stop.exited = true; stop.processInstanceId = processInstanceId_; stop.reason = "stop";
+      stop = engine_->stopAndSnapshot();
+      stop.exited = true; stop.processInstanceId = processInstanceId_; stop.reason = "stop";
       auto observation = makeObservation(stop, "exit");
       auto state = makeState(observation, "terminated"); appendHistory(observation, state);
       frames.push_back(event({{"kind", "observation"}, {"observation", observation}}, processInstanceId_, string_at(request, "requestId")));
@@ -383,8 +438,12 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
     emitCommandFinished(frames, request, "failed", err); return frames;
   }
   interruption = activeInterruption(string_at(request, "requestId"));
+  if (interruption == "stop" && !stop.exited) {
+    stop = engine_->stopAndSnapshot();
+    stop.exited = true;
+    stop.processInstanceId = processInstanceId_;
+  }
   if (stop.exited) engine_->stop();
-  if (kind == "stop" || kind == "pause") { stop = GdbStop{}; stop.exited = kind == "stop"; stop.processInstanceId = processInstanceId_; stop.reason = kind; }
   const auto reason = stop.exited ? "exit" :
       (interruption == "pause" || kind == "pause" ? "pause" :
        stop.reason == "breakpoint-hit" ? "breakpoint" :
@@ -396,6 +455,16 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   frames.push_back(event({{"kind", "observation"}, {"observation", observation}}, processInstanceId_, string_at(request, "requestId")));
   frames.push_back(event({{"kind", "state"}, {"state", state}}, processInstanceId_, string_at(request, "requestId")));
   emitCommandFinished(frames, request, interruption == "cancel" ? "cancelled" : "completed"); return frames;
+  } catch (const std::exception& error) {
+    // Acceptance has already been published. An unexpected adapter error
+    // must finish that command, never produce a contradictory second reply.
+    engine_->stop();
+    (void)activeInterruption(string_at(request, "requestId"));
+    publishFailedState(frames, request);
+    emitCommandFinished(frames, request, "failed",
+                        Json{{"code", "INTERNAL"}, {"message", error.what()}, {"retryable", true}});
+    return frames;
+  }
 }
 
 Json BackendService::handleHistory(const Json& request) {
@@ -444,19 +513,6 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         (sessionId_.empty() || request.at("session").at("id").get<std::string>() != sessionId_ ||
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
-    const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" ||
-                             kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
-                             kind == "setBreakpoints" || kind == "writeVariable";
-    if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
-      return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
-    if (liveCommand && !engine_->live())
-      return {errorResponse(request, "STALE_CONTEXT", "the session has no live inferior", false)};
-    if (request.contains("expectedStop")) {
-      const auto& expected = request.at("expectedStop");
-      const bool matches = liveObservation_.is_object() && liveObservation_.contains("stop") &&
-                           liveObservation_.at("stop") == expected;
-      if (!matches) return {errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false)};
-    }
     // pause/stop/cancel may already have interrupted the active GDB command
     // on the transport reader thread. Their queued protocol frame is an
     // acknowledgement, not a second debugger operation; issuing another
@@ -465,7 +521,11 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       bool wasApplied = false;
       {
         std::lock_guard controlLock(controlMutex_);
-        wasApplied = appliedControls_.erase(string_at(request, "requestId")) != 0;
+        const auto applied = appliedControls_.find(string_at(request, "requestId"));
+        if (applied != appliedControls_.end() && applied->second == request) {
+          wasApplied = true;
+          appliedControls_.erase(applied);
+        }
       }
       if (wasApplied) {
         std::vector<Json> frames{okResponse(request, {{"kind", "accepted"}})};
@@ -473,13 +533,31 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         return frames;
       }
     }
-    const bool longOperation = kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
+    if (shuttingDown_.load() && (kind == "build" || kind == "launch" || kind == "step" ||
+                                 kind == "continue" || kind == "pause" || kind == "stop"))
+      return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
+    const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" ||
+                             kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
+                             kind == "setBreakpoints" || kind == "writeVariable";
+    if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
+      return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
+    if (liveCommand && !engine_->live())
+      return engineError(request, {"STALE_CONTEXT", "the session has no live inferior", false});
+    if (request.contains("expectedStop")) {
+      const auto& expected = request.at("expectedStop");
+      const bool matches = liveObservation_.is_object() && liveObservation_.contains("stop") &&
+                           liveObservation_.at("stop") == expected;
+      if (!matches) return {errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false)};
+    }
+    const bool longOperation = kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
     std::optional<std::string> activeId;
     if (longOperation) {
       const auto requestId = string_at(request, "requestId");
       {
         std::lock_guard controlLock(controlMutex_);
-        active_ = ActiveRequest{requestId, request.at("workspace"), request.at("session"), kind, {}, {}};
+        active_ = ActiveRequest{requestId, request.at("workspace"), request.at("session"), kind, {}, {}, false,
+                                liveObservation_.is_object() ? liveObservation_.value("stop", Json(nullptr)) : Json(nullptr)};
+        if (shuttingDown_.load()) active_->stop.request_stop();
       }
       controlWake_.notify_all();
       activeId = requestId;
@@ -488,11 +566,30 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       if (activeId) clearActive(*activeId);
     }};
     if (kind == "capabilities") return {okResponse(request, {{"kind", "capabilities"}, {"capabilities", capabilities()}})};
-    if (kind == "getState") return {okResponse(request, {{"kind", "state"}, {"state", liveState_}, {"observation", liveObservation_}, {"throughSequence", sequence_}})};
+    if (kind == "getState") {
+      // v1's state result describes an assigned session and is non-null.
+      // Before the first launch, connect supplies the nullable checkpoint.
+      if (liveState_.is_null())
+        return {errorResponse(request, "STALE_CONTEXT", "no debugging session has been established", false)};
+      return {okResponse(request, {{"kind", "state"}, {"state", liveState_}, {"observation", liveObservation_}, {"throughSequence", sequence_}})};
+    }
     if (kind == "build") {
       if (engine_->live())
         return {errorResponse(request, "STALE_CONTEXT", "stop the current inferior before replacing its build artifact", false)};
-      try { return {handleBuild(request)}; }
+      try {
+        auto response = handleBuild(request);
+        if (activeInterruption(string_at(request, "requestId")) == "cancel") {
+          artifact_.reset();
+          return {errorResponse(request, "CANCELLED", "build cancelled", false)};
+        }
+        return {std::move(response)};
+      }
+      catch (const ProcessError& error) {
+        artifact_.reset();
+        const auto code = error.code() == ProcessErrorCode::cancelled ? "CANCELLED" :
+                          error.code() == ProcessErrorCode::timeout ? "TIMEOUT" : "BUILD_FAILED";
+        return {errorResponse(request, code, error.what(), false)};
+      }
       catch (const std::exception& e) { artifact_.reset(); return {errorResponse(request, "BUILD_FAILED", e.what(), false)}; }
     }
     if (kind == "launch") return handleLaunch(request, publish);
@@ -519,17 +616,17 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
           return {errorResponse(request, "STALE_CONTEXT", "breakpoint range identity does not match the command document", false)};
       }
       Json result; GdbError error;
-      if (!engine_->setBreakpoints(command, result, error)) return {errorResponse(request, error.code, error.message, error.retryable)};
+      if (!engine_->setBreakpoints(command, result, error)) return engineError(request, error);
       return {okResponse(request, {{"kind", "breakpoints"}, {"breakpoints", result}})};
     }
-    if (kind == "readVariables") { Json result; GdbError error; const auto& c=request.at("command"); if (!engine_->readVariables(c.at("reference").get<std::string>(), c.at("start").get<std::size_t>(), c.at("count").get<std::size_t>(), result, error)) return {errorResponse(request,error.code,error.message,error.retryable)}; result["kind"] = "variables"; return {okResponse(request, std::move(result))}; }
-    if (kind == "readMemory") { Json result; GdbError error; const auto& c=request.at("command"); if (!engine_->readMemory(c.at("addressHex").get<std::string>(), c.at("byteCount").get<std::size_t>(), result, error)) return {errorResponse(request,error.code,error.message,error.retryable)}; result["kind"] = "memory"; return {okResponse(request,std::move(result))}; }
+    if (kind == "readVariables") { Json result; GdbError error; const auto& c=request.at("command"); if (!engine_->readVariables(c.at("reference").get<std::string>(), c.at("start").get<std::size_t>(), c.at("count").get<std::size_t>(), result, error)) return engineError(request, error); result["kind"] = "variables"; return {okResponse(request, std::move(result))}; }
+    if (kind == "readMemory") { Json result; GdbError error; const auto& c=request.at("command"); if (!engine_->readMemory(c.at("addressHex").get<std::string>(), c.at("byteCount").get<std::size_t>(), result, error)) return engineError(request, error); result["kind"] = "memory"; return {okResponse(request,std::move(result))}; }
     if (kind == "disassemble") {
       Json result; GdbError error; const auto& c = request.at("command");
       if (!artifact_ || c.at("buildId").get<std::string>() != string_at(artifact_->dto, "id"))
         return {errorResponse(request, "STALE_CONTEXT", "disassembly artifact is not the current build", false)};
       if (c.at("target").at("kind") != "pc") return {errorResponse(request,"UNSUPPORTED","source disassembly requires DWARF line mapping",false)};
-      if (!engine_->disassemble(c.at("target").at("addressHex").get<std::string>(),c.at("maxInstructions").get<std::size_t>(),result,error)) return {errorResponse(request,error.code,error.message,error.retryable)};
+      if (!engine_->disassemble(c.at("target").at("addressHex").get<std::string>(),c.at("maxInstructions").get<std::size_t>(),result,error)) return engineError(request, error);
       result["kind"] = "asm"; result["architecture"] = "x86_64"; return {okResponse(request,std::move(result))};
     }
     if (kind == "writeVariable") return {errorResponse(request, "UNSUPPORTED", "variable writes are disabled until typed readback and audit are implemented", false)};
@@ -537,29 +634,38 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       return {errorResponse(request, "STALE_CONTEXT", "cancel target is no longer active", false)};
     }
     return {errorResponse(request, "UNSUPPORTED", "command is not implemented", false)};
-  } catch (const std::exception& e) { return {errorResponse(request, "INTERNAL", e.what(), false)}; }
+  } catch (const std::exception& e) { return engineError(request, {"INTERNAL", e.what(), false}); }
 }
 
-bool BackendService::control(const Json& request) {
+bool BackendService::control(const Json& request, bool waitForActive) {
   try { validate_request(request, options_.limits); } catch (...) { return false; }
   const auto kind = request.at("command").at("kind").get<std::string>();
   if (kind != "pause" && kind != "stop" && kind != "cancel") return false;
   const auto requestId = string_at(request, "requestId");
   std::unique_lock controlLock(controlMutex_);
   // The reader can see a control line before the worker has popped the
-  // preceding execution line from its bounded queue. A non-null session is
-  // enough to identify this as a live-operation control; wait only for the
-  // short dequeue hand-off and never take the service's long-held mutex.
-  if ((!active_ || !active_->ready) && !request.at("session").is_null())
+  // preceding execution line from its bounded queue. This includes a cancel
+  // for an initial launch whose session is still null. Wait only for the
+  // short dequeue handoff and never take the service's long-held mutex.
+  if (waitForActive && (!active_ || !active_->ready))
     controlWake_.wait_for(controlLock, std::chrono::seconds(2), [this] {
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
-  if (!active_ || (!request.at("session").is_null() && !active_->ready)) return false;
+  if (!active_ || !active_->ready) return false;
+  if (active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue") return false;
+  if (active_->kind == "build" && kind != "cancel") return false;
+  if (active_->kind == "launch" && kind == "pause") return false;
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session) return false;
   if (kind == "cancel" && request.at("command").at("targetRequestId") != active_->id) return false;
+  if (request.contains("expectedStop") && request.at("expectedStop") != active_->expectedStop) return false;
   appliedControls_.insert_or_assign(requestId, request);
-  active_->interruption = kind;
-  engine_->interrupt(kind == "stop" ? 2 : 1);
+  // Termination dominates cancellation, which dominates pause. A later
+  // pause must not erase a cancellation that was already applied.
+  if (kind == "stop" || active_->interruption.empty() ||
+      (kind == "cancel" && active_->interruption == "pause"))
+    active_->interruption = kind;
+  if (active_->kind == "launch" || active_->kind == "build") active_->stop.request_stop();
+  if (active_->kind != "build") engine_->interrupt(kind == "stop" || active_->kind == "launch" ? 2 : 1);
   return true;
 }
 
@@ -576,6 +682,12 @@ void BackendService::dispose() noexcept {
   connected_ = false; sessionId_.clear(); processInstanceId_.clear();
 }
 void BackendService::interrupt(int mode) noexcept {
+  if (mode >= 2) shuttingDown_.store(true);
+  {
+    std::lock_guard lock(controlMutex_);
+    if (active_ && (active_->kind == "launch" || active_->kind == "build")) active_->stop.request_stop();
+  }
+  controlWake_.notify_all();
   if (engine_) engine_->interrupt(mode);
 }
 } // namespace phantom

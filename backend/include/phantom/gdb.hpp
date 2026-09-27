@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,8 +32,10 @@ struct GdbSourceBundle {
 
 struct GdbOptions {
   std::string gdbPath = "gdb";
-  // Reserved for a future alternate file-capture transport. The current
-  // adapter leaves this unset and uses a dedicated PTY for the inferior.
+  // Trusted helper used to connect the inferior's fd 0/1/2 to bounded pipes.
+  // The backend executable supplies this helper next to itself. An empty or
+  // inaccessible path fails launch explicitly instead of falling back to a
+  // merged PTY with different stdin/stream semantics.
   std::filesystem::path execWrapper;
   std::filesystem::path workingDirectory;
   std::size_t maxOutputBytes = 4u * 1024u * 1024u;
@@ -84,7 +87,7 @@ class GdbEngine {
   GdbEngine& operator=(const GdbEngine&) = delete;
 
   bool launch(const GdbLaunchRequest& request, GdbStop& result,
-              GdbError& error);
+              GdbError& error, std::stop_token cancellation = {});
   bool resume(std::string_view stepKind, GdbStop& result, GdbError& error);
   bool pause(GdbStop& result, GdbError& error);
 
@@ -92,7 +95,11 @@ class GdbEngine {
   // boundary; interrupt(2) also terminates the inferior.  It is safe to call
   // this from a control thread while launch/resume is running.
   void interrupt(int mode = 1) noexcept;
+  // Owning worker only, after the service seals the active command.
+  void clearInterrupt() noexcept;
   void stop() noexcept;
+  // Terminate and preserve the final transport snapshot before closing pipes.
+  GdbStop stopAndSnapshot();
   bool live() const noexcept;
   std::optional<int> gdbPid() const noexcept;
 

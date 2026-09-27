@@ -22,6 +22,12 @@ def fail(message: str, value=None) -> None:
     raise AssertionError(message)
 
 
+def require_keys(value: dict, expected: set[str], label: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        fail(f"{label} keys do not match frontend DTO", {"expected": sorted(expected), "actual": sorted(actual)})
+
+
 class Client:
     def __init__(self, executable: str, workspace: Path) -> None:
         self.process = subprocess.Popen(
@@ -81,7 +87,22 @@ def main() -> int:
             connect = client.send({"kind": "connect", "supportedProtocolVersions": [1]})
             if not connect.get("ok"):
                 fail("connect failed", connect)
+            require_keys(
+                connect,
+                {"kind", "ok", "protocolVersion", "workspace", "session", "state", "observation", "capabilities", "throughSequence"},
+                "connectResult",
+            )
             caps = connect.get("capabilities", {})
+            require_keys(
+                caps,
+                {
+                    "protocolVersion", "backendName", "backendVersion", "architectures", "stepKinds",
+                    "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
+                    "inputTracking", "expressionGroups", "history", "restore", "asm", "memoryRead",
+                    "eventReplay", "limits",
+                },
+                "BackendCapabilitiesDTO",
+            )
             if caps.get("backendName") != "phantom-linux":
                 fail("unexpected backend capability identity", caps)
             if caps.get("sourceBreakpoints") is not True:
@@ -92,6 +113,10 @@ def main() -> int:
                 "workspace": {"id": "workspace-local", "revisionId": "workspace-0"},
                 "session": None,
             }
+            no_session = client.send({**common, "requestId": "state-before-launch",
+                                      "command": {"kind": "getState"}})
+            if no_session.get("ok") or no_session.get("error", {}).get("code") != "STALE_CONTEXT":
+                fail("getState before launch must return a v1 error instead of a null state result", no_session)
             source_text = (
                 "int add(int a, int b) { return a + b; }\n"
                 "int main() {\n"
@@ -160,6 +185,18 @@ def main() -> int:
             ]:
                 fail("launch event sequence is incomplete", event_frames)
             observation = event_frames[0]["payload"]["observation"]
+            require_keys(
+                observation,
+                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage"},
+                "StopObservationDTO",
+            )
+            require_keys(event_frames[1]["payload"]["state"], {"session", "phase", "processInstanceId", "buildId", "live", "exit"}, "DebugSessionStateDTO")
+            require_keys(
+                event_frames[2]["payload"],
+                {"kind", "requestId", "outcome"},
+                "CommandFinishedEventDTO",
+            )
+            require_keys(event_frames[0], {"protocolVersion", "workspace", "session", "processInstanceId", "sequence", "payload", "causedByRequestId"}, "BackendEventDTO")
             if observation["sourceBundleId"] != "source-1":
                 fail("source identity was not preserved", observation)
             location = observation.get("location")
@@ -349,14 +386,15 @@ def main() -> int:
                 fail("loop cleanup stop was not accepted", loop_stop)
             [client.recv() for _ in range(3)]
 
-            # A second session exercises the fixed-input PTY.  The current
-            # transport promises bytes written to the PTY, not extraction
-            # events, but it must still preserve output and EOF determinism.
+            # A second session exercises the binary pipe transport. The
+            # backend promises bytes written to stdin, not extraction events,
+            # and keeps stdout/stderr as separate bounded snapshots.
             io_text = (
                 "#include <iostream>\n"
                 "#include <cstdlib>\n"
                 "int main() { int value = 0; std::cin >> value; const char* tag = std::getenv(\"PHANTOM_ENV\"); "
-                "std::cout << value + 1 << \":\" << (tag ? tag : \"missing\") << \"\\n\"; }\n"
+                "std::cout << value + 1 << \":\" << (tag ? tag : \"missing\") << \"\\n\"; "
+                "std::cerr << \"diagnostic\\n\"; }\n"
             )
             io_document = {**document, "text": io_text, "sha256": hashlib.sha256(io_text.encode()).hexdigest()}
             io_build = client.send(
@@ -380,9 +418,8 @@ def main() -> int:
                     "command": {
                         "kind": "launch",
                         "buildId": io_build["result"]["artifact"]["id"],
-                        # No trailing newline exercises canonical-PTY EOF: the
-                        # feeder must send the two VEOF markers needed to flush
-                        # the final line and make the next read observe EOF.
+                        # No trailing newline is valid pipe input. The feeder
+                        # closes stdin after the exact bytes are delivered.
                         "input": {"id": "input-io", "text": "41", "encoding": "utf-8", "closeAfterWrite": True},
                         "argv": [],
                         # PATH is intentionally target-only: GDB must still
@@ -398,7 +435,7 @@ def main() -> int:
                 fail("new session did not reset its event sequence", io_events)
             io_observation = io_events[0]["payload"]["observation"]
             if io_observation["input"]["tracking"] != "transport-only" or io_observation["input"]["deliveredBytes"] != 2:
-                fail("PTY input accounting is incorrect", io_observation["input"])
+                fail("pipe input accounting is incorrect", io_observation["input"])
             io_continue = client.send(
                 {
                     **common,
@@ -413,16 +450,18 @@ def main() -> int:
             io_exit_events = [client.recv() for _ in range(3)]
             io_exit = io_exit_events[0]["payload"]["observation"]
             if io_exit["reason"] != "exit" or io_exit["stdout"]["text"] != "42:hello world\n":
-                fail("PTY output/EOF result is incorrect", io_exit)
+                fail("pipe output/EOF result is incorrect", io_exit)
+            if io_exit["stderr"]["text"] != "diagnostic\n":
+                fail("stdout and stderr were not captured separately", io_exit)
             if "exited" in io_exit or "exitCode" in io_exit:
                 fail("internal GDB stop fields leaked into the v1 observation DTO", io_exit)
             io_exit_state = io_exit_events[1]["payload"]["state"]
             if io_exit_state.get("phase") != "terminated" or io_exit_state.get("live") is not None or set(io_exit_state.get("exit", {})) != {"code", "signal"}:
                 fail("terminated state did not expose an exit record", io_exit_state)
 
-            # A canonical PTY has a finite line queue.  Rejecting an
-            # overlong line before starting GDB is preferable to blocking a
-            # writer forever while the inferior waits for a line delimiter.
+            # Pipes have no terminal MAX_CANON line limit. A long payload is
+            # accepted, delivered byte-for-byte, and still gets deterministic
+            # EOF after the entry stop.
             too_long = client.send(
                 {
                     **common,
@@ -437,8 +476,12 @@ def main() -> int:
                     },
                 }
             )
-            if too_long.get("ok") or too_long.get("error", {}).get("code") != "LIMIT_EXCEEDED":
-                fail("overlong canonical PTY input was not rejected", too_long)
+            if not too_long.get("ok"):
+                fail("overlong pipe input was rejected", too_long)
+            too_long_events = [client.recv() for _ in range(3)]
+            too_long_observation = too_long_events[0]["payload"]["observation"]
+            if too_long_observation["input"]["deliveredBytes"] != 4096:
+                fail("long pipe input was not fully delivered", too_long_observation["input"])
         finally:
             client.close()
     return 0

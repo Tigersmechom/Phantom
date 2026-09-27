@@ -36,6 +36,10 @@ struct ProcessOptions {
   std::vector<std::pair<std::string, std::string>> environment;
   bool inherit_environment = true;
   std::size_t max_output_bytes = 4 * 1024 * 1024;
+  // Capture mode retains output for wait() up to max_output_bytes in total.
+  // Streaming mode returns bytes only through poll(), without a lifetime
+  // cap or retention. Each poll reads at most 64 KiB per stream in either mode.
+  bool capture_output = true;
 };
 
 struct ProcessExit {
@@ -71,8 +75,9 @@ class Process final {
   void write(std::string_view data, Deadline deadline = Deadline::max(),
              std::stop_token stop = {});
   void close_stdin() noexcept;
-  // poll returns newly-read bytes. Output is retained internally so wait()
-  // returns the complete bounded output, including bytes seen by poll().
+  // poll returns newly-read bytes. In capture mode wait() includes bytes
+  // already seen by poll(); in streaming mode wait() discards further output
+  // and returns only completion status, without replaying consumed bytes.
   ProcessOutput poll(std::chrono::milliseconds wait = std::chrono::milliseconds(0),
                      std::stop_token stop = {});
   ProcessOutput wait(Deadline deadline = Deadline::max(), std::stop_token stop = {});
@@ -81,7 +86,7 @@ class Process final {
 
  private:
   explicit Process(int pid, int stdin_fd, int stdout_fd, int stderr_fd,
-                   std::size_t max_output_bytes);
+                   std::size_t max_output_bytes, bool capture_output);
   void close_fds() noexcept;
   void reap(bool block) noexcept;
   ProcessOutput drain(bool wait_for_io, std::chrono::milliseconds wait,
@@ -96,6 +101,7 @@ class Process final {
   int stderr_fd_ = -1;
   std::size_t max_output_bytes_ = 0;
   std::size_t output_bytes_ = 0;
+  bool capture_output_ = true;
   std::string captured_out_;
   std::string captured_err_;
   bool stdout_eof_ = false;

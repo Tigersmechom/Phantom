@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
+#include <fstream>
+#include <pthread.h>
 #include <fcntl.h>
 #include <iomanip>
 #include <limits>
@@ -19,6 +22,9 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <thread>
 #include <termios.h>
 #include <unistd.h>
@@ -108,6 +114,29 @@ bool safeMiArgument(std::string_view value) {
 }
 std::string valText(const MiValue* v) { return v ? v->text : std::string{}; }
 
+// OutputSnapshotDTO carries Unicode text, while the inferior may write any
+// bytes. Keep byte counters in the raw domain and replace malformed UTF-8
+// deterministically (including a codepoint cut by the retained tail boundary).
+std::string displayUtf8(std::string_view bytes) {
+  std::string text;
+  text.reserve(bytes.size());
+  for (std::size_t i = 0; i < bytes.size();) {
+    const auto c = static_cast<unsigned char>(bytes[i]);
+    const std::size_t width = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 :
+        c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    bool valid = width != 0 && width <= bytes.size() - i;
+    for (std::size_t n = 1; valid && n < width; ++n) {
+      const auto next = static_cast<unsigned char>(bytes[i + n]);
+      valid = next >= 0x80 && next <= 0xbf;
+      if (n == 1 && ((c == 0xe0 && next < 0xa0) || (c == 0xed && next >= 0xa0) ||
+                    (c == 0xf0 && next < 0x90) || (c == 0xf4 && next >= 0x90))) valid = false;
+    }
+    if (valid) { text.append(bytes.substr(i, width)); i += width; }
+    else { text += "\xef\xbf\xbd"; ++i; }
+  }
+  return text;
+}
+
 std::string base64(std::string_view bytes) {
   static constexpr char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -164,17 +193,32 @@ struct GdbEngine::Impl {
   mutable std::mutex processMutex;
   std::atomic<int> control{0};
   std::atomic<bool> live{false};
-  int nextToken = 1;
+  std::stop_token launchCancellation;
+  int inferiorPidFd = -1;
+  std::uint64_t nextToken = 1;
   std::string lines;
   std::filesystem::path tempDir;
   int ptyMaster = -1;
   int ptySlave = -1;
   std::filesystem::path ptyPath;
-  std::string ptyOutput;
-  std::size_t ptyTotalBytes = 0;
-  std::size_t ptyMaxCanonical = 4095;
-  std::atomic<std::size_t> deliveredInputBytes{0};
-  std::jthread inputFeeder;
+  std::filesystem::path stdinFifo;
+  std::filesystem::path stdoutFifo;
+  std::filesystem::path stderrFifo;
+  std::filesystem::path readyFifo;
+  int stdinFd = -1;
+  int stdinKeepFd = -1;
+  int stdoutFd = -1;
+  int stderrFd = -1;
+  int readyFd = -1;
+  int stdoutKeepFd = -1;
+  int stderrKeepFd = -1;
+  std::string stdoutOutput;
+  std::string stderrOutput;
+  std::size_t stdoutTotalBytes = 0;
+  std::size_t stderrTotalBytes = 0;
+  std::size_t deliveredInputBytes = 0;
+  std::string pendingInput;
+  bool wrapperReady = false;
   GdbSourceBundle sourceBundle;
   std::string inferiorPid;
   struct BreakpointEntry { std::string documentId; std::string number; };
@@ -186,14 +230,24 @@ struct GdbEngine::Impl {
     e = GdbError{std::move(code), std::move(msg), retry};
   }
   void failClosed(GdbError& e, std::string code, std::string message, bool retry = true) {
+    std::lock_guard lock(processMutex);
     if (process) process->terminate();
     process.reset();
+    killInferior();
     live = false;
     breakpoints.clear();
     cleanupTemp();
     setError(e, std::move(code), std::move(message), retry);
   }
-  bool prepareTemp(const std::string& input, GdbError& e) {
+  void killInferior() noexcept {
+    // A pidfd refers to this exact child even if its numeric PID is reused.
+    // GDB normally kills it on exit; this covers abrupt debugger death too.
+    if (inferiorPidFd >= 0) {
+      (void)::syscall(SYS_pidfd_send_signal, inferiorPidFd, SIGKILL, nullptr, 0);
+      (void)::close(inferiorPidFd); inferiorPidFd = -1;
+    }
+  }
+  bool prepareTemp(const GdbLaunchRequest& request, GdbError& e) {
     std::string pattern = (std::filesystem::temp_directory_path() /
                            "phantom-gdb-XXXXXX").string();
     std::vector<char> buf(pattern.begin(), pattern.end());
@@ -211,121 +265,160 @@ struct GdbEngine::Impl {
     ptyPath = slaveName;
     ptySlave = ::open(ptyPath.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (ptySlave < 0) { setError(e, "LAUNCH_FAILED", "cannot open inferior PTY"); cleanupTemp(); return false; }
-    termios tty{};
-    if (::tcgetattr(ptySlave, &tty) == 0) {
-      tty.c_lflag |= ICANON;
-      tty.c_lflag &= static_cast<tcflag_t>(~(ECHO | ECHONL | ISIG | IEXTEN));
-      tty.c_iflag &= static_cast<tcflag_t>(~(ICRNL | INLCR | IGNCR | IXON | IXOFF | IXANY));
-      tty.c_oflag &= static_cast<tcflag_t>(~OPOST);
-      // Keep canonical mode for deterministic VEOF, but disable its line
-      // editing controls so submitted bytes are not silently erased or
-      // reprinted by the terminal driver.
-#ifdef VERASE
-      tty.c_cc[VERASE] = _POSIX_VDISABLE;
-#endif
-#ifdef VKILL
-      tty.c_cc[VKILL] = _POSIX_VDISABLE;
-#endif
-#ifdef VWERASE
-      tty.c_cc[VWERASE] = _POSIX_VDISABLE;
-#endif
-#ifdef VREPRINT
-      tty.c_cc[VREPRINT] = _POSIX_VDISABLE;
-#endif
-#ifdef VLNEXT
-      tty.c_cc[VLNEXT] = _POSIX_VDISABLE;
-#endif
-#ifdef VDISCARD
-      tty.c_cc[VDISCARD] = _POSIX_VDISABLE;
-#endif
-      tty.c_cc[VEOF] = 4;
-      (void)::tcsetattr(ptySlave, TCSANOW, &tty);
-    }
-    if (const long maxCanonical = ::fpathconf(ptySlave, _PC_MAX_CANON); maxCanonical > 0)
-      ptyMaxCanonical = static_cast<std::size_t>(maxCanonical);
-    std::size_t lineBytes = 0;
-    for (const unsigned char byte : input) {
-      if (byte == 4) {
-        setError(e, "LIMIT_EXCEEDED", "input contains the PTY EOF control byte");
-        cleanupTemp();
-        return false;
-      }
-      if (byte == '\n') { lineBytes = 0; continue; }
-      if (++lineBytes > ptyMaxCanonical) {
-        setError(e, "LIMIT_EXCEEDED", "input line exceeds the PTY canonical line limit");
-        cleanupTemp();
-        return false;
-      }
-    }
+    // Only startup diagnostics use this PTY. The wrapper replaces fd 0/1/2
+    // with pipes before exec; terminal line discipline never touches input.
     const int flags = ::fcntl(ptyMaster, F_GETFL);
     if (flags < 0 || ::fcntl(ptyMaster, F_SETFL, flags | O_NONBLOCK) < 0) {
-      setError(e, "LAUNCH_FAILED", "cannot configure inferior PTY"); cleanupTemp(); return false;
+      setError(e, "LAUNCH_FAILED", "cannot configure startup PTY"); cleanupTemp(); return false;
     }
-    ptyOutput.clear(); ptyTotalBytes = 0; deliveredInputBytes.store(0);
-    (void)input;
+    std::ofstream environment(tempDir / "environment", std::ios::binary);
+    for (const auto& [name, value] : request.environment) {
+      environment << name << '=' << value;
+      environment.put('\0');
+    }
+    environment.close();
+    if (!environment) { setError(e, "LAUNCH_FAILED", "cannot save target environment"); cleanupTemp(); return false; }
+    stdinFifo = tempDir / "stdin";
+    stdoutFifo = tempDir / "stdout";
+    stderrFifo = tempDir / "stderr";
+    readyFifo = tempDir / "ready";
+    if (::mkfifo(stdinFifo.c_str(), 0600) != 0 ||
+        ::mkfifo(stdoutFifo.c_str(), 0600) != 0 ||
+        ::mkfifo(stderrFifo.c_str(), 0600) != 0 ||
+        ::mkfifo(readyFifo.c_str(), 0600) != 0) {
+      setError(e, "LAUNCH_FAILED", "cannot create inferior I/O pipes");
+      cleanupTemp();
+      return false;
+    }
+    // Keep the FIFO endpoints open across the wrapper's startup. Separate
+    // read and keepalive descriptors let us close the latter after exit and
+    // observe a genuine EOF while retaining every buffered byte.
+    stdinKeepFd = ::open(stdinFifo.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    stdinFd = ::open(stdinFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    stdoutFd = ::open(stdoutFifo.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    stderrFd = ::open(stderrFifo.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    readyFd = ::open(readyFifo.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    stdoutKeepFd = ::open(stdoutFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    stderrKeepFd = ::open(stderrFifo.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (stdinKeepFd < 0 || stdinFd < 0 || stdoutFd < 0 || stderrFd < 0 || readyFd < 0 || stdoutKeepFd < 0 || stderrKeepFd < 0) {
+      setError(e, "LAUNCH_FAILED", "cannot open inferior I/O pipes");
+      cleanupTemp();
+      return false;
+    }
+    stdoutOutput.clear(); stderrOutput.clear();
+    stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
+    pendingInput = request.input; wrapperReady = false;
     return true;
   }
   void cleanupTemp() noexcept {
-    inputFeeder.request_stop();
-    if (inputFeeder.joinable()) inputFeeder.join();
+    if (stdinKeepFd >= 0) { (void)::close(stdinKeepFd); stdinKeepFd = -1; }
+    if (stdinFd >= 0) { (void)::close(stdinFd); stdinFd = -1; }
+    if (readyFd >= 0) { (void)::close(readyFd); readyFd = -1; }
+    if (stdoutKeepFd >= 0) { (void)::close(stdoutKeepFd); stdoutKeepFd = -1; }
+    if (stderrKeepFd >= 0) { (void)::close(stderrKeepFd); stderrKeepFd = -1; }
+    if (stdoutFd >= 0) { (void)::close(stdoutFd); stdoutFd = -1; }
+    if (stderrFd >= 0) { (void)::close(stderrFd); stderrFd = -1; }
     if (ptySlave >= 0) { (void)::close(ptySlave); ptySlave = -1; }
     if (ptyMaster >= 0) { (void)::close(ptyMaster); ptyMaster = -1; }
-    ptyPath.clear(); ptyOutput.clear(); ptyTotalBytes = 0; deliveredInputBytes.store(0);
+    ptyPath.clear(); stdinFifo.clear(); stdoutFifo.clear(); stderrFifo.clear(); readyFifo.clear();
+    stdoutOutput.clear(); stderrOutput.clear();
+    stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
+    pendingInput.clear(); wrapperReady = false;
     if (!tempDir.empty()) { std::error_code ec; std::filesystem::remove_all(tempDir, ec); }
     tempDir.clear();
   }
 
-  void drainPty() noexcept {
-    if (ptyMaster < 0) return;
+  void drainFd(int fd, std::string& output, std::size_t& total,
+               std::size_t budget = 64 * 1024) {
+    if (fd < 0) return;
     std::array<char, 8192> buffer{};
-    for (;;) {
-      const auto n = ::read(ptyMaster, buffer.data(), buffer.size());
+    // A program may write forever. Bound work per pump so stdout cannot
+    // starve stderr, MI replies, deadlines or cancellation.
+    while (budget != 0) {
+      const auto n = ::read(fd, buffer.data(), std::min(buffer.size(), budget));
       if (n > 0) {
-        ptyTotalBytes += static_cast<std::size_t>(n);
-        ptyOutput.append(buffer.data(), static_cast<std::size_t>(n));
-        if (ptyOutput.size() > options.maxOutputBytes)
-          ptyOutput.erase(0, ptyOutput.size() - options.maxOutputBytes);
-      } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-        if (errno == EINTR) continue;
-        break;
-      } else break;
+        const auto count = static_cast<std::size_t>(n);
+        budget -= count; total += count;
+        output.append(buffer.data(), count);
+        if (output.size() > options.maxOutputBytes)
+          output.erase(0, output.size() - options.maxOutputBytes);
+      } else if (n < 0 && errno == EINTR) continue;
+      else break;
     }
   }
 
-  void startInputFeeder(std::string input) {
-    inputFeeder = std::jthread([this, input = std::move(input)](std::stop_token stop) {
-      std::size_t offset = 0;
-      auto writeAvailable = [&](const char* data, std::size_t size) {
-        while (offset < size && !stop.stop_requested()) {
-          pollfd pollfdValue{ptyMaster, POLLOUT, 0};
-          const int ready = ::poll(&pollfdValue, 1, 50);
-          if (ready <= 0) continue;
-          const auto n = ::write(ptyMaster, data + offset, size - offset);
-          if (n > 0) { offset += static_cast<std::size_t>(n); deliveredInputBytes.store(offset); continue; }
-          if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-          return false;
-        }
-        return offset == size;
-      };
-      if (!writeAvailable(input.data(), input.size()) || stop.stop_requested()) return;
-      // Ctrl-D is the terminal driver's canonical EOF marker. It follows all
-      // submitted bytes, so formatted extraction receives data then EOF.
-      const char eof = 4;
-      // With canonical input, the first VEOF flushes a final unterminated
-      // line; the second VEOF is required to make the following read observe
-      // EOF. Sending two is harmless after a newline and fixes empty/no-newline
-      // input without pretending that PTY delivery is extraction tracing.
-      for (int marker = 0; marker < 2 && !stop.stop_requested(); ++marker) {
-        bool sent = false;
-        while (!sent && !stop.stop_requested()) {
-          pollfd pollfdValue{ptyMaster, POLLOUT, 0};
-          if (::poll(&pollfdValue, 1, 50) <= 0) continue;
-          const auto n = ::write(ptyMaster, &eof, 1);
-          if (n > 0) sent = true;
-          else if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return;
-        }
+  void feedInput() {
+    if (!wrapperReady && readyFd >= 0) {
+      char marker = 0;
+      if (::read(readyFd, &marker, 1) == 1 && marker == 1) {
+        wrapperReady = true;
+        (void)::close(readyFd); readyFd = -1;
+        // Remove our bootstrap reader now: early close(0) in the target must
+        // produce EPIPE rather than leave a writer waiting on its own reader.
+        (void)::close(stdinKeepFd); stdinKeepFd = -1;
       }
-    });
+    }
+    if (!wrapperReady || stdinFd < 0) return;
+    if (deliveredInputBytes < pendingInput.size()) {
+      sigset_t blocked{}, previous{}, pending{};
+      ::sigemptyset(&blocked); ::sigaddset(&blocked, SIGPIPE);
+      if (::pthread_sigmask(SIG_BLOCK, &blocked, &previous) != 0)
+        throw std::runtime_error("cannot block SIGPIPE for inferior stdin");
+      (void)::sigpending(&pending);
+      const auto n = ::write(stdinFd, pendingInput.data() + deliveredInputBytes,
+                             std::min<std::size_t>(64 * 1024, pendingInput.size() - deliveredInputBytes));
+      const int writeError = errno;
+      if (n < 0 && writeError == EPIPE && !::sigismember(&pending, SIGPIPE)) {
+        timespec zero{}; (void)::sigtimedwait(&blocked, nullptr, &zero);
+      }
+      (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+      if (n > 0) deliveredInputBytes += static_cast<std::size_t>(n);
+      else if (n < 0 && writeError != EINTR && writeError != EAGAIN && writeError != EWOULDBLOCK) {
+        (void)::close(stdinFd); stdinFd = -1;
+        if (writeError != EPIPE) throw std::runtime_error("cannot write inferior stdin");
+      }
+    }
+    if (stdinFd >= 0 && deliveredInputBytes == pendingInput.size()) {
+      (void)::close(stdinFd); stdinFd = -1;
+    }
+  }
+
+  void drainIo() {
+    drainFd(stdoutFd, stdoutOutput, stdoutTotalBytes);
+    drainFd(stderrFd, stderrOutput, stderrTotalBytes);
+    // Discard startup chatter before wrapper exec (kept separate from target
+    // stdout/stderr); otherwise a noisy shell could fill its controlling tty.
+    std::string startup;
+    std::size_t ignored = 0;
+    drainFd(ptyMaster, startup, ignored);
+    feedInput();
+  }
+
+  void captureIo(GdbStop& result) {
+    // A FIFO can exceed the live pump's 64 KiB budget (F_SETPIPE_SZ or a
+    // larger system page size). Capture the queued byte count once so the
+    // final snapshot includes the complete pending tail without waiting for
+    // EOF or following an untraced descendant that keeps writing forever.
+    const auto queued = [](int fd) -> std::size_t {
+      if (fd < 0) return 0;
+      int bytes = 0;
+      if (::ioctl(fd, FIONREAD, &bytes) != 0 || bytes < 0)
+        throw std::runtime_error("cannot inspect pending inferior output");
+      return static_cast<std::size_t>(bytes);
+    };
+    const auto stdoutQueued = queued(stdoutFd);
+    const auto stderrQueued = queued(stderrFd);
+    drainFd(stdoutFd, stdoutOutput, stdoutTotalBytes, stdoutQueued);
+    drainFd(stderrFd, stderrOutput, stderrTotalBytes, stderrQueued);
+    feedInput();
+    const auto snapshot = [](const std::string& bytes, std::size_t total) {
+      return nlohmann::json{{"text", displayUtf8(bytes)}, {"totalBytes", total},
+                            {"retainedFromByte", total - bytes.size()},
+                            {"truncated", total > bytes.size()}};
+    };
+    result.stdoutSnapshot = snapshot(stdoutOutput, stdoutTotalBytes);
+    result.stderrSnapshot = snapshot(stderrOutput, stderrTotalBytes);
+    result.input = {{"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes}};
   }
 
   nlohmann::json sourceLocation(std::string_view fullName, int line) const {
@@ -369,7 +462,7 @@ struct GdbEngine::Impl {
     if (line.empty() || (line.rfind("(gdb)", 0) == 0 &&
                         line.find_first_not_of(" \t", 5) == std::string::npos)) return false;
     if (line.size() > 1024u * 1024u) {
-      setError(e, "LIMIT_EXCEEDED", "GDB/MI record exceeds the configured line limit");
+      failClosed(e, "LIMIT_EXCEEDED", "GDB/MI record exceeds the configured line limit");
       return false;
     }
     MiRecord r;
@@ -377,15 +470,23 @@ struct GdbEngine::Impl {
       r = parseMiRecord(line);
     } catch (const mi::ParseError& ex) {
       const auto code = ex.code() == mi::ParseErrorCode::limit ? "LIMIT_EXCEEDED" : "READ_FAILED";
-      setError(e, code, std::string("malformed GDB/MI record: ") + ex.what(), true);
+      failClosed(e, code, std::string("malformed GDB/MI record: ") + ex.what());
       return false;
     } catch (const std::exception& ex) {
-      setError(e, "READ_FAILED", std::string("cannot parse GDB/MI record: ") + ex.what(), true);
+      failClosed(e, "READ_FAILED", std::string("cannot parse GDB/MI record: ") + ex.what());
       return false;
     }
     if (r.type == '=' && r.klass == "thread-group-started") {
       const auto* pid = field(r.fields, "pid");
-      if (pid && !pid->text.empty()) inferiorPid = pid->text;
+      if (pid && !pid->text.empty()) {
+        inferiorPid = pid->text;
+        int numericPid = 0;
+        const auto parsed = std::from_chars(inferiorPid.data(), inferiorPid.data() + inferiorPid.size(), numericPid);
+        if (parsed.ec == std::errc{} && parsed.ptr == inferiorPid.data() + inferiorPid.size() && numericPid > 0) {
+          if (inferiorPidFd >= 0) (void)::close(inferiorPidFd);
+          inferiorPidFd = static_cast<int>(::syscall(SYS_pidfd_open, numericPid, 0));
+        }
+      }
     }
     if (r.type == '*' && r.klass == "stopped") { stopped = std::move(r); return waitStop; }
     if (r.type == '*' && (r.klass == "exited" || r.klass == "exited-normally")) { stopped = std::move(r); return waitStop; }
@@ -411,8 +512,9 @@ struct GdbEngine::Impl {
   // GdbStop tied to a real stop, rather than a guessed source line.
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
                GdbError& e, int preempt = 0) {
+    e = {};
     if (!process) { setError(e, "INVALID_REQUEST", "GDB is not running"); return false; }
-    int token = nextToken++;
+    const auto token = nextToken++;
     std::string tokenText = std::to_string(token);
     try {
       process->write(tokenText + std::string(commandText) + "\n",
@@ -420,25 +522,25 @@ struct GdbEngine::Impl {
     } catch (const std::exception& ex) {
       failClosed(e, "INTERNAL", ex.what()); return false;
     }
-    // A control frame may have arrived after the service accepted this
-    // operation but just before resume() wrote its MI command. Preserve that
-    // request across the command boundary: sending SIGINT/SIGTERM while GDB
-    // is idle would be racy, while sending it immediately after the command
-    // is on the wire has deterministic meaning.
-    if (preempt >= 2) {
-      process->terminate(); setError(e, "CANCELLED", "debugger stopped", true); return false;
-    }
-    if (preempt == 1) process->interrupt();
+    // Control-thread calls only publish intent. The owning worker sends an
+    // interrupt after ^running, so same-packet pause cannot signal idle GDB.
+    bool pendingInterrupt = preempt == 1;
+    bool interruptSent = false;
     bool done = false, running = false;
     auto deadline = std::chrono::steady_clock::now() + options.commandTimeout;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (control.load(std::memory_order_relaxed) >= 2) {
-        process->terminate(); setError(e, "CANCELLED", "debugger stopped", true); return false;
+      const int mode = control.exchange(0);
+      if (preempt >= 2 || mode >= 2 || launchCancellation.stop_requested()) {
+        process->terminate(); live = false;
+        setError(e, "CANCELLED", "debugger stopped", true); return false;
+      }
+      pendingInterrupt = pendingInterrupt || mode == 1;
+      if (waitStop && running && pendingInterrupt && !interruptSent) {
+        process->interrupt(); interruptSent = true;
       }
       ProcessOutput output;
-      try { output = process->poll(std::chrono::milliseconds(20)); }
+      try { drainIo(); output = process->poll(std::chrono::milliseconds(5)); drainIo(); }
       catch (const std::exception& ex) { failClosed(e, "INTERNAL", ex.what()); return false; }
-      drainPty();
       lines += output.out;
       std::size_t p = 0;
       while ((p = lines.find('\n')) != std::string::npos) {
@@ -453,6 +555,9 @@ struct GdbEngine::Impl {
         // (for example ptrace denied or an invalid executable).  Do not spin
         // until the timeout after GDB has already returned ^error.
         if (!e.code.empty()) return false;
+      }
+      if (lines.size() > 1024u * 1024u) {
+        failClosed(e, "LIMIT_EXCEEDED", "unterminated GDB/MI record exceeds line limit"); return false;
       }
       if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) return true;
       if (!waitStop && done) return e.code.empty();
@@ -594,7 +699,10 @@ struct GdbEngine::Impl {
         continue;
       MiRecord created;
       GdbError local;
-      if (!command("-var-create - * " + name, false, created, local)) continue;
+      if (!command("-var-create - * " + name, false, created, local)) {
+        if (!live) { outerError = local; return; }
+        continue;
+      }
       const auto* type = field(created.fields, "type");
       const auto* value = field(created.fields, "value");
       if (type && !type->text.empty()) {
@@ -605,7 +713,9 @@ struct GdbEngine::Impl {
       if (objectName && !objectName->text.empty()) {
         MiRecord deleted;
         GdbError ignored;
-        (void)command("-var-delete " + objectName->text, false, deleted, ignored);
+        if (!command("-var-delete " + objectName->text, false, deleted, ignored) && !live) {
+          outerError = ignored; return;
+        }
       }
     }
     (void)outerError;
@@ -636,6 +746,7 @@ struct GdbEngine::Impl {
           if (!command("-stack-list-variables --all-values", false, vr, e)) return false;
           variables = varsFrom(field(vr.fields, "variables"), level);
           enrichVariableTypes(variables, e);
+          if (!e.code.empty()) return false;
         }
         auto activation = "frame:" + std::to_string(level);
         output.push_back({{"id", activation}, {"activationId", activation}, {"functionName", function},
@@ -656,6 +767,7 @@ struct GdbEngine::Impl {
           if (!command("-stack-list-variables --all-values", false, vr, e)) return false;
           variables = varsFrom(field(vr.fields, "variables"), level);
           enrichVariableTypes(variables, e);
+          if (!e.code.empty()) return false;
         }
         int sourceLine = 0;
         try { sourceLine = std::stoi(valText(field(*fr, "line"))); } catch (...) {}
@@ -677,6 +789,7 @@ struct GdbEngine::Impl {
     result.exited = stop.klass == "exited" || stop.klass == "exited-normally" ||
                     result.reason == "exited-normally" || result.reason == "exited" ||
                     result.reason == "exited-signalled";
+    if (stop.klass == "exited-normally" || result.reason == "exited-normally") result.exitCode = 0;
     result.threadId = valText(field(stop.fields, "thread-id"));
     if (const auto code = field(stop.fields, "exit-code")) {
       try { result.exitCode = static_cast<int>(std::stoul(code->text, nullptr, 0)); } catch (...) {}
@@ -699,12 +812,9 @@ struct GdbEngine::Impl {
     // for a stack here can yield a misleading stale frame or a secondary
     // READ_FAILED error.
     if (!result.exited && !snapshotStack(result, e)) return false;
-    drainPty();
-    result.stdoutSnapshot = {{"text", ptyOutput}, {"totalBytes", ptyTotalBytes},
-                             {"retainedFromByte", ptyTotalBytes > ptyOutput.size() ? ptyTotalBytes - ptyOutput.size() : 0},
-                             {"truncated", ptyTotalBytes > ptyOutput.size()}};
-    result.stderrSnapshot = {{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
-    result.input = {{"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes.load()}};
+    // At an inferior stop its completed writes are already queued in the
+    // kernel. Capture that backlog without a sleep or EOF heuristic.
+    captureIo(result);
     result.raw = {{"reason", result.reason}, {"stack", result.stack}, {"location", result.location}};
     result.raw["exited"] = result.exited;
     if (result.exitCode) result.raw["exitCode"] = *result.exitCode;
@@ -712,15 +822,25 @@ struct GdbEngine::Impl {
   }
 
   bool startGdb(const GdbLaunchRequest& request, GdbError& e) {
-    std::vector<std::string> argv{options.gdbPath, "--interpreter=mi2", "-nx", "--quiet"};
+    if (options.execWrapper.empty() || ::access(options.execWrapper.c_str(), X_OK) != 0) {
+      setError(e, "LAUNCH_FAILED", "the inferior I/O wrapper is unavailable", true);
+      return false;
+    }
+    std::vector<std::string> argv{options.gdbPath, "--interpreter=mi2", "-nx", "--quiet",
+                                  "-iex", "set auto-load off"};
     ProcessOptions po;
     po.argv = argv;
     po.cwd = options.workingDirectory.empty() ? request.binaryPath.parent_path().string() : options.workingDirectory.string();
     // The requested environment belongs to the inferior. Passing it to the
     // debugger itself makes PATH or LD_PRELOAD alter GDB's lookup/loading
     // behavior instead of only configuring the debugged program.
-    po.max_output_bytes = options.maxOutputBytes;
-    try { process = std::make_unique<Process>(Process::spawn(po)); }
+    po.environment.emplace_back("SHELL", "/bin/sh");
+    po.environment.emplace_back("DEBUGINFOD_URLS", "");
+    // MI belongs to an unbounded-duration conversation. Retaining already
+    // consumed replies would eventually kill a healthy debugging session.
+    // Process bounds each poll; command() bounds individual MI records.
+    po.capture_output = false;
+    try { std::lock_guard lock(processMutex); process = std::make_unique<Process>(Process::spawn(po)); }
     catch (const std::exception& ex) { setError(e, "LAUNCH_FAILED", ex.what()); return false; }
     live = true;
     auto setup = [&](std::string_view c) { MiRecord ignored; return command(c, false, ignored, e); };
@@ -728,12 +848,12 @@ struct GdbEngine::Impl {
         !setup("-gdb-set startup-with-shell on") || !setup("-gdb-set print pretty off") ||
         !setup("-gdb-set print elements 128") ||
         !setup("-interpreter-exec console " + miQuote("set inferior-tty " + ptyPath.string()))) return false;
-    for (const auto& [name, value] : request.environment) {
-      // MI quoting preserves spaces, quotes and embedded newlines in the
-      // console command. The validated POSIX name cannot introduce a second
-      // `set environment` directive.
-      if (!setup("-interpreter-exec console " + miQuote("set environment " + name + " " + value))) return false;
-    }
+    // GDB runs exec-wrapper through its startup shell; quote both trusted
+    // paths. Target environment is a private NUL-delimited file consumed by
+    // the helper immediately before exec, so LD_*/BASH_ENV never affect GDB,
+    // the shell or the helper itself.
+    if (!setup("-interpreter-exec console " + miQuote("set exec-wrapper " +
+        shellQuote(options.execWrapper.string()) + " " + shellQuote(tempDir.string())))) return false;
     std::string file = "-file-exec-and-symbols " + miQuote(request.binaryPath.string());
     if (!setup(file)) return false;
     std::string args = "-exec-arguments";
@@ -746,8 +866,14 @@ struct GdbEngine::Impl {
 GdbEngine::GdbEngine(GdbOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
 GdbEngine::~GdbEngine() { stop(); }
 
-bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbError& error) {
+bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbError& error,
+                       std::stop_token cancellation) {
   stop();
+  impl_->launchCancellation = cancellation;
+  struct ResetCancellation {
+    std::stop_token& token;
+    ~ResetCancellation() { token = {}; }
+  } reset{impl_->launchCancellation};
   for (const auto& argument : request.argv) {
     if (!safeMiArgument(argument)) {
       error = {"INVALID_REQUEST", "inferior arguments must not contain NUL or line breaks", false};
@@ -762,14 +888,14 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   }
   impl_->control.store(0);
   impl_->inferiorPid.clear();
+  impl_->lines.clear(); impl_->nextToken = 1; impl_->selectedFrame = 0;
   impl_->sourceBundle = request.sourceBundle;
-  if (!impl_->prepareTemp(request.input, error)) return false;
+  if (!impl_->prepareTemp(request, error)) return false;
   if (!impl_->startGdb(request, error)) { stop(); return false; }
   if (request.stopAtEntry) {
     MiRecord entryBreakpoint;
     if (!impl_->command("-break-insert -t -f main", false, entryBreakpoint, error)) { stop(); return false; }
   }
-  impl_->startInputFeeder(request.input);
   MiRecord stopped;
   if (!impl_->command("-exec-run", true, stopped, error)) { stop(); return false; }
   if (!impl_->makeStop(stopped, result, error)) { stop(); return false; }
@@ -808,11 +934,23 @@ void GdbEngine::interrupt(int mode) noexcept {
   if (!impl_) return;
   int expected = impl_->control.load();
   while (expected < mode && !impl_->control.compare_exchange_weak(expected, mode)) {}
-  std::lock_guard lock(impl_->processMutex);
-  if (impl_->process) {
-    if (mode >= 2) impl_->process->terminate();
-    else impl_->process->interrupt();
+}
+void GdbEngine::clearInterrupt() noexcept { impl_->control.store(0); }
+GdbStop GdbEngine::stopAndSnapshot() {
+  GdbStop result;
+  result.exited = true;
+  result.reason = "stop";
+  result.processInstanceId = impl_->inferiorPid;
+  impl_->control.store(2);
+  {
+    std::lock_guard lock(impl_->processMutex);
+    if (impl_->process) impl_->process->terminate();
   }
+  impl_->killInferior();
+  try { impl_->captureIo(result); }
+  catch (...) { stop(); throw; }
+  stop();
+  return result;
 }
 void GdbEngine::stop() noexcept {
   if (!impl_) return;
@@ -820,6 +958,7 @@ void GdbEngine::stop() noexcept {
   std::lock_guard lock(impl_->processMutex);
   if (impl_->process) impl_->process->terminate();
   impl_->process.reset();
+  impl_->killInferior();
   impl_->live = false;
   impl_->breakpoints.clear();
   impl_->cleanupTemp();
@@ -838,10 +977,11 @@ bool GdbEngine::setBreakpoints(const nlohmann::json& request, nlohmann::json& re
   // source documents intact.  The old global delete made an editor update in
   // helper.cpp silently remove all main.cpp breakpoints as well.
   std::vector<Impl::BreakpointEntry> retained;
-  for (const auto& entry : impl_->breakpoints) {
+  const auto previousBreakpoints = impl_->breakpoints;
+  for (const auto& entry : previousBreakpoints) {
     if (entry.documentId != documentId) { retained.push_back(entry); continue; }
-    MiRecord ignored; GdbError ignoredError;
-    (void)impl_->command("-break-delete " + entry.number, false, ignored, ignoredError);
+    MiRecord ignored;
+    if (!impl_->command("-break-delete " + entry.number, false, ignored, error)) return false;
   }
   impl_->breakpoints = std::move(retained);
   result = nlohmann::json::array();

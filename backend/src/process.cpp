@@ -125,9 +125,10 @@ ProcessError::ProcessError(ProcessErrorCode code, std::string message, int error
     : std::runtime_error(std::move(message)), code_(code), error_number_(error_number) {}
 
 Process::Process(int pid, int stdin_fd, int stdout_fd, int stderr_fd,
-                 std::size_t max_output_bytes)
+                 std::size_t max_output_bytes, bool capture_output)
     : pid_(pid), pgid_(pid), stdin_fd_(stdin_fd), stdout_fd_(stdout_fd),
-      stderr_fd_(stderr_fd), max_output_bytes_(max_output_bytes) {}
+      stderr_fd_(stderr_fd), max_output_bytes_(max_output_bytes),
+      capture_output_(capture_output) {}
 
 Process Process::spawn(const ProcessOptions& options) {
   if (options.argv.empty() || options.argv.front().empty())
@@ -239,7 +240,8 @@ Process Process::spawn(const ProcessOptions& options) {
     close_nointr(in_pipe[1]); close_nointr(out_pipe[0]); close_nointr(err_pipe[0]);
     throw ProcessError(ProcessErrorCode::spawn, "fcntl failed: " + std::string(std::strerror(e)), e);
   }
-  return Process(child, in_pipe[1], out_pipe[0], err_pipe[0], options.max_output_bytes);
+  return Process(child, in_pipe[1], out_pipe[0], err_pipe[0], options.max_output_bytes,
+                 options.capture_output);
 }
 
 Process::Process(Process&& other) noexcept { *this = std::move(other); }
@@ -251,6 +253,7 @@ Process& Process::operator=(Process&& other) noexcept {
   stdin_fd_ = std::exchange(other.stdin_fd_, -1); stdout_fd_ = std::exchange(other.stdout_fd_, -1);
   stderr_fd_ = std::exchange(other.stderr_fd_, -1); max_output_bytes_ = other.max_output_bytes_;
   output_bytes_ = other.output_bytes_; captured_out_ = std::move(other.captured_out_);
+  capture_output_ = other.capture_output_;
   captured_err_ = std::move(other.captured_err_); stdout_eof_ = other.stdout_eof_;
   stderr_eof_ = other.stderr_eof_; stdin_closed_ = other.stdin_closed_; child_reaped_ = other.child_reaped_;
   group_signal_allowed_ = other.group_signal_allowed_; exit_ = other.exit_;
@@ -358,12 +361,21 @@ ProcessOutput Process::drain(bool wait_for_io, std::chrono::milliseconds wait, s
   }
   auto read_one = [&](int& fd, bool& eof, std::string& captured, std::string& fresh) {
     std::array<char, 8192> buf{};
-    for (;;) {
-      ssize_t n = ::read(fd, buf.data(), buf.size());
+    std::size_t remaining = 64 * 1024;
+    while (remaining) {
+      ssize_t n = ::read(fd, buf.data(), std::min(buf.size(), remaining));
       if (n > 0) {
-        output_bytes_ += static_cast<std::size_t>(n);
-        if (output_bytes_ > max_output_bytes_) { close_nointr(fd); fd = -1; fail_and_kill(ProcessErrorCode::output_limit, "process output limit exceeded"); }
-        captured.append(buf.data(), static_cast<std::size_t>(n)); fresh.append(buf.data(), static_cast<std::size_t>(n));
+        const auto size = static_cast<std::size_t>(n);
+        if (capture_output_) {
+          if (size > max_output_bytes_ - output_bytes_) {
+            close_nointr(fd); fd = -1;
+            fail_and_kill(ProcessErrorCode::output_limit, "process output limit exceeded");
+          }
+          output_bytes_ += size;
+          captured.append(buf.data(), size);
+        }
+        fresh.append(buf.data(), size);
+        remaining -= size;
       } else if (n == 0) { close_nointr(fd); fd = -1; eof = true; break; }
       else if (errno == EINTR) continue;
       else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -410,7 +422,6 @@ ProcessOutput Process::wait(Deadline deadline, std::stop_token stop) {
       std::lock_guard lock(mutex_);
       part = drain(true, slice, stop);
     }
-    current.out += std::move(part.out); current.err += std::move(part.err);
     current.stdout_eof = part.stdout_eof; current.stderr_eof = part.stderr_eof; current.exit = part.exit;
   }
   {

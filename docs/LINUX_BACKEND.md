@@ -2,7 +2,7 @@
 
 Ветка: **`backend/linux`**. Общая линия интерфейса и согласованных контрактов:
 **`main`**. Приоритеты исследований находятся в
-[BACKEND_HANDOFF.md](BACKEND_HANDOFF.md), устройство каркаса — в
+[BACKEND_HANDOFF.md](BACKEND_HANDOFF.md), устройство backend — в
 [backend/README.md](../backend/README.md).
 
 ## Какую ОС выбрать
@@ -23,7 +23,8 @@ Linux kernel и аппаратные performance counters; в VM нужны ви
 
 Приложение на Mac и backend на Linux могут разрабатываться одновременно.
 Удалённый transport пока не реализован: на этой ветке сейчас собирается только
-standalone CLI. Будущая Linux-сессия исследует Linux executable/ABI/библиотеки;
+standalone service с локальным NDJSON transport через stdin/stdout. Linux-сессия
+исследует Linux executable/ABI/библиотеки;
 она не выдаёт его поведение за нативное поведение той же программы на macOS.
 
 ## Клонирование и минимальные зависимости
@@ -72,13 +73,17 @@ ctest --preset linux-debug
 ./out/linux-debug/phantom-backend --self-check
 ```
 
-Последняя команда должна показать `status: scaffold-only`,
-`protocol: not-implemented` и все capabilities `false`.
-Это успешная проверка каркаса, **не готовый debugger**.
+Последняя команда показывает `status: ready` и `protocol: v1-stdio-ndjson`.
+Это описание реализованного профиля, а не проверка наличия GDB или работоспособности
+rr на машине. Реальный цикл сборки, запуска, stepping, истории и остановки
+проверяет CTest с GDB. Для запуска сервиса используйте
+`./out/linux-debug/phantom-backend --stdio --workspace /path/to/project`.
+Рядом с executable должен находиться собранный `phantom-io-wrapper`.
 
 Workflow [.github/workflows/backend-linux.yml](../.github/workflows/backend-linux.yml)
-собирает каркас и выполняет CTest на `ubuntu-24.04` при изменениях backend-ветки.
-Он также запускает fixture как обычную программу. Запись и обратное исполнение
+собирает service и выполняет CTest с GDB на `ubuntu-24.04` при изменениях backend-ветки.
+Проверяются также раздельные потоки, отмена, аварии отладчика и реальные DTO через
+TypeScript. Workflow запускает rr fixture как обычную программу. Запись и обратное исполнение
 rr проверяются отдельно на выбранном компьютере: стандартный CI runner не
 считается проверенной средой с нужными аппаратными счётчиками.
 
@@ -144,12 +149,16 @@ quit
 - Изменения общего `src/backend-contract.ts` и семантики DTO согласуются отдельным
   небольшим PR вместе с fixtures и описанием совместимости. Не менять renderer
   для обхода отсутствующего наблюдения.
-- Регулярно подтягивать общую линию, решая конфликты до следующего большого этапа:
+- Получать обновления общей линии и проверять совместимость. Переносить frontend
+  целиком необязательно: backend развивается независимо, необходимые части можно
+  выбирать отдельно. Сам по себе merge не подключает UI к сервису. Например,
+  [проверка DTO](../backend/docs/frontend-compatibility.md) читает контракт из
+  указанного commit без merge:
 
 ```bash
 git fetch origin
-git checkout backend/linux
-git merge origin/main
+python3 backend/tests/frontend_contract_test.py backend/out/linux-debug/phantom-backend \
+  --contract-ref 56308532338bcccc65413c794052e06fc73a3e4f
 ```
 
 - Готовые законченные части с проверками отдавать через PR `backend/linux → main`.

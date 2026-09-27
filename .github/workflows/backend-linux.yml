@@ -6,12 +6,14 @@ on:
     paths:
       - 'backend/**'
       - 'scripts/backend-doctor.sh'
+      - 'src/backend-contract.ts'
       - '.github/workflows/backend-linux.yml'
   pull_request:
     branches: [main, backend/linux]
     paths:
       - 'backend/**'
       - 'scripts/backend-doctor.sh'
+      - 'src/backend-contract.ts'
       - '.github/workflows/backend-linux.yml'
   workflow_dispatch:
 
@@ -29,7 +31,12 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake ninja-build python3
+          sudo apt-get install --yes clang cmake ninja-build python3 gdb
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install standalone TypeScript contract checker
+        run: npm install --global typescript@5.9.3
       - name: Check environment script syntax
         run: bash -n scripts/backend-doctor.sh
       - name: Configure
@@ -38,7 +45,7 @@ jobs:
       - name: Build
         working-directory: backend
         run: cmake --build --preset linux-debug
-      - name: Test scaffold contract
+      - name: Test backend and frontend DTO conformance
         working-directory: backend
         run: ctest --preset linux-debug
       - name: Build and execute the recorder fixture normally
