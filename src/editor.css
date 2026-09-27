@@ -60,6 +60,16 @@
   border-left: 1px solid var(--accent, #d9bb84);
   background: linear-gradient(90deg, color-mix(in srgb, var(--accent, #d9bb84) 6%, transparent), color-mix(in srgb, var(--accent, #d9bb84) 2%, transparent) 80%, transparent);
 }
+.editor-global-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 0;
+  pointer-events: none;
+  border-left: 1px dashed color-mix(in srgb, #a995d6 76%, transparent);
+  background: linear-gradient(90deg, color-mix(in srgb, #a995d6 4%, transparent), transparent 72%);
+  opacity: .82;
+}
 .editor-highlight-viewport { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 1; }
 .editor-highlight,
 .editor-textarea {

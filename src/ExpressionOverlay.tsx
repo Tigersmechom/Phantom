@@ -169,12 +169,13 @@ function RailValues({ stage, phase, immediate, isPlaying, pendingOperands, links
     return () => observer.disconnect();
   }, [showOperands, pending]);
   const prefix = stage.operands.length === 1 && ['+', '-', '!', '~', '++', '--'].includes(stage.operator) ? stage.operator : null;
-  return <div className={`rail-equation ${pending ? 'rail-equation--pending' : ''} ${immediate || stage.operands.length === 0 ? 'rail-equation--immediate' : ''}`}
+  const isCall = stage.operator === 'call';
+  return <div className={`rail-equation ${pending ? 'rail-equation--pending' : ''} ${isCall ? 'rail-equation--call' : ''} ${immediate || stage.operands.length === 0 ? 'rail-equation--immediate' : ''}`}
     data-stage-id={stage.id} data-stage-phase={pending ? 'pending' : immediate ? 'result' : phase} ref={rowRef}>
     {showOperands && stage.operands.map((operand, index) => <div className="rail-term" key={index}>
       {(index > 0 ? operationSymbol(stage, index) : prefix) && <span className="expression-operator" data-operator={(index > 0 ? operationSymbol(stage, index) : prefix)!}>{index > 0 ? operationSymbol(stage, index) : prefix}</span>}
       <div className="rail-argument" data-operand-index={index} ref={(element) => { if (links[index]) links[index].frame = element; }}
-        style={{ '--operand-width': `${metrics.operands[index]}px`, '--operand-size': `${Math.min(34, Math.max(13, (metrics.operands[index] - 26) / (Math.max(1, valueText(operand).length) * .64)))}px` } as CSSProperties}>
+        style={{ '--operand-index': index, '--operand-width': `${metrics.operands[index]}px`, '--operand-size': `${Math.min(34, Math.max(13, (metrics.operands[index] - 26) / (Math.max(1, valueText(operand).length) * .64)))}px` } as CSSProperties}>
         <span className="rail-argument-label" title={operandLabel(stage, index)}>{operandLabel(stage, index)}</span>
         <span className="expression-operand" title={valueText(operand)}>{valueText(operand)}</span>
       </div>
@@ -227,7 +228,7 @@ function AnchoredStage({ stage, line, phase, immediate, isPlaying, pendingOperan
     <div className="expression-anchor" ref={elementRef} data-style={style} data-visible="false" data-stage-key={stage.id}>
       <div className="expression-plane">
         <div className="expression-chip-motion">
-          <div className={`expression-chip expression-chip--${style}`} ref={chipRef} style={{ '--chip-width': `${width}px`, '--result-size': `${resultSize}px` } as CSSProperties}>
+          <div className={`expression-chip expression-chip--${style} ${stage.operator === 'call' ? 'expression-chip--call' : ''}`} ref={chipRef} style={{ '--chip-width': `${width}px`, '--result-size': `${resultSize}px` } as CSSProperties}>
             <span className="expression-label" title={stage.label}>{stage.label}</span>
             <span className="expression-fallback">строка {line}</span>
             {style === 'rail' ? <RailValues stage={stage} phase={phase} immediate={immediate} isPlaying={isPlaying} pendingOperands={pendingOperands} links={operandLinks} />
@@ -249,7 +250,10 @@ function ExpressionCard({ event, isPlaying, reduced, stepDurationMs, style, exit
   // playback is an educational mode: it keeps the same finite timeline as a
   // manual step even while execution is running.
   const immediate = !animated || (isPlaying && playbackMode === 'rate');
-  const pendingOperands = !animated || !isPlaying;
+  // Base is intentionally the fully narrated mode: pending calls keep their
+  // observed arguments on screen while the call is being resolved. Rate mode
+  // still collapses an in-flight call to the compact “вызов…” marker.
+  const pendingOperands = !animated || !isPlaying || playbackMode === 'base';
   const allGroups = event.groups?.filter((group) => group.stages.length > 0) ?? [];
   // A malformed trace must never create an unbounded UI wait. Keep the
   // observed final event visible and make truncation explicit in the DOM/ARIA;
@@ -266,7 +270,12 @@ function ExpressionCard({ event, isPlaying, reduced, stepDurationMs, style, exit
   const remainingGroupsMs = Math.max(0, groups.length - groupIndex) * groupDuration;
   const finalStageMs = (!groups.length || groupIndex >= groups.length) && stages.some((stage) => stage.result !== null && stage.operands.length > 0)
     ? (style === 'rail' ? 2300 : 640) : 0;
-  const sequenceMs = remainingGroupsMs + finalStageMs;
+  // A pending call has no merge/result phase, but its argument frames still
+  // need a deliberate reading window. Keep the coordinator aware of that
+  // finite reveal so BASE playback cannot advance halfway through it.
+  const pendingCallMs = stages.some((stage) => stage.result === null && stage.operator === 'call' && stage.operands.length > 0 && (!isPlaying || playbackMode === 'base'))
+    ? (style === 'rail' ? 1750 : 1500) : 0;
+  const sequenceMs = remainingGroupsMs + finalStageMs + pendingCallMs;
   useLayoutEffect(() => {
     if (exiting || immediate || !sequenceMs) return;
     // Register before the passive timer effect below, so a presentation

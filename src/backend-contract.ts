@@ -90,6 +90,79 @@ export interface StackFrameDTO {
   variables: VariableDTO[];
 }
 
+/**
+ * A source operation is an observed execution boundary. A source line can
+ * produce several operations and an operation can stop before completion
+ * (for example when an expression throws), so consumers must not collapse
+ * these records to one event per line.
+ */
+export type OperationKindDTO =
+  | 'statement' | 'expression' | 'instruction' | 'call' | 'return' | 'branch'
+  | 'switch' | 'case' | 'loop' | 'break' | 'continue' | 'goto' | 'throw' | 'catch'
+  | 'rethrow' | 'cleanup' | 'input' | 'output' | 'allocation' | 'lifetime';
+export type OperationBoundaryDTO = 'before' | 'after' | 'throw' | 'unwind' | 'catch' | 'terminate';
+export interface OperationTraceDTO {
+  id: string;
+  /** Stable occurrence identity across replay; do not derive it from line number. */
+  occurrence: string;
+  kind: OperationKindDTO;
+  granularity: 'statement' | 'expression' | 'instruction';
+  boundary: OperationBoundaryDTO;
+  range: SourceSpanDTO | null;
+  activationId: string | null;
+  threadId: string | null;
+  observed: boolean;
+  /** Optional destination for control transfer operations. */
+  targetRange?: SourceSpanDTO;
+  targetActivationId?: string;
+  condition?: RuntimeValueDTO;
+  branch?: 'true' | 'false' | 'case' | 'default' | 'unknown';
+  exceptionId?: string;
+  exceptionType?: string;
+}
+
+/** A primitive global/static read, with enough provenance to highlight its declaration. */
+export interface GlobalReferenceDTO {
+  id: string;
+  name: string;
+  qualifiedName?: string;
+  type: string;
+  scope: 'global' | 'static' | 'thread-local';
+  value: RuntimeValueDTO;
+  locator: string;
+  useRange?: SourceSpanDTO;
+  declarationRange?: SourceSpanDTO;
+}
+
+export interface ControlFlowEventDTO {
+  id: string;
+  operationId?: string;
+  kind: 'if' | 'else' | 'loop' | 'switch' | 'case' | 'default' | 'break' | 'continue' | 'goto' | 'throw' | 'catch' | 'rethrow' | 'return' | 'fallthrough' | 'cleanup';
+  phase: 'before' | 'condition' | 'taken' | 'enter' | 'leave' | 'unwind' | 'caught' | 'terminate' | 'fallthrough';
+  range: SourceSpanDTO | null;
+  targetRange?: SourceSpanDTO;
+  condition?: RuntimeValueDTO;
+  branch?: 'true' | 'false' | 'case' | 'default' | 'unknown';
+  activationId?: string;
+  fromActivationId?: string;
+  toActivationId?: string;
+  exceptionId?: string;
+  exceptionType?: string;
+  /** False means the adapter knows the record is incomplete or inferred. */
+  observed: boolean;
+}
+
+export type RuntimeOutcomeDTO =
+  | 'normal' | 'throwing' | 'caught' | 'uncaught' | 'rethrowing'
+  | 'terminate' | 'assert' | 'signal' | 'segfault' | 'undefined-behavior' | 'timeout';
+
+export interface TraceGapDTO {
+  id: string;
+  range: SourceSpanDTO | null;
+  reason: 'not-instrumented' | 'optimized-out' | 'unsupported' | 'limit' | 'event-loss' | 'unobserved';
+  detail?: string;
+}
+
 export interface ExpressionStageDTO {
   id: string;
   kind: 'operator' | 'call' | 'return' | 'store';
@@ -101,6 +174,8 @@ export interface ExpressionStageDTO {
   targetLocator?: string;
   /** Observed data dependencies by stage ID; source order is not execution evidence. */
   dependsOn: string[];
+  /** Global/static primitive reads observed by this stage. */
+  globalReferences?: GlobalReferenceDTO[];
 }
 export interface EvaluationGroupDTO {
   id: string;
@@ -115,6 +190,7 @@ export interface ExpressionTraceDTO {
   groups: EvaluationGroupDTO[];
   activeStageIds: string[];
   complete: boolean;
+  globalReferences?: GlobalReferenceDTO[];
 }
 export interface InputStateDTO {
   submitted: SubmittedInputDTO;
@@ -157,6 +233,11 @@ export interface StopObservationDTO {
   stdout: OutputSnapshotDTO;
   stderr: OutputSnapshotDTO;
   expressions: ExpressionTraceDTO[];
+  /** Optional semantic trace. Missing means this capability was not captured. */
+  operations?: OperationTraceDTO[];
+  controlFlow?: ControlFlowEventDTO[];
+  outcome?: RuntimeOutcomeDTO;
+  gaps?: TraceGapDTO[];
   coverage: { variables: 'complete' | 'partial'; expressions: 'none' | 'partial' | 'observed'; memory: 'none' | 'partial' };
 }
 export interface DebugSessionStateDTO {
@@ -193,6 +274,11 @@ export interface BackendCapabilitiesDTO {
   variableWrite: boolean;
   inputTracking: InputStateDTO['tracking'];
   expressionGroups: boolean;
+  /** Optional semantic capture advertised independently from ordinary stepping. */
+  operationTrace?: boolean;
+  controlFlowTrace?: boolean;
+  globalPrimitiveReferences?: boolean;
+  runtimeOutcomes?: boolean;
   history: boolean;
   restore: 'none' | 'verified-replay';
   asm: { currentPc: boolean; sourceRange: boolean };

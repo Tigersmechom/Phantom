@@ -10,6 +10,8 @@ export interface CodeEditorProps {
   depth: boolean;
   font: 'neon' | 'krypton' | 'xcode';
   fontSize: number;
+  /** Declaration lines of primitive globals used by the current expression. */
+  globalLines?: number[];
 }
 
 type AssemblyPreview = { line: number; x: number; y: number };
@@ -50,7 +52,7 @@ function assemblyLines(architecture: CodeEditorProps['architecture'], source: st
   return [['mov', 'eax, DWORD PTR [rbp-8]'], ['add', 'eax, DWORD PTR [rbp-12]'], ['mov', 'DWORD PTR [rbp-8], eax'], ['nop', '']];
 }
 
-export default function CodeEditor({ source, onChange, activeLine, architecture, depth, font, fontSize }: CodeEditorProps) {
+export default function CodeEditor({ source, onChange, activeLine, architecture, depth, font, fontSize, globalLines = [] }: CodeEditorProps) {
   const input = useRef<HTMLTextAreaElement>(null);
   const codePlane = useRef<HTMLDivElement>(null);
   const highlight = useRef<HTMLPreElement>(null);
@@ -264,6 +266,13 @@ export default function CodeEditor({ source, onChange, activeLine, architecture,
     </div>
 
     <div className="editor-code-plane" ref={codePlane}>
+      {globalLines.filter(line => line > 0 && line <= lines.length).map(line => <div
+        key={`global-${line}`}
+        aria-hidden="true"
+        className="editor-global-line"
+        style={{ top: paddingTop + (line - 1) * lineHeight - scroll.top, height: lineHeight }}
+        data-global-line={line}
+      />)}
       {activeLine > 0 && activeLine <= lines.length && <div aria-hidden="true" className="editor-active-line" style={{ top: paddingTop + (activeLine - 1) * lineHeight - scroll.top, height: lineHeight }} />}
       <div className="editor-highlight-viewport" aria-hidden="true">
         <div className="editor-selection-layer" data-testid="editor-selection" data-start={selection.start} data-end={selection.end}>{selectionRects.map(rect => <span key={rect.line} className="editor-selection-rect" data-line={rect.line + 1} style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }} />)}</div>

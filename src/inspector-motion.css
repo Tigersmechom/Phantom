@@ -294,6 +294,84 @@
   color: var(--accent);
   border-color: var(--accent);
 }
+.inspector-hidden-scopes {
+  display: grid;
+  gap: 7px;
+  margin: 4px 0 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.inspector-hidden-scopes__label {
+  color: var(--dim);
+  font: 8px var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.inspector-hidden-frame {
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: linear-gradient(135deg, #ffffff03, transparent);
+}
+.inspector-hidden-frame__toggle {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 33px;
+  gap: 7px;
+  padding: 7px 10px;
+  color: var(--muted);
+  text-align: left;
+}
+.inspector-hidden-frame__toggle:hover,
+.inspector-hidden-frame.is-expanded .inspector-hidden-frame__toggle {
+  color: var(--text);
+  background: #ffffff05;
+}
+.inspector-hidden-frame__toggle svg {
+  flex: 0 0 auto;
+  transition: transform .24s ease;
+}
+.inspector-hidden-frame__toggle svg.collapsed {
+  transform: rotate(-90deg);
+}
+.inspector-hidden-frame__name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font: 10px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector-hidden-frame__meta {
+  margin-left: auto;
+  color: var(--dim);
+  font: 8px var(--mono);
+  white-space: nowrap;
+}
+.inspector-hidden-frame__body {
+  padding: 5px 10px 11px;
+  border-top: 1px solid var(--line);
+  animation: hidden-frame-open .26s cubic-bezier(.2,.8,.2,1) both;
+}
+.inspector-hidden-frame__body .scalar-grid {
+  margin-bottom: 12px;
+}
+.inspector-hidden-frame__body .array-section {
+  margin-bottom: 12px;
+}
+.inspector-hidden-frame__empty {
+  padding: 7px 0 2px;
+  color: var(--dim);
+  font: 9px var(--mono);
+}
+@keyframes hidden-frame-open {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .inspector-hidden-frame__body { animation: none; }
+}
 .inspector-retired-frame .scalar-card,
 .inspector-retired-frame .array-cell strong {
   border-color: #e77b8755;

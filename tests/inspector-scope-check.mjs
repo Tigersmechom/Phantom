@@ -29,7 +29,9 @@ try {
     assert.equal(await value('b'), String(b));
     assert.equal(await scope.locator('[data-variable-kind="argument"]').count(), 2);
     assert.equal(await page.locator('.variables-panel .array-section,.variables-panel .array-note,.variables-panel [data-variable="i"],.variables-panel [data-variable="n"]').count(), 0, 'Caller values must be absent from the DOM, including fading content');
-    assert.doesNotMatch(await page.locator('.variables-panel').textContent(), /CALLER|вызывающий кадр|main\(\)|Σ/);
+    assert.equal(await page.locator('[data-hidden-frame]').count(), 1, 'The live caller is available behind a collapsed disclosure');
+    assert.equal(await page.locator('[data-hidden-frame] .inspector-hidden-frame__toggle').getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('[data-hidden-frame] [data-variable]').count(), 0, 'Hidden scopes do not pollute active-frame selectors');
     assert.equal(await page.getByTestId('stdin-editor').inputValue(), '3  1  4  1  5  9');
     assert.equal(await page.locator('[data-input-state="consumed"]').count(), 6);
     assert.equal(await page.locator('.timeline-track button').count(), 57);
@@ -87,6 +89,8 @@ try {
   await frame(21);
   await page.waitForTimeout(800);
   await assertAdd(0, 3);
+  await page.locator('[data-hidden-frame] .inspector-hidden-frame__toggle').click();
+  assert.ok(await page.locator('[data-hidden-frame] [data-hidden-variable]').count() > 0, 'The caller disclosure reveals its own variables');
   await page.screenshot({ path: '/private/tmp/phantom-inspector-add.png' });
   await frame(56);
   assert.equal(await scope.locator('[data-variable="i"]').count(), 0, 'Loop-local i is absent after its loop');

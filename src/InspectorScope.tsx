@@ -58,6 +58,10 @@ export interface InspectorFrame {
 
 export interface InspectorScopeProps {
   frame: InspectorFrame;
+  /** Other live stack frames. They remain collapsed until the user opens one. */
+  frames?: InspectorFrame[];
+  /** Alias used by backend projections that already separate the active frame. */
+  hiddenFrames?: InspectorFrame[];
   fileName: string;
   line: number;
   transition?: InspectorTransition;
@@ -275,15 +279,22 @@ function RetiredFrameView({
 function ScalarCard({
   variable,
   birth,
+  frameId,
+  hidden = false,
 }: {
   variable: InspectorScalar;
   birth: boolean;
+  frameId?: string;
+  hidden?: boolean;
 }) {
   return (
     <div
       className={`scalar-card ${birth ? "inspector-lifecycle-birth" : ""} ${variable.lifetime?.state === "invalidated" ? "inspector-lifecycle-invalidated" : ""}`}
       data-value-cell
-      data-variable={variable.name}
+      data-variable={hidden ? undefined : variable.name}
+      data-hidden-variable={hidden ? variable.name : undefined}
+      data-frame-variable={hidden && frameId ? `${frameId}:${variable.name}` : undefined}
+      data-frame-id={frameId}
       data-variable-kind={variable.kind}
       data-lifetime={variable.lifetime?.state}
       data-lifecycle={birth ? "birth" : undefined}
@@ -311,11 +322,15 @@ function ArrayView({
   collapsed,
   onToggle,
   birthIndexes,
+  frameId,
+  hidden = false,
 }: {
   array: InspectorArray;
   collapsed: boolean;
   onToggle: () => void;
   birthIndexes: Set<number>;
+  frameId?: string;
+  hidden?: boolean;
 }) {
   const expanded = !collapsed;
   const focus = array.readingIndex ?? array.changedIndex;
@@ -340,7 +355,10 @@ function ArrayView({
   return (
     <div
       className={`array-section ${array.presentation === "prefix" ? "prefix-section" : ""}`}
-      data-variable={array.name}
+      data-variable={hidden ? undefined : array.name}
+      data-hidden-variable={hidden ? array.name : undefined}
+      data-frame-variable={hidden && frameId ? `${frameId}:${array.name}` : undefined}
+      data-frame-id={frameId}
       data-lifetime={array.lifetime?.state}
       title={array.name}
     >
@@ -428,14 +446,86 @@ function ArrayView({
   );
 }
 
+function HiddenFrameCard({
+  frame,
+  expanded,
+  onToggle,
+}: {
+  frame: InspectorFrame;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const [collapsedArrays, setCollapsedArrays] = useState<Record<string, boolean>>({});
+  return (
+    <section
+      className={`inspector-hidden-frame ${expanded ? "is-expanded" : "is-collapsed"}`}
+      data-hidden-frame={frame.id}
+      data-function={frame.functionName}
+    >
+      <button
+        type="button"
+        className="inspector-hidden-frame__toggle"
+        aria-expanded={expanded}
+        aria-controls={`hidden-frame-${frame.id}`}
+        onClick={onToggle}
+      >
+        <ChevronDown size={12} className={expanded ? "" : "collapsed"} />
+        <span className="inspector-hidden-frame__name">{frame.functionName}</span>
+        <span className="inspector-hidden-frame__meta">
+          {frame.scalars.length + frame.arrays.length} знач.
+        </span>
+      </button>
+      {expanded && (
+        <div id={`hidden-frame-${frame.id}`} className="inspector-hidden-frame__body">
+          {frame.scalars.length > 0 && (
+            <div className="scalar-grid">
+              {frame.scalars.map((variable) => (
+                <ScalarCard
+                  key={`${frame.id}:${variable.id}`}
+                  variable={variable}
+                  birth={false}
+                  frameId={frame.id}
+                  hidden
+                />
+              ))}
+            </div>
+          )}
+          {frame.arrays.map((array) => (
+            <ArrayView
+              key={`${frame.id}:${array.id}`}
+              array={array}
+              collapsed={Boolean(collapsedArrays[array.id])}
+              onToggle={() =>
+                setCollapsedArrays((items) => ({
+                  ...items,
+                  [array.id]: !items[array.id],
+                }))
+              }
+              birthIndexes={new Set()}
+              frameId={frame.id}
+              hidden
+            />
+          ))}
+          {frame.scalars.length === 0 && frame.arrays.length === 0 && (
+            <div className="inspector-hidden-frame__empty">нет доступных значений</div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function InspectorScope({
   frame,
+  frames,
+  hiddenFrames,
   fileName,
   line,
   transition,
   motion,
 }: InspectorScopeProps) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [expandedFrames, setExpandedFrames] = useState<Record<string, boolean>>({});
   const [retired, setRetired] = useState<RetiredFrame[]>([]);
   const frameRef = useRef<InspectorFrame | null>(null);
   const frameIdRef = useRef<string | null>(null);
@@ -541,6 +631,13 @@ export default function InspectorScope({
   }, [motion, motionSignature, transition?.kind]);
 
   const scopeMotion = useChangeMotion<HTMLDivElement>(frame.id, "scope");
+  const otherFrames = Array.from(
+    new Map(
+      [...(frames || []), ...(hiddenFrames || [])]
+        .filter((candidate) => candidate.id !== frame.id)
+        .map((candidate) => [candidate.id, candidate] as const),
+    ).values(),
+  );
   return (
     <>
       {retired.map((item) => (
@@ -600,6 +697,24 @@ export default function InspectorScope({
               birthIndexes={birthArrays.get(array.id) || new Set()}
             />
           ))}
+          {otherFrames.length > 0 && (
+            <div className="inspector-hidden-scopes" aria-label="Другие области видимости">
+              <div className="inspector-hidden-scopes__label">Другие функции</div>
+              {otherFrames.map((otherFrame) => (
+                <HiddenFrameCard
+                  key={otherFrame.id}
+                  frame={otherFrame}
+                  expanded={Boolean(expandedFrames[otherFrame.id])}
+                  onToggle={() =>
+                    setExpandedFrames((items) => ({
+                      ...items,
+                      [otherFrame.id]: !items[otherFrame.id],
+                    }))
+                  }
+                />
+              ))}
+            </div>
+          )}
         </div>
         <div className="stack-row" ref={scopeMotion}>
           <span className="stack-symbol">↳</span>

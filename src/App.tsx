@@ -158,6 +158,15 @@ function demoInspectorFrame(current: DemoSnapshot): InspectorFrame {
   };
 }
 
+function demoHiddenFrames(current: DemoSnapshot): InspectorFrame[] {
+  // While add(a,b) is active, main() remains a live caller frame. Keep it
+  // available behind a collapsed disclosure instead of mixing caller locals
+  // into the active callee scope.
+  return current.functionName === "main()"
+    ? []
+    : [demoInspectorFrame({ ...current, functionName: "main()" })];
+}
+
 export default function App() {
   const [prefs, setPrefs] = useState(readPrefs);
   const [mode, setMode] = useState<"debug" | "basic">("debug");
@@ -172,6 +181,7 @@ export default function App() {
   const [traceInput, setTraceInput] = useState(DEFAULT_INPUT);
   const [values, setValues] = useState([3, 1, 4, 1, 5, 9]);
   const [step, setStep] = useState(0);
+  const [editorActiveLine, setEditorActiveLine] = useState(0);
   const [transition, setTransition] = useState<InspectorTransition>({ kind: "seek" });
   const [playing, setPlaying] = useState(false);
   const [consoleOpen, setConsoleOpen] = useState(false);
@@ -204,9 +214,22 @@ export default function App() {
     palettes[prefs.theme === "porcelain" ? "light" : "dark"].colors;
   const current = snapshot(step, values);
   const inspectorFrame = showDemoState ? demoInspectorFrame(current) : null;
+  const hiddenInspectorFrames = showDemoState ? demoHiddenFrames(current) : [];
   const fileName = document?.name || "prefix_sum.cpp";
   const activeLine = showDemoState ? current.line : 0;
   const hasDemoOutput = showDemoState && current.output !== null;
+  const globalLines = showDemoState
+    ? [...new Set(current.expression?.globalReferences?.flatMap((reference) =>
+        reference.declarationRange ? [reference.declarationRange.start.line] : [],
+      ) ?? [])]
+    : [];
+  // The 3D scene follows every recorded operation. The 2D editor follows
+  // source-line changes only, so `i++` and the following loop condition do
+  // not replay the same line highlight twice.
+  useEffect(() => {
+    const nextLine = showDemoState ? current.line : 0;
+    setEditorActiveLine((previous) => previous === nextLine ? previous : nextLine);
+  }, [showDemoState, current.line]);
   /** Move the prepared trace while explicitly describing its lifecycle edge.
    * A missing variable is never inferred as a death: only a frame return can
    * request the inspector's finite retirement choreography. */
@@ -489,11 +512,16 @@ export default function App() {
       );
       return;
     }
+    if (step >= DEMO_FRAME_COUNT - 1) {
+      setToast("Выполнение уже завершено. Выберите кадр истории или сбросьте пример.");
+      return;
+    }
+    // Run is a resume command. The history cursor is authoritative: changing
+    // input refreshes the trace values, but never silently teleports it back
+    // to frame 0. Reset remains the explicit way to restart the demo.
     setValues(parsed);
     setTraceInput(input);
     presentationMotion.reset();
-    setTransition({ kind: "seek" });
-    setStep(0);
     setPlaying(true);
     setRunResult(null);
   }
@@ -700,7 +728,7 @@ export default function App() {
         <label className="operation-speed" title="Скорость выполнения шагов">
           <select
             aria-label="Операций в секунду"
-            disabled={mode !== "debug"}
+            disabled={mode !== "debug" || prefs.playbackMode === "base"}
             value={prefs.operationsPerSecond}
             onChange={(event) =>
               update({ operationsPerSecond: Number(event.target.value) })
@@ -901,11 +929,12 @@ export default function App() {
                 <CodeEditor
                   source={source}
                   onChange={editSource}
-                  activeLine={activeLine}
+                  activeLine={editorActiveLine}
                   architecture={arch}
                   depth={prefs.depth}
                   font={prefs.font}
                   fontSize={prefs.fontSize}
+                  globalLines={globalLines}
                 />
               )}
             </div>
@@ -1065,6 +1094,7 @@ export default function App() {
                       frame={inspectorFrame}
                       fileName={fileName}
                       line={current.line}
+                      hiddenFrames={hiddenInspectorFrames}
                       transition={transition}
                       motion={presentationMotion}
                     />

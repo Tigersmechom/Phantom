@@ -109,6 +109,12 @@
 .expression-chip--inline .expression-result::before { top: 1px; font-size: 12px; }
 .expression-values-area--immediate .expression-result { animation: expression-result-immediate var(--result-fade, 240ms) ease-out both; }
 .expression-values-area--pending .expression-operand { animation: expression-rise 320ms ease-out both; }
+.expression-chip--call .expression-values-area--pending .expression-operand {
+  /* Function arguments are the most information-dense part of a trace. Give
+     each value enough time to be read before the call is allowed to resolve. */
+  animation: expression-call-rise 1250ms cubic-bezier(.22,.61,.36,1) both;
+  animation-delay: calc(var(--operand-index, 0) * 140ms);
+}
 .expression-pending-note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--spatial-muted); font: 11px/1.4 'Monaspace Krypton', ui-monospace, monospace; }
 .spatial-code--light .expression-chip { border-color: rgba(71, 115, 115, .24); background: rgba(249, 252, 250, .95); box-shadow: 0 4px 16px rgba(34, 55, 58, .1); }
 .spatial-code--light .expression-chip--rail { background: linear-gradient(90deg, rgba(248, 252, 250, .96), rgba(245, 248, 247, .8)); }
@@ -130,6 +136,11 @@
 }
 @keyframes expression-result-immediate { from { opacity: .1; } to { opacity: 1; } }
 @keyframes expression-rise { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes expression-call-rise {
+  0% { opacity: 0; transform: translateY(12px) scale(.94); filter: blur(3px); }
+  34% { opacity: .72; transform: translateY(2px) scale(.985); filter: blur(.6px); }
+  62%, 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
 @media (prefers-reduced-motion: reduce) {
   .expression-card, .expression-stage-presence { transition: none; }
   .expression-chip-motion, .expression-operand, .expression-result { animation: none; }
@@ -232,6 +243,12 @@
 }
 .rail-result .expression-result::before { content: none; }
 .rail-equation--pending .rail-argument { animation: expression-rise 380ms ease-out both; }
+.rail-equation--pending.rail-equation--call .rail-argument {
+  /* Keep prefix[i] and values[i] as separate, staged frames. The 1.45s
+     envelope is intentionally slower than ordinary value appearance. */
+  animation: rail-call-argument-reveal 1450ms cubic-bezier(.22,.61,.36,1) both;
+  animation-delay: calc(var(--operand-index, 0) * 150ms);
+}
 .rail-equation--pending .expression-operator { animation: none; }
 .rail-equation--immediate .rail-result { animation: expression-result-immediate var(--result-fade, 260ms) ease-out both; }
 .expression-connector--rail path { stroke: var(--rail-result, #72f0c3); stroke-width: 2.6; stroke-dasharray: 8 6; stroke-linecap: round; opacity: .92; }
@@ -252,6 +269,11 @@
   13.6%, 50% { opacity: 1; transform: translate(0,0); }
   58% { opacity: 1; }
   82.2%, 100% { opacity: 0; transform: translate(var(--operand-merge-x,0px),0) scale(.8); }
+}
+@keyframes rail-call-argument-reveal {
+  0% { opacity: 0; transform: translateY(18px) scale(.88); filter: blur(4px); }
+  38% { opacity: .72; transform: translateY(3px) scale(.98); filter: blur(1px); }
+  66%, 100% { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
 }
 @keyframes rail-operator-fade { 0%, 13.6% { opacity: 0; } 24%, 59% { opacity: 1; } 78%, 100% { opacity: 0; } }
 @keyframes rail-result-reveal {

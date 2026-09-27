@@ -1,4 +1,4 @@
-import type { ExpressionEvent, ExpressionOperator, SourceRange } from './execution-types';
+import type { ExpressionEvent, ExpressionOperator, GlobalReference, RuntimeControlEvent, SourceRange } from './execution-types';
 import type { InputTrace } from './backend-contract';
 
 export const DEMO_SOURCE = `#include <iostream>
@@ -20,7 +20,101 @@ int main() {
     }
     std::cout << "sum = " << prefix[n] << '\\n';
     return 0;
+}
+
+// Runtime gallery: the prepared prefix trace stays deterministic above, while
+// this callable fixture keeps the language constructs visible for the real
+// backend and semantic highlighter.
+int phantom_global_limit = 3;
+int phantom_runtime_gallery(int value) {
+    if (value < phantom_global_limit) {
+        value += 1;
+    } else if (value == phantom_global_limit) {
+        switch (value) {
+            case 0: break;
+            case 1:
+                value += 1;
+                break;
+            default: goto phantom_fallback;
+        }
+    } else {
+        while (true) {
+            if (value <= 0) break;
+            --value;
+            if (value == 1) continue;
+            if (value == 0) break;
+        }
+    }
+    try {
+        if (value < 0) throw value;
+    } catch (int error) {
+        return error;
+    }
+phantom_fallback:
+    return phantom_global_limit;
 }`;
+
+/**
+ * Small, source-backed control-flow fixture used by contract/UI probes. It is
+ * deliberately separate from the 57-frame prefix-sum walkthrough so changing
+ * the demonstration does not change its stable timeline. Every event below is
+ * an observed path fact; a real backend may instead emit a gap when a phase is
+ * not instrumented.
+ */
+export const DEMO_RUNTIME_EDGE_SOURCE = `int globalLimit = 3;
+int branch(int value) {
+    for (;;) {
+        if (value < globalLimit) { break; }
+        else { continue; }
+        switch (value) {
+            case 0: break;
+            case 1: value++; break;
+            default: goto fallback;
+        }
+    }
+    try { throw value; }
+    catch (int error) { return error; }
+fallback:
+    return globalLimit;
+}`;
+const edgeRange = (line: number, text: string): SourceRange => {
+  const sourceLine = DEMO_RUNTIME_EDGE_SOURCE.split('\n')[line - 1] ?? '';
+  const offset = sourceLine.indexOf(text);
+  if (offset < 0) throw Error(`Prepared runtime annotation no longer matches line ${line}: ${text}`);
+  return { start: { line, column: offset + 1 }, end: { line, column: offset + text.length + 1 } };
+};
+const edgeEvent = (id: string, kind: RuntimeControlEvent['kind'], phase: RuntimeControlEvent['phase'], line: number, text: string, extra: Partial<RuntimeControlEvent> = {}): RuntimeControlEvent => ({
+  id, kind, phase, line, range: edgeRange(line, text), observed: true, ...extra,
+});
+export const DEMO_GLOBAL_LIMIT: GlobalReference = {
+  id: 'demo:globalLimit', name: 'globalLimit', qualifiedName: '::globalLimit', type: 'int', value: 3,
+  scope: 'global', locator: 'global::globalLimit', useRange: edgeRange(4, 'globalLimit'), declarationRange: edgeRange(1, 'globalLimit'),
+};
+export const DEMO_RUNTIME_EDGE_CASES: Readonly<{
+  source: string;
+  globals: readonly GlobalReference[];
+  controls: readonly RuntimeControlEvent[];
+}> = {
+  source: DEMO_RUNTIME_EDGE_SOURCE,
+  globals: [DEMO_GLOBAL_LIMIT],
+  controls: [
+    edgeEvent('edge:loop', 'loop', 'condition', 3, 'for (;;)', { condition: 1, conditionKind: 'boolean', branch: 'true', targetLine: 3 }),
+    edgeEvent('edge:if', 'if', 'condition', 4, 'if (value < globalLimit)', { condition: 1, conditionKind: 'boolean', branch: 'true', targetLine: 4 }),
+    edgeEvent('edge:break-if', 'break', 'taken', 4, 'break', { targetLine: 6 }),
+    edgeEvent('edge:else', 'else', 'taken', 5, 'else', { branch: 'false', targetLine: 5 }),
+    edgeEvent('edge:continue', 'continue', 'taken', 5, 'continue', { targetLine: 3 }),
+    edgeEvent('edge:switch', 'switch', 'condition', 6, 'switch (value)', { condition: 2, conditionKind: 'integer', branch: 'case', targetLine: 9 }),
+    edgeEvent('edge:case-0', 'case', 'taken', 7, 'case 0:', { condition: 0, conditionKind: 'integer', branch: 'case', targetLine: 7 }),
+    edgeEvent('edge:case-1', 'case', 'fallthrough', 8, 'case 1:', { branch: 'case', targetLine: 8 }),
+    edgeEvent('edge:default', 'default', 'taken', 9, 'default:', { branch: 'default', targetLine: 10 }),
+    edgeEvent('edge:goto', 'goto', 'taken', 9, 'goto fallback', { targetLine: 15 }),
+    edgeEvent('edge:throw', 'throw', 'before', 12, 'throw value', { exceptionId: 'edge:exception-1', exceptionType: 'int' }),
+    edgeEvent('edge:unwind', 'throw', 'unwind', 12, 'throw value', { exceptionId: 'edge:exception-1', exceptionType: 'int' }),
+    edgeEvent('edge:catch', 'catch', 'caught', 13, 'catch (int error)', { exceptionId: 'edge:exception-1', exceptionType: 'int', targetLine: 13 }),
+    edgeEvent('edge:return-catch', 'return', 'taken', 13, 'return error', { targetLine: 16 }),
+    edgeEvent('edge:return-goto', 'return', 'taken', 15, 'return globalLimit', { targetLine: 16 }),
+  ],
+};
 export const DEFAULT_INPUT = "3  1  4  1  5  9";
 export const DEMO_FRAME_COUNT = 57;
 export function parseInput(value: string): number[] | null {
