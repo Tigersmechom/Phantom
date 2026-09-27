@@ -3,7 +3,7 @@ import type { InputTrace } from './backend-contract';
 
 export const DEMO_SOURCE = `#include <iostream>
 #include <vector>
-
+int phantom_runtime_gallery(int value);
 int add(int a, int b) {
     return a + b;
 }
@@ -19,6 +19,7 @@ int main() {
         prefix[i + 1] = add(prefix[i], values[i]);
     }
     std::cout << "sum = " << prefix[n] << '\\n';
+    (void)phantom_runtime_gallery(prefix[n]);
     return 0;
 }
 
@@ -175,7 +176,8 @@ const demoExpressionSpans: Record<string, { text: string; operands: string[]; re
   '5:+': { text: 'a + b', operands: ['a', 'b'] },
   '16:=': { text: 'prefix[i + 1] = add(prefix[i], values[i])', operands: ['add(prefix[i], values[i])'] },
   '18:output': { text: 'prefix[n]', operands: ['prefix[n]'] },
-  '19:return': { text: 'return 0', operands: ['0'] },
+  '19:call': { text: 'phantom_runtime_gallery(prefix[n])', operands: ['prefix[n]'] },
+  '20:return': { text: 'return 0', operands: ['0'] },
 };
 /** Static annotations of DEMO_SOURCE, not a C++ expression recognizer. */
 function demoExpressionRanges(line: number, operator: ExpressionOperator): Pick<ExpressionEvent, 'range' | 'operandRanges' | 'operandLabels' | 'resultKind'> {
@@ -265,9 +267,21 @@ export function snapshot(step: number, values: number[]): DemoSnapshot {
       state.i = null; state.inLoop = false; state.initialized.i = false;
       state.output = state.sum === null ? null : `sum = ${state.sum}\n`;
       move(18, 'output', 'Вывод prefix[n]', event(frame, 18, 'output', [state.sum], state.sum, 'cout << prefix[n]'));
+      // Keep the 57-frame prefix trace intact while making the runtime gallery
+      // a real call from main. Two recorded groups let the 2D/3D expression
+      // overlay dwell on the output and then reveal the call arguments rather
+      // than flashing through the call between adjacent history frames.
+      const output = state.expression!;
+      const outputStage = { ...output, id: `${output.id}:output` };
+      const call = event(frame, 19, 'call', [state.sum], null, 'phantom_runtime_gallery(prefix[n])', 'phantom_runtime_gallery');
+      call.id = `${call.id}:runtime-gallery`;
+      output.groups = [
+        { id: `demo:${frame}:output`, stages: [outputStage] },
+        { id: `demo:${frame}:runtime-gallery`, stages: [call] },
+      ];
     } else {
       state.done = true;
-      move(19, 'return', 'Возврат 0 из main()', event(frame, 19, 'return', [0], 0, 'return 0'));
+      move(20, 'return', 'Возврат 0 из main()', event(frame, 20, 'return', [0], 0, 'return 0'));
     }
   }
   return state;

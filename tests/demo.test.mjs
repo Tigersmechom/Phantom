@@ -112,6 +112,16 @@ test('false final condition, output and main return are separate deterministic f
   assert.equal(snapshot(56, [1, 2, 3, 4, 5, 6]).output, 'sum = 21\n');
 });
 
+test('main invokes the runtime gallery without changing the prefix timeline', () => {
+  const output = snapshot(55, input).expression;
+  assert.match(DEMO_SOURCE.split('\n')[18], /phantom_runtime_gallery\(prefix\[n\]\)/);
+  assert.deepEqual(output?.groups?.map(group => group.id), ['demo:55:output', 'demo:55:runtime-gallery']);
+  assert.equal(output?.groups?.[1]?.stages[0]?.operator, 'call');
+  assert.deepEqual(output?.groups?.[1]?.stages[0]?.operands, [23]);
+  assert.equal(output?.groups?.[1]?.stages[0]?.result, null, 'The call stays pending until its arguments have been read');
+  assert.equal(DEMO_FRAME_COUNT, 57, 'The gallery call does not extend the prefix walkthrough');
+});
+
 test('source ranges are exact and snapshots can be revisited without mutation or invented values', () => {
   const expression = snapshot(21, input).expression;
   const line = DEMO_SOURCE.split('\n')[expression.line - 1];

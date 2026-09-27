@@ -10,6 +10,8 @@ export interface CodeEditorProps {
   depth: boolean;
   font: 'neon' | 'krypton' | 'xcode';
   fontSize: number;
+  /** Duration used when the execution marker travels to a new source line. */
+  lineTransitionMs?: number;
   /** Declaration lines of primitive globals used by the current expression. */
   globalLines?: number[];
 }
@@ -52,7 +54,7 @@ function assemblyLines(architecture: CodeEditorProps['architecture'], source: st
   return [['mov', 'eax, DWORD PTR [rbp-8]'], ['add', 'eax, DWORD PTR [rbp-12]'], ['mov', 'DWORD PTR [rbp-8], eax'], ['nop', '']];
 }
 
-export default function CodeEditor({ source, onChange, activeLine, architecture, depth, font, fontSize, globalLines = [] }: CodeEditorProps) {
+export default function CodeEditor({ source, onChange, activeLine, architecture, depth, font, fontSize, lineTransitionMs = 300, globalLines = [] }: CodeEditorProps) {
   const input = useRef<HTMLTextAreaElement>(null);
   const codePlane = useRef<HTMLDivElement>(null);
   const highlight = useRef<HTMLPreElement>(null);
@@ -241,6 +243,7 @@ export default function CodeEditor({ source, onChange, activeLine, architecture,
     '--editor-line-height': `${lineHeight}px`,
     '--editor-scroll-y': `${-scroll.top}px`,
     '--editor-scroll-x': `${-scroll.left}px`,
+    '--editor-line-transition': `${Math.max(0, lineTransitionMs)}ms`,
   } as CSSProperties;
 
   return <div className={`code-editor${depth ? ' code-editor--depth' : ''}${focused ? ' code-editor--focused' : ''}`} style={style} data-testid="code-editor">

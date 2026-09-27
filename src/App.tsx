@@ -218,6 +218,12 @@ export default function App() {
   const fileName = document?.name || "prefix_sum.cpp";
   const activeLine = showDemoState ? current.line : 0;
   const hasDemoOutput = showDemoState && current.output !== null;
+  // Give the 2D execution marker a visible, cadence-aware travel time. A
+  // short floor keeps fast RATE playback readable, while the cap prevents
+  // slow playback from making a line linger after the next frame is ready.
+  const editorLineTransitionMs = prefs.playbackMode === "base"
+    ? 460
+    : Math.min(720, Math.max(140, (1000 / prefs.operationsPerSecond) * 0.62));
   const globalLines = showDemoState
     ? [...new Set(current.expression?.globalReferences?.flatMap((reference) =>
         reference.declarationRange ? [reference.declarationRange.start.line] : [],
@@ -929,11 +935,12 @@ export default function App() {
                 <CodeEditor
                   source={source}
                   onChange={editSource}
-                  activeLine={editorActiveLine}
+                  activeLine={showDemoState ? editorActiveLine : 0}
                   architecture={arch}
                   depth={prefs.depth}
                   font={prefs.font}
                   fontSize={prefs.fontSize}
+                  lineTransitionMs={editorLineTransitionMs}
                   globalLines={globalLines}
                 />
               )}
