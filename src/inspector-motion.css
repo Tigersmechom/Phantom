@@ -47,6 +47,19 @@
 .inspector .variable-name {
   font-size: calc(12px * var(--debug-name-scale, 1));
 }
+.inspector .scalar-card .variable-name,
+.inspector .array-heading .variable-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector .array-heading .type-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .inspector .state-heading h1 {
   font-size: calc(19px * var(--debug-name-scale, 1));
   overflow-wrap: anywhere;
@@ -185,4 +198,165 @@
   .inspector.is-playing .state-orb::after {
     animation: none;
   }
+}
+
+/* Variable lifetime choreography. Retired nodes carry only data-retired-* so
+   an active-frame query can never accidentally read a caller's ghost. */
+.inspector-lifecycle-birth {
+  animation: inspector-birth 720ms cubic-bezier(.2,.75,.2,1) both;
+}
+.inspector-retired-frame {
+  display: grid;
+  position: relative;
+  grid-template-rows: 1fr;
+  min-height: 0;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: 1;
+  animation: inspector-retired-lane 1400ms cubic-bezier(.24,.7,.2,1) both;
+}
+.inspector-retired-frame::after {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  left: 8%;
+  right: 8%;
+  top: 50%;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, #ff7180 22%, #fff 50%, #ff7180 78%, transparent);
+  box-shadow: 0 0 8px #ff718055;
+  transform-origin: 86% 50%;
+  animation: inspector-crt-collapse 1400ms cubic-bezier(.16,.8,.2,1) both;
+}
+.inspector-retired-frame__inner {
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 23px;
+}
+.inspector-retired-frame .scope-label {
+  margin-top: 2px;
+  color: #df7a87;
+  animation: inspector-retired-label 980ms cubic-bezier(.2,.7,.2,1) both;
+}
+.inspector-retired-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  padding: 5px 0 9px;
+}
+.inspector-retired-variable {
+  animation: inspector-retired-card 980ms cubic-bezier(.2,.7,.2,1) both;
+  animation-delay: var(--lifecycle-delay, 0ms);
+  transform-origin: 50% 50%;
+}
+.inspector-retired-variable .motion-value {
+  animation: inspector-retired-ink 980ms cubic-bezier(.2,.7,.2,1) both;
+}
+.inspector-retired-frame .array-section {
+  margin-bottom: 10px;
+}
+.inspector-retired-frame .array-cells {
+  overflow: hidden;
+}
+.inspector-retired-stack {
+  animation: inspector-retired-stack 980ms cubic-bezier(.2,.7,.2,1) both;
+}
+.inspector-array-empty {
+  color: var(--dim);
+  border: 1px dashed var(--line-strong);
+  border-radius: 6px;
+  padding: 8px;
+  font: 9px var(--mono);
+}
+.inspector-array-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 7px;
+  color: var(--dim);
+  font: 8px var(--mono);
+}
+.inspector-array-pagination button {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  color: var(--muted);
+}
+.inspector-array-pagination button:disabled {
+  opacity: .3;
+}
+.inspector-array-pagination button:not(:disabled):hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.inspector-retired-frame .scalar-card,
+.inspector-retired-frame .array-cell strong {
+  border-color: #e77b8755;
+}
+.inspector-lifecycle-invalidated {
+  border-color: #e2536470 !important;
+  color: #f27a88;
+  box-shadow: 0 0 0 1px #e2536428, 0 0 15px #e2536418;
+}
+.inspector-lifecycle-invalidated::after {
+  content: "lifetime ended";
+  display: block;
+  color: #d96e7d;
+  font: 7px/1 var(--mono);
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  opacity: .75;
+}
+@keyframes inspector-birth {
+  0% { opacity: 0; transform: translateY(8px) scale(.95); filter: saturate(.35) brightness(1.8); }
+  20% { opacity: 1; border-color: #fff; filter: saturate(1.1) brightness(1.45); }
+  100% { opacity: 1; transform: translateY(0) scale(1); filter: none; }
+}
+@keyframes inspector-retired-card {
+  0% { opacity: 1; transform: translateX(0) scale(1); border-color: #e2536466; color: inherit; filter: saturate(1); }
+  18% { border-color: #ed5263; color: #ff7d89; filter: saturate(1.6) brightness(1.15); }
+  38% { border-color: #fff; color: #fff; filter: saturate(.35) brightness(1.5); }
+  57% { opacity: .55; border-color: #ffffff44; color: #ffffff88; filter: saturate(0) brightness(1.15); }
+  74% { opacity: .13; transform: translateX(-8px) scale(.78); border-color: transparent; }
+  100% { opacity: 0; transform: translateX(-18px) scale(.18); border-color: transparent; filter: blur(1px); }
+}
+@keyframes inspector-retired-ink {
+  0%, 45% { opacity: 1; }
+  63% { opacity: .5; }
+  77%, 100% { opacity: 0; transform: scale(.15); }
+}
+@keyframes inspector-retired-label {
+  0%, 38% { opacity: 1; color: #ff7d89; }
+  67% { opacity: .35; color: #fff; }
+  100% { opacity: 0; transform: translateX(-15px); }
+}
+@keyframes inspector-retired-stack {
+  0% { opacity: .9; max-height: 40px; }
+  62% { opacity: .25; }
+  100% { opacity: 0; max-height: 0; padding-block: 0; border-color: transparent; }
+}
+@keyframes inspector-retired-lane {
+  0%, 82% { grid-template-rows: 1fr; opacity: 1; }
+  100% { grid-template-rows: 0fr; opacity: 0; }
+}
+@keyframes inspector-crt-collapse {
+  0%, 57% { opacity: 0; transform: scaleX(0) scaleY(1); }
+  65% { opacity: .95; transform: scaleX(1) scaleY(1); }
+  82% { opacity: .85; transform: scaleX(.16) scaleY(1); }
+  100% { opacity: 0; transform: scaleX(.02) scaleY(4); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .inspector-lifecycle-birth,
+  .inspector-retired-frame,
+  .inspector-retired-frame .scope-label,
+  .inspector-retired-variable,
+  .inspector-retired-variable .motion-value,
+  .inspector-retired-stack { animation: none; }
+  .inspector-retired-frame { display: none; }
+  .inspector-retired-frame::after { animation: none; }
 }

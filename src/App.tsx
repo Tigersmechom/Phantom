@@ -40,6 +40,8 @@ import CodeEditor from "./CodeEditor";
 import InputPanel from "./InputPanel";
 import { useChangeMotion } from "./AnimatedValue";
 import InspectorScope, { type InspectorFrame } from "./InspectorScope";
+import type { InspectorTransition } from "./inspector-lifecycle";
+import { presentationMotion } from "./presentation-motion";
 import "./inspector-motion.css";
 import Separator from "./Separator";
 import SettingsPanel, { defaultBuildConfig } from "./SettingsPanel";
@@ -170,6 +172,7 @@ export default function App() {
   const [traceInput, setTraceInput] = useState(DEFAULT_INPUT);
   const [values, setValues] = useState([3, 1, 4, 1, 5, 9]);
   const [step, setStep] = useState(0);
+  const [transition, setTransition] = useState<InspectorTransition>({ kind: "seek" });
   const [playing, setPlaying] = useState(false);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [bottomTab, setBottomTab] = useState<"terminal" | "build">("terminal");
@@ -204,6 +207,27 @@ export default function App() {
   const fileName = document?.name || "prefix_sum.cpp";
   const activeLine = showDemoState ? current.line : 0;
   const hasDemoOutput = showDemoState && current.output !== null;
+  /** Move the prepared trace while explicitly describing its lifecycle edge.
+   * A missing variable is never inferred as a death: only a frame return can
+   * request the inspector's finite retirement choreography. */
+  const goToStep = useCallback((target: number, kind: InspectorTransition["kind"] = "seek") => {
+    const bounded = Math.max(0, Math.min(DEMO_FRAME_COUNT - 1, Math.floor(target)));
+    const previous = snapshot(step, values);
+    const nextFrame = snapshot(bounded, values);
+    presentationMotion.reset();
+    setTransition({
+      kind,
+      // In the prepared trace `main() → add(a,b)` is a call (birth of a
+      // callee), while `add(a,b) → main()` is an actual return. Retire only
+      // the latter; entering a callee must never ghost the caller's scope.
+      departedFrame:
+        showDemoState &&
+        kind === "forward" &&
+        previous.functionName !== "main()" &&
+        nextFrame.functionName === "main()",
+    });
+    setStep(bounded);
+  }, [showDemoState, step, values]);
   const update = useCallback(
     (patch: Partial<Preferences>) => setPrefs((p) => ({ ...p, ...patch })),
     [],
@@ -239,6 +263,8 @@ export default function App() {
     setSavedSource(content);
     setPlaying(false);
     setRunResult(null);
+    presentationMotion.reset();
+    setTransition({ kind: "seek" });
     setStep(0);
   }, []);
   useEffect(() => {
@@ -264,24 +290,39 @@ export default function App() {
       setPlaying(false);
       return;
     }
-    const timer = setTimeout(
-      () => setStep((s) => Math.min(DEMO_FRAME_COUNT - 1, s + 1)),
-      1000 / prefs.operationsPerSecond,
-    );
-    return () => clearTimeout(timer);
-  }, [playing, step, prefs.operationsPerSecond]);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const advance = () => {
+      if (cancelled) return;
+      goToStep(step + 1, "forward");
+    };
+    if (prefs.playbackMode === "base") {
+      void presentationMotion.waitForSettled().then(() => {
+        if (cancelled) return;
+        timer = setTimeout(advance, 500);
+      });
+    } else {
+      timer = setTimeout(advance, 1000 / prefs.operationsPerSecond);
+    }
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [goToStep, playing, step, prefs.operationsPerSecond, prefs.playbackMode]);
   const next = useCallback(() => {
     setPlaying(false);
-    setStep((s) => Math.min(DEMO_FRAME_COUNT - 1, s + 1));
-  }, []);
+    goToStep(step + 1, "forward");
+  }, [goToStep, step]);
   const back = useCallback(() => {
     setPlaying(false);
-    setStep((s) => Math.max(0, s - 1));
-  }, []);
+    goToStep(step - 1, "seek");
+  }, [goToStep, step]);
   function editSource(value: string) {
     setSource(value);
     setPlaying(false);
     setRunResult(null);
+    presentationMotion.reset();
+    setTransition({ kind: "seek" });
   }
   async function save() {
     if (operationRef.current || (native && !project)) return false;
@@ -450,6 +491,8 @@ export default function App() {
     }
     setValues(parsed);
     setTraceInput(input);
+    presentationMotion.reset();
+    setTransition({ kind: "seek" });
     setStep(0);
     setPlaying(true);
     setRunResult(null);
@@ -465,6 +508,8 @@ export default function App() {
     setInput(DEFAULT_INPUT);
     setTraceInput(DEFAULT_INPUT);
     setValues([3, 1, 4, 1, 5, 9]);
+    presentationMotion.reset();
+    setTransition({ kind: "seek" });
     setStep(0);
     setRunResult(null);
     setMode("debug");
@@ -669,6 +714,19 @@ export default function App() {
           </select>
           <span>оп/с</span>
         </label>
+        <label className="operation-speed" title="Глубина показа анимаций">
+          <select
+            aria-label="Режим воспроизведения"
+            disabled={mode !== "debug"}
+            value={prefs.playbackMode}
+            onChange={(event) =>
+              update({ playbackMode: event.target.value as Preferences["playbackMode"] })
+            }
+          >
+            <option value="rate">RATE</option>
+            <option value="base">BASE</option>
+          </select>
+        </label>
         <span className="toolbar-divider" />
         <div className="architecture">
           <span className="chip-icon">
@@ -826,6 +884,8 @@ export default function App() {
                     activeLine={activeLine}
                     expression={showDemoState ? current.expression : null}
                     expressionStyle={prefs.expressionStyle}
+                    expressionAnimations={prefs.spatialExpressionAnimations}
+                    playbackMode={prefs.playbackMode}
                     stepDurationMs={1000 / prefs.operationsPerSecond}
                     isPlaying={playing}
                     executionKey={step}
@@ -1005,6 +1065,8 @@ export default function App() {
                       frame={inspectorFrame}
                       fileName={fileName}
                       line={current.line}
+                      transition={transition}
+                      motion={presentationMotion}
                     />
                   ) : (
                     <div className="program-state-empty">
@@ -1039,7 +1101,7 @@ export default function App() {
                           className={`${i <= step ? "visited" : ""} ${i === step ? "current" : ""}`}
                           onClick={() => {
                             setPlaying(false);
-                            setStep(i);
+                            goToStep(i, "seek");
                           }}
                         >
                           <i />

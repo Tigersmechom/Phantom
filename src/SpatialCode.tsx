@@ -40,6 +40,8 @@ type SpatialCodeProps = {
   expression?: ExpressionEvent | null;
   expressionStyle?: ExpressionStyle;
   stepDurationMs?: number;
+  expressionAnimations?: boolean;
+  playbackMode?: 'rate' | 'base';
   resetKey?: number;
 };
 
@@ -74,6 +76,7 @@ export default function SpatialCode({
   source, palette, theme = 'dark', activeLine = 0, isPlaying = false,
   executionKey = activeLine, followExecution = true, depth = 0.56, light = 3.4,
   wireframe = false, highlightBrightness = 1, resetKey = 0, expression, expressionStyle = 'float', stepDurationMs = 1250,
+  expressionAnimations = true, playbackMode = 'rate',
 }: SpatialCodeProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SceneHandle | null>(null);
@@ -712,7 +715,8 @@ export default function SpatialCode({
       style={{ '--expression-number': palette.number, '--expression-result': palette.variable } as CSSProperties}>
       <div className="spatial-code__viewport" ref={viewportRef} aria-hidden={Boolean(error)} />
       <div className="spatial-code__vignette" aria-hidden="true" />
-      {ready && !error && <ExpressionOverlay event={visibleExpression} isPlaying={isPlaying} stepDurationMs={stepDurationMs} style={expressionStyle} projectorRef={projectorRef} />}
+      {ready && !error && <ExpressionOverlay event={visibleExpression} isPlaying={isPlaying} stepDurationMs={stepDurationMs}
+        style={expressionStyle} projectorRef={projectorRef} expressionAnimations={expressionAnimations} playbackMode={playbackMode} />}
       {!ready && !error && <div className="spatial-code__loading" role="status">Загружаем 3D<span>· · ·</span></div>}
       {error && (
         <div className="spatial-code__fallback">

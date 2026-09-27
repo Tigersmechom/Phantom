@@ -18,6 +18,8 @@ export type Preferences = {
   debuggerNumberScale: number;
   debuggerNameScale: number;
   operationsPerSecond: number;
+  playbackMode: "rate" | "base";
+  spatialExpressionAnimations: boolean;
   expressionStyle: "float" | "rail" | "inline";
 };
 export const defaults: Preferences = {
@@ -36,9 +38,11 @@ export const defaults: Preferences = {
   cameraFollow: true,
   inputFontSize: 14,
   outputFontSize: 14,
-  debuggerNumberScale: 1,
-  debuggerNameScale: 1,
+  debuggerNumberScale: 1.15,
+  debuggerNameScale: 1.05,
   operationsPerSecond: 1,
+  playbackMode: "rate",
+  spatialExpressionAnimations: true,
   expressionStyle: "rail",
 };
 const clamp = (value: unknown, fallback: number, min: number, max: number) =>
@@ -89,9 +93,11 @@ export function readPrefs(): Preferences {
       cameraFollow: p.cameraFollow !== false,
       inputFontSize: clamp(p.inputFontSize, 14, 10, 28),
       outputFontSize: clamp(p.outputFontSize, 14, 10, 28),
-      debuggerNumberScale: clamp(p.debuggerNumberScale, 1, 0.7, 1.8),
-      debuggerNameScale: clamp(p.debuggerNameScale, 1, 0.7, 1.8),
+      debuggerNumberScale: clamp(p.debuggerNumberScale, defaults.debuggerNumberScale, 0.7, 1.8),
+      debuggerNameScale: clamp(p.debuggerNameScale, defaults.debuggerNameScale, 0.7, 1.8),
       operationsPerSecond: clamp(p.operationsPerSecond, 1, 0.25, 12),
+      playbackMode: p.playbackMode === "base" ? "base" : defaults.playbackMode,
+      spatialExpressionAnimations: p.spatialExpressionAnimations !== false,
       expressionStyle: p.expressionStyle === "rail" || p.expressionStyle === "inline" || p.expressionStyle === "float" ? p.expressionStyle : defaults.expressionStyle,
     };
   } catch {

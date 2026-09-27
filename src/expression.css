@@ -13,7 +13,8 @@
   position: relative;
   box-sizing: border-box;
   width: var(--chip-width, 90px);
-  height: 30px;
+  height: 36px;
+  min-width: 0;
   color: var(--spatial-text);
   border: 1px solid rgba(167, 196, 210, .22);
   background: linear-gradient(145deg, rgba(24, 32, 39, .91), rgba(15, 20, 27, .92));
@@ -30,7 +31,8 @@
   box-shadow: 5px 5px 18px rgba(0,0,0,.10);
 }
 .expression-chip--inline {
-  height: 22px;
+  height: auto;
+  min-height: 24px;
   border: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--expression-result) 55%, transparent);
   border-radius: 2px;
@@ -72,18 +74,23 @@
 .expression-operand {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 150px;
+  max-width: min(100%, calc(var(--chip-width, 240px) - 16px));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--expression-number, #d0bf69);
-  font: 500 15px/1.3 'Monaspace Krypton', ui-monospace, monospace;
+  font: 560 19px/1.25 'Monaspace Krypton', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   animation: expression-merge 820ms cubic-bezier(.22, .61, .36, 1) both;
   will-change: transform, opacity;
 }
-.expression-chip--inline .expression-operand { font-size: 13px; }
+.expression-chip--inline .expression-operand { font-size: 16px; }
 .expression-chip--inline .expression-values { gap: 7px; }
+.expression-chip--float .expression-values { flex-wrap: wrap; row-gap: 3px; padding: 3px 0; box-sizing: border-box; }
+.expression-chip--float { height: auto; min-height: 36px; padding: 0 8px; }
+.expression-chip--float .expression-values-area { position: relative; inset: auto; min-height: max(30px, calc(var(--operand-count, 1) * 18px + 10px)); }
+.expression-chip--float .expression-operand,
+.expression-chip--inline .expression-operand { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
 .expression-result {
   position: absolute;
   left: 50%; top: 50%;
@@ -94,12 +101,12 @@
   white-space: nowrap;
   padding-left: 12px;
   color: var(--expression-result, #67b7a4);
-  font: 500 var(--result-size, 17px)/1.25 'Monaspace Krypton', ui-monospace, monospace;
+  font: 560 var(--result-size, 21px)/1.2 'Monaspace Krypton', ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   animation: expression-result 820ms cubic-bezier(.22, .61, .36, 1) both;
 }
 .expression-result::before { content: '='; position: absolute; left: 0; top: 2px; opacity: .48; font-size: 12px; }
-.expression-chip--inline .expression-result::before { top: 1px; font-size: 11px; }
+.expression-chip--inline .expression-result::before { top: 1px; font-size: 12px; }
 .expression-values-area--immediate .expression-result { animation: expression-result-immediate var(--result-fade, 240ms) ease-out both; }
 .expression-values-area--pending .expression-operand { animation: expression-rise 320ms ease-out both; }
 .expression-pending-note { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--spatial-muted); font: 11px/1.4 'Monaspace Krypton', ui-monospace, monospace; }
@@ -188,7 +195,7 @@
 .rail-equation .expression-operand {
   max-width: 100%;
   color: var(--rail-operand);
-  font-size: var(--operand-size, 28px);
+  font-size: var(--operand-size, 34px);
   line-height: 1.2;
   animation: none;
   text-shadow: 0 0 12px rgba(255, 209, 132, .12);
@@ -218,7 +225,7 @@
   padding: 0;
   transform: none;
   color: var(--rail-result);
-  font-size: var(--result-size, 28px);
+  font-size: var(--result-size, 34px);
   line-height: 1.2;
   animation: none;
   text-shadow: 0 0 14px rgba(114,240,195,.14);

@@ -16,6 +16,7 @@
     "test:editor": "node tests/editor-check.mjs --selection",
     "test:spatial": "node tests/spatial-check.mjs",
     "test:experience": "node tests/experience-check.mjs",
+    "test:lifecycle": "node tests/inspector-lifecycle.test.mjs",
     "test:desktop": "node tests/desktop-ui.mjs",
     "test:settings": "node tests/settings-workspace.mjs",
     "test:demo": "node --test tests/demo.test.mjs",

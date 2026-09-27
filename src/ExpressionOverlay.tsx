@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import type { ExpressionEvent, ExpressionStage, SourceRange } from './execution-types';
 import { overlaps, placeExpression, type ExpressionProjector, type ExpressionStyle, type ScreenRect } from './expression-layout';
+import { usePresentationMotion } from './presentation-motion';
 import './expression.css';
 
 export type { ExpressionStyle } from './expression-layout';
@@ -10,11 +11,16 @@ type Props = {
   stepDurationMs?: number;
   style?: ExpressionStyle;
   projectorRef: RefObject<ExpressionProjector | null>;
+  /** Whether finite expression transitions should be shown at all. */
+  expressionAnimations?: boolean;
+  /** `rate` keeps playback compact; `base` exposes the recorded stages while playing. */
+  playbackMode?: 'rate' | 'base';
 };
 type Phase = 'rise' | 'merge' | 'result' | 'pending';
 const GROUP_DURATION_MS = 900;
 const RAIL_GROUP_DURATION_MS = 3200;
 const PRESENCE_MS = 520;
+const MAX_GROUPS_PER_EVENT = 12;
 
 function useReducedMotion() {
   const [reduced, setReduced] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -91,12 +97,15 @@ type AnchorRegistration = {
 };
 type RegisterAnchor = (registration: AnchorRegistration) => () => void;
 
-function StageValues({ stage, phase, immediate, isPlaying }: {
-  stage: ExpressionStage; phase: Phase; immediate: boolean; isPlaying: boolean;
+function StageValues({ stage, phase, immediate, isPlaying, pendingOperands }: {
+  stage: ExpressionStage; phase: Phase; immediate: boolean; isPlaying: boolean; pendingOperands: boolean;
 }) {
   const valuesRef = useRef<HTMLDivElement>(null);
   const pending = stage.result === null;
-  const showOperands = stage.operands.length > 0 && (!immediate || (pending && !isPlaying));
+  // A pending call has no observed result to replace its arguments with. Keep
+  // those arguments visible when animations are disabled/reduced, including
+  // autoplay; `immediate` is intentionally not enough to hide unknown data.
+  const showOperands = stage.operands.length > 0 && (!immediate || (pending && pendingOperands));
   const localPhase = pending ? 'pending' : immediate || stage.operands.length === 0 ? 'result' : phase;
   useLayoutEffect(() => {
     const row = valuesRef.current;
@@ -136,11 +145,11 @@ function railMetrics(stage: ExpressionStage, showOperands: boolean) {
   return { operands, result, width };
 }
 
-function RailValues({ stage, phase, immediate, isPlaying, links }: {
-  stage: ExpressionStage; phase: Phase; immediate: boolean; isPlaying: boolean; links: OperandLink[];
+function RailValues({ stage, phase, immediate, isPlaying, pendingOperands, links }: {
+  stage: ExpressionStage; phase: Phase; immediate: boolean; isPlaying: boolean; pendingOperands: boolean; links: OperandLink[];
 }) {
   const pending = stage.result === null;
-  const showOperands = stage.operands.length > 0 && (!immediate || (pending && !isPlaying));
+  const showOperands = stage.operands.length > 0 && (!immediate || (pending && pendingOperands));
   const metrics = railMetrics(stage, showOperands);
   const rowRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -165,14 +174,14 @@ function RailValues({ stage, phase, immediate, isPlaying, links }: {
     {showOperands && stage.operands.map((operand, index) => <div className="rail-term" key={index}>
       {(index > 0 ? operationSymbol(stage, index) : prefix) && <span className="expression-operator" data-operator={(index > 0 ? operationSymbol(stage, index) : prefix)!}>{index > 0 ? operationSymbol(stage, index) : prefix}</span>}
       <div className="rail-argument" data-operand-index={index} ref={(element) => { if (links[index]) links[index].frame = element; }}
-        style={{ '--operand-width': `${metrics.operands[index]}px`, '--operand-size': `${Math.min(28, Math.max(12, (metrics.operands[index] - 26) / (Math.max(1, valueText(operand).length) * .64)))}px` } as CSSProperties}>
+        style={{ '--operand-width': `${metrics.operands[index]}px`, '--operand-size': `${Math.min(34, Math.max(13, (metrics.operands[index] - 26) / (Math.max(1, valueText(operand).length) * .64)))}px` } as CSSProperties}>
         <span className="rail-argument-label" title={operandLabel(stage, index)}>{operandLabel(stage, index)}</span>
         <span className="expression-operand" title={valueText(operand)}>{valueText(operand)}</span>
       </div>
     </div>)}
     {stage.result !== null ? <div className="rail-final-term">
       {showOperands && <span className="rail-relation">{['call', 'return', 'input', 'output'].includes(stage.operator) ? '→' : '='}</span>}
-      <div className="rail-result" style={{ '--operand-width': `${metrics.result}px`, '--result-size': `${Math.min(28, Math.max(12, (metrics.result - 26) / (Math.max(1, resultText(stage).length) * .64)))}px` } as CSSProperties}>
+      <div className="rail-result" style={{ '--operand-width': `${metrics.result}px`, '--result-size': `${Math.min(34, Math.max(13, (metrics.result - 26) / (Math.max(1, resultText(stage).length) * .64)))}px` } as CSSProperties}>
         <span className="rail-argument-label" title={stage.target || 'результат'}>{stage.target || 'результат'}</span>
         <output className="expression-result" title={resultText(stage)}>{resultText(stage)}</output>
       </div>
@@ -180,8 +189,8 @@ function RailValues({ stage, phase, immediate, isPlaying, links }: {
   </div>;
 }
 
-function AnchoredStage({ stage, line, phase, immediate, isPlaying, style, exiting, registryKey, register, grouped }: {
-  stage: ExpressionStage; line: number; phase: Phase; immediate: boolean; isPlaying: boolean;
+function AnchoredStage({ stage, line, phase, immediate, isPlaying, pendingOperands, style, exiting, registryKey, register, grouped }: {
+  stage: ExpressionStage; line: number; phase: Phase; immediate: boolean; isPlaying: boolean; pendingOperands: boolean;
   style: ExpressionStyle; exiting: boolean; registryKey: string; register: RegisterAnchor; grouped: boolean;
 }) {
   const elementRef = useRef<HTMLDivElement>(null);
@@ -191,7 +200,7 @@ function AnchoredStage({ stage, line, phase, immediate, isPlaying, style, exitin
   const dotRef = useRef<SVGCircleElement>(null);
   const maskRef = useRef<SVGGElement>(null);
   const maskId = useId().replace(/[^a-zA-Z0-9_-]/g, '');
-  const showRailOperands = style === 'rail' && stage.operands.length > 0 && (!immediate || (stage.result === null && !isPlaying));
+  const showRailOperands = style === 'rail' && stage.operands.length > 0 && (!immediate || (stage.result === null && pendingOperands));
   const operandLinks = useMemo<OperandLink[]>(() => stage.operands.map((_, index) => ({ range: stage.operandRanges?.[index], index, path: null, dot: null, frame: null })), [stage]);
   useLayoutEffect(() => register({
     key: registryKey, element: elementRef.current!, chip: chipRef.current!, path: pathRef.current!,
@@ -199,8 +208,10 @@ function AnchoredStage({ stage, line, phase, immediate, isPlaying, style, exitin
   }), [registryKey, register, stage, line, style, exiting, operandLinks, showRailOperands]);
   const digits = Math.max(resultText(stage).length + 2, stage.operands.reduce<number>((length, value, index) => length + valueText(value).length + 1.8 + (index > 0 ? (operationSymbol(stage, index)?.length ?? 0) * 1.25 : 0), 0));
   const width = style === 'rail' ? railMetrics(stage, showRailOperands).width
-    : Math.max(style === 'inline' ? 50 : 60, Math.min(style === 'inline' ? 204 : 236, digits * (style === 'inline' ? 8 : 9) + 24));
-  const resultSize = Math.min(style === 'inline' ? 14 : style === 'rail' ? 18 : 17, Math.max(10, (width - 34) / (Math.max(1, resultText(stage).length) * .64)));
+    : Math.max(style === 'inline' ? 50 : 60, Math.min(style === 'inline' ? 280 : 340, digits * (style === 'inline' ? 10 : 11) + 28));
+  // Keep ordinary values cinematic and legible, while the width-aware term
+  // below still shrinks exact wide integers instead of clipping them.
+  const resultSize = Math.min(style === 'inline' ? 17 : style === 'rail' ? 34 : 21, Math.max(11, (width - 34) / (Math.max(1, resultText(stage).length) * .64)));
   return <div className={`expression-stage-presence ${grouped ? 'expression-substage' : ''}`} data-presence={exiting ? 'exiting' : 'present'} aria-hidden="true">
     <svg className={`expression-connector expression-connector--${style} ${showRailOperands ? 'expression-connector--arguments' : ''} ${stage.result === null ? 'expression-connector--pending' : ''}`} ref={connectorRef}>
       {style === 'rail' && <defs><mask id={maskId} maskUnits="userSpaceOnUse" x="0" y="0" width="100%" height="100%"><rect x="0" y="0" width="100%" height="100%" fill="white" /><g ref={maskRef} /></mask></defs>}
@@ -219,8 +230,8 @@ function AnchoredStage({ stage, line, phase, immediate, isPlaying, style, exitin
           <div className={`expression-chip expression-chip--${style}`} ref={chipRef} style={{ '--chip-width': `${width}px`, '--result-size': `${resultSize}px` } as CSSProperties}>
             <span className="expression-label" title={stage.label}>{stage.label}</span>
             <span className="expression-fallback">строка {line}</span>
-            {style === 'rail' ? <RailValues stage={stage} phase={phase} immediate={immediate} isPlaying={isPlaying} links={operandLinks} />
-              : <StageValues stage={stage} phase={phase} immediate={immediate} isPlaying={isPlaying} />}
+            {style === 'rail' ? <RailValues stage={stage} phase={phase} immediate={immediate} isPlaying={isPlaying} pendingOperands={pendingOperands} links={operandLinks} />
+              : <StageValues stage={stage} phase={phase} immediate={immediate} isPlaying={isPlaying} pendingOperands={pendingOperands} />}
           </div>
         </div>
       </div>
@@ -228,16 +239,45 @@ function AnchoredStage({ stage, line, phase, immediate, isPlaying, style, exitin
   </div>;
 }
 
-function ExpressionCard({ event, isPlaying, reduced, stepDurationMs, style, exiting, register, identity }: {
+function ExpressionCard({ event, isPlaying, reduced, stepDurationMs, style, exiting, register, identity, expressionAnimations, playbackMode }: {
   event: ExpressionEvent; isPlaying: boolean; reduced: boolean; stepDurationMs: number; style: ExpressionStyle;
-  exiting: boolean; register: RegisterAnchor; identity: string;
+  exiting: boolean; register: RegisterAnchor; identity: string; expressionAnimations: boolean; playbackMode: 'rate' | 'base';
 }) {
-  const immediate = isPlaying || reduced;
-  const groups = event.groups?.filter((group) => group.stages.length > 0) ?? [];
+  const presentation = usePresentationMotion();
+  const animated = expressionAnimations && !reduced;
+  // Rate playback intentionally presents only the observed final value. Base
+  // playback is an educational mode: it keeps the same finite timeline as a
+  // manual step even while execution is running.
+  const immediate = !animated || (isPlaying && playbackMode === 'rate');
+  const pendingOperands = !animated || !isPlaying;
+  const allGroups = event.groups?.filter((group) => group.stages.length > 0) ?? [];
+  // A malformed trace must never create an unbounded UI wait. Keep the
+  // observed final event visible and make truncation explicit in the DOM/ARIA;
+  // a future paginator can expose the remaining recorded groups.
+  const groups = allGroups.slice(0, MAX_GROUPS_PER_EVENT);
   const [groupIndex, setGroupIndex] = useState(immediate ? groups.length : 0);
   const group = !immediate && groupIndex < groups.length ? groups[groupIndex] : null;
   const stages = group?.stages ?? [event];
   const [phase, setPhase] = useState<Phase>(() => initialPhase(stages, immediate));
+  const groupDuration = style === 'rail' ? RAIL_GROUP_DURATION_MS : GROUP_DURATION_MS;
+  // The card re-renders at each recorded group boundary. Hold only the
+  // remaining tail, otherwise every boundary would restart a full-event hold
+  // and a scheduler could wait quadratically long for one finite event.
+  const remainingGroupsMs = Math.max(0, groups.length - groupIndex) * groupDuration;
+  const finalStageMs = (!groups.length || groupIndex >= groups.length) && stages.some((stage) => stage.result !== null && stage.operands.length > 0)
+    ? (style === 'rail' ? 2300 : 640) : 0;
+  const sequenceMs = remainingGroupsMs + finalStageMs;
+  useLayoutEffect(() => {
+    if (exiting || immediate || !sequenceMs) return;
+    // Register before the passive timer effect below, so a presentation
+    // coordinator can hold the debugger step across the whole finite chain.
+    const release = presentation?.hold(`expression:${event.id}`, sequenceMs + 500);
+    const timer = window.setTimeout(() => release?.(), sequenceMs);
+    return () => {
+      window.clearTimeout(timer);
+      release?.();
+    };
+  }, [event.id, exiting, immediate, presentation, sequenceMs]);
   useEffect(() => {
     if (exiting) return;
     const timers: ReturnType<typeof setTimeout>[] = [];
@@ -256,22 +296,28 @@ function ExpressionCard({ event, isPlaying, reduced, stepDurationMs, style, exit
   }, [groupIndex, immediate, exiting]);
   const stageKey = group?.id ?? 'final';
   const presentStages = usePresence(stages.map((stage) => ({ key: `${stageKey}:${stage.id}`, stage, phase, grouped: Boolean(group) })), `${stageKey}:${phase}`, reduced);
-  const announcement = `${group ? `Этап ${groupIndex + 1}. ` : ''}${stages.map(describe).join('; ')}. Строка ${event.line}`;
-  return <div className={`expression-card ${reduced ? 'expression-card--reduced' : ''}`}
-    data-event-id={event.id} data-mode={isPlaying ? 'playing' : 'manual'} data-phase={phase} data-style={style}
+  const overflowNote = allGroups.length > MAX_GROUPS_PER_EVENT ? ` Показаны первые ${MAX_GROUPS_PER_EVENT} из ${allGroups.length} этапов; остальные доступны в трассе.` : '';
+  const announcement = `${group ? `Этап ${groupIndex + 1}. ` : ''}${stages.map(describe).join('; ')}. Строка ${event.line}.${overflowNote}`;
+  return <div className={`expression-card ${!animated ? 'expression-card--reduced' : ''}`}
+    data-event-id={event.id} data-mode={isPlaying ? 'playing' : 'manual'} data-playback-mode={playbackMode}
+    data-animations={animated ? 'on' : 'off'} data-expression-animations={animated ? 'true' : 'false'} data-phase={phase} data-style={style}
     data-presence={exiting ? 'exiting' : 'present'} data-group-id={group?.id ?? 'final'} data-group-index={group ? groupIndex : groups.length}
+    data-group-count={allGroups.length} data-group-overflow={allGroups.length > MAX_GROUPS_PER_EVENT ? 'true' : 'false'}
     role="status" aria-live={isPlaying || exiting ? 'off' : 'polite'} aria-label={announcement}
     style={{ '--result-fade': `${Math.max(80, Math.min(320, stepDurationMs * .32))}ms` } as CSSProperties}>
     {presentStages.map((item) => <AnchoredStage key={item.key} stage={item.value.stage} line={event.line} phase={item.value.phase}
-      grouped={item.value.grouped} immediate={immediate} isPlaying={isPlaying} style={style} exiting={exiting || item.exiting}
+      grouped={item.value.grouped} immediate={immediate} isPlaying={isPlaying} pendingOperands={pendingOperands} style={style} exiting={exiting || item.exiting}
       registryKey={`${identity}:${item.key}`} register={register} />)}
   </div>;
 }
 
-export default function ExpressionOverlay({ event, isPlaying, stepDurationMs = 1250, style = 'float', projectorRef }: Props) {
+export default function ExpressionOverlay({ event, isPlaying, stepDurationMs = 1250, style = 'float', projectorRef, expressionAnimations = true, playbackMode = 'rate' }: Props) {
   const reduced = useReducedMotion();
-  const identity = event ? JSON.stringify([event, isPlaying, reduced, style]) : '';
-  const items = usePresence(event ? [{ key: identity, event, isPlaying, stepDurationMs, style }] : [], identity, reduced);
+  const animated = expressionAnimations && !reduced;
+  // Include presentation controls in identity so toggling them cancels a
+  // pending group sequence instead of leaving a hidden timer/card behind.
+  const identity = event ? JSON.stringify([event, isPlaying, reduced, style, expressionAnimations, playbackMode]) : '';
+  const items = usePresence(event ? [{ key: identity, event, isPlaying, stepDurationMs, style, expressionAnimations, playbackMode }] : [], identity, !animated);
   const registry = useRef(new Map<string, AnchorRegistration>());
   const register = useCallback<RegisterAnchor>((entry) => {
     registry.current.set(entry.key, entry);
@@ -417,6 +463,7 @@ export default function ExpressionOverlay({ event, isPlaying, stepDurationMs = 1
   }, [projectorRef, reduced]);
   return <div className="expression-overlay" data-style={style}>
     {items.map((item) => <ExpressionCard key={item.key} identity={item.key} event={item.value.event} isPlaying={item.value.isPlaying}
-      stepDurationMs={item.value.stepDurationMs} style={item.value.style} reduced={reduced} exiting={item.exiting} register={register} />)}
+      stepDurationMs={item.value.stepDurationMs} style={item.value.style} reduced={reduced} exiting={item.exiting}
+      expressionAnimations={item.value.expressionAnimations} playbackMode={item.value.playbackMode} register={register} />)}
   </div>;
 }

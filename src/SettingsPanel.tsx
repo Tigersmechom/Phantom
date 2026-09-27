@@ -369,6 +369,20 @@ export default function SettingsPanel({
                 </button>)}
               </div>
               <div className="setting-section-title">БУКВЫ И СВЕТ</div>
+              <label>
+                Анимации вычислений
+                <button
+                  role="switch"
+                  aria-label="Анимации вычислений"
+                  aria-checked={prefs.spatialExpressionAnimations}
+                  className={`switch ${prefs.spatialExpressionAnimations ? "on" : ""}`}
+                  onClick={() =>
+                    update({ spatialExpressionAnimations: !prefs.spatialExpressionAnimations })
+                  }
+                >
+                  <i />
+                </button>
+              </label>
               <label className="range-setting">
                 <span>
                   Глубина<output>{prefs.spatialDepth.toFixed(2)}</output>
