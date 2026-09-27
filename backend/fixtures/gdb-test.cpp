@@ -1,4 +1,5 @@
 #include <cstring>
+#include <iostream>
 #include <unistd.h>
 
 // Keep this function out of main so the regression can select a nonzero
@@ -12,7 +13,20 @@ __attribute__((noinline)) void waitForever(int marker) {
   }
 }
 
+__attribute__((noinline)) void pendingOutput() {
+  std::cout << "pending\n";
+  volatile unsigned long pendingCounter = 0;
+  for (;;) {  // GDB_TEST_PENDING_LOOP
+    ++pendingCounter;
+    asm volatile("" : : "r"(pendingCounter) : "memory");
+  }
+}
+
 int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], "cout-pending") == 0) {
+    pendingOutput();
+    return 0;
+  }
   if (argc > 1 && std::strcmp(argv[1], "utf8") == 0) {
     const char out[] = "ab\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80"
                        "\xf0\x9f\x98\x80\xf0\x9f\x98\x80";

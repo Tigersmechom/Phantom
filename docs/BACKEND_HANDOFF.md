@@ -110,6 +110,22 @@ Capabilities объявляют реальные архитектуры, вид�
 
 Ошибки структурированы (`STALE_CONTEXT`, `STALE_STOP`, `BUSY`, `BUILD_FAILED`, `TIMEOUT`, `CANCELLED`, `REPLAY_DIVERGED`, `HISTORY_EVICTED`, `LIMIT_EXCEEDED` и другие из DTO). Сохранять понятное сообщение/диагностику; ошибка не должна оставлять spinner или скрытый процесс навсегда.
 
+`observation.stdout.text` содержит только байты, уже сброшенные inferior в
+транспортный pipe. На Linux/glibc остановленный процесс дополнительно может
+получить необязательное `stdout.buffered`: это bounded read окна
+`_IO_write_base.._IO_write_ptr`, подтверждённый GDB в момент остановки. Поле
+отсутствует для неподдерживаемой ABI, несинхронизированного `iostream` или
+невалидного диапазона; статический разбор исходника не подменяет этот факт.
+
+Source-level `step` имеет отдельный короткий deadline. Если GDB не может достичь
+другой source location, например в бесконечном `while (true) { continue; }`,
+backend прерывает inferior на реальном остановленном PC, сохраняет live session и
+публикует `observation.reason = "step-timeout"` вместе с
+`commandFinished.outcome = "failed"`, `error.code = "STEP_TIMEOUT"`. Это
+неуспешный переход source-step, а не завершение процесса и не доказательство
+перехода на новую строку; `continue`, `pause`, `stop` и instruction-step остаются
+доступны.
+
 ## 5. Снимки, история и настоящий replay
 
 `DebugSessionStateDTO.live` описывает живую позицию. `ExecutionViewDTO` — отдельно принадлежащий frontend курсор `live/history`. `StopObservationDTO` неизменяем и содержит точку `branchId + eventOrdinal`, stop/state revision, build/source identity, стек, значения, input/output и coverage. Изменение переменной на той же остановке увеличивает `stateRevision`; одинаковая строка не означает одинаковый шаг.

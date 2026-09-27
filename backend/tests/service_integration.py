@@ -371,6 +371,31 @@ def main() -> int:
             loop_launch_events = [client.recv() for _ in range(3)]
             loop_session = loop_launch["session"]
             loop_stop_ref = loop_launch_events[0]["payload"]["observation"]["stop"]
+            # A source-level step on a loop whose body and condition share one
+            # line has no different line at which GDB can complete `next`.
+            # The backend must interrupt that attempt, preserve a live stopped
+            # checkpoint, and report the step as incomplete instead of killing
+            # the session after the general command timeout.
+            same_line_step = client.send({
+                **common, "requestId": "step-same-line", "session": loop_session,
+                "expectedStop": loop_stop_ref,
+                "command": {"kind": "step", "stepKind": "over"},
+            })
+            if not same_line_step.get("ok") or same_line_step.get("result", {}).get("kind") != "accepted":
+                fail("same-line step was not accepted", same_line_step)
+            same_line_events = [client.recv() for _ in range(3)]
+            if [frame.get("payload", {}).get("kind") for frame in same_line_events] != [
+                    "observation", "state", "commandFinished"]:
+                fail("same-line step event sequence is incomplete", same_line_events)
+            same_line_observation = same_line_events[0]["payload"]["observation"]
+            same_line_finished = same_line_events[-1]["payload"]
+            if same_line_observation.get("reason") != "step-timeout" or \
+                    same_line_finished.get("outcome") != "failed" or \
+                    same_line_finished.get("error", {}).get("code") != "STEP_TIMEOUT":
+                fail("same-line step was not surfaced as an incomplete stopped checkpoint", same_line_events)
+            if same_line_events[1]["payload"]["state"].get("phase") != "stopped":
+                fail("same-line step invalidated the live session", same_line_events[1])
+            loop_stop_ref = same_line_observation["stop"]
             client.send_many(
                 [
                     {**common, "requestId": "continue-loop", "session": loop_session, "expectedStop": loop_stop_ref, "command": {"kind": "continue"}},

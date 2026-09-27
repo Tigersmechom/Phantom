@@ -3,10 +3,10 @@ import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
-const ids = ['source', 'argv', 'input', 'environment', 'state', 'observation', 'stdout', 'stderr', 'log', 'status', 'connection', 'reset'];
+const ids = ['source', 'argv', 'input', 'environment', 'theoretical-cout', 'buffered-cout', 'state', 'observation', 'stdout', 'stdout-check', 'stderr', 'history', 'log', 'status', 'connection', 'reset'];
 const elements = new Map(ids.map(id => [id, {
   id,
-  value: id === 'source' ? 'int main() { return 0; }' : '',
+  value: id === 'source' ? '#include <iostream>\nint main() { std::cout << "ready\\n"; return 0; }' : id === 'buffered-cout' ? 'Ожидание runtime остановки процесса.' : '',
   textContent: '',
   dataset: {},
   classList: {add() {}, remove() {}},
@@ -49,6 +49,10 @@ await new Promise(resolve => setTimeout(resolve, 20));
 
 if (!actions.find(button => button.dataset.action === 'step').disabled)
   throw new Error('Step must be disabled before Launch');
+if (elements.get('theoretical-cout').value !== 'ready\n')
+  throw new Error(`Theoretical cout preview did not initialize from source: ${elements.get('theoretical-cout').value}`);
+if (!elements.get('buffered-cout').value.includes('runtime'))
+  throw new Error('Runtime buffered cout field did not initialize honestly');
 await actions.find(button => button.dataset.action === 'build').onclick();
 const hash = requestPayload?.command?.source?.documents?.[0]?.sha256;
 if (!/^[0-9a-f]{64}$/.test(hash || '')) throw new Error(`Build sent an invalid SHA-256 digest: ${hash}`);

@@ -184,6 +184,20 @@ std::optional<std::uint64_t> parseAddress(std::string_view s) {
   return value;
 }
 
+std::optional<std::uint64_t> parseUnsigned(std::string_view s) {
+  if (s.empty()) return std::nullopt;
+  int base = 10;
+  if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    base = 16;
+    s.remove_prefix(2);
+  }
+  if (s.empty()) return std::nullopt;
+  std::uint64_t value = 0;
+  const auto parsed = std::from_chars(s.data(), s.data() + s.size(), value, base);
+  if (parsed.ec != std::errc{} || parsed.ptr != s.data() + s.size()) return std::nullopt;
+  return value;
+}
+
 }  // namespace
 
 struct GdbEngine::Impl {
@@ -394,6 +408,65 @@ struct GdbEngine::Impl {
     feedInput();
   }
 
+  // glibc keeps bytes written through a synchronised std::cout in stdout's
+  // _IO_FILE write window until a flush.  GDB can inspect that window while
+  // the inferior is stopped. This is deliberately an optional probe: the
+  // layout is not a C++ or POSIX contract, so unsupported runtimes simply do
+  // not expose a buffered snapshot instead of guessing.
+  nlohmann::json captureBufferedStdout() {
+    const auto unavailable = [](std::string reason) {
+      return nlohmann::json{{"available", false}, {"reason", std::move(reason)}};
+    };
+    if (!process || !live) return unavailable("no-live-inferior");
+    const auto evaluate = [&](std::string_view expression, std::string& value) {
+      MiRecord record;
+      GdbError error;
+      if (!command("-data-evaluate-expression " + miQuote(expression), false, record, error)) return false;
+      const auto* result = field(record.fields, "value");
+      if (!result || result->text.empty()) return false;
+      value = result->text;
+      return true;
+    };
+    std::string baseText, pointerText;
+    if (!evaluate("(unsigned long)((struct _IO_FILE*)stdout)->_IO_write_base", baseText) ||
+        !evaluate("(unsigned long)((struct _IO_FILE*)stdout)->_IO_write_ptr", pointerText))
+      return unavailable("stdout-buffer-layout-unavailable");
+    const auto base = parseUnsigned(baseText);
+    const auto pointer = parseUnsigned(pointerText);
+    if (!base || !pointer || *pointer < *base) return unavailable("stdout-buffer-range-unavailable");
+    const auto count = *pointer - *base;
+    if (count == 0) return nlohmann::json{{"available", true}, {"text", ""}, {"totalBytes", 0},
+                                           {"retainedFromByte", 0}, {"truncated", false}};
+    // GDB/MI returns the memory contents in one result record. Keep the
+    // optional probe well below the 1 MiB MI record limit even when the
+    // retained stdout budget is larger; a huge buffered write is reported as
+    // unavailable rather than risking a fatal parser overflow.
+    const auto maxProbeBytes = std::min<std::size_t>(options.maxOutputBytes, 64u * 1024u);
+    if (count > maxProbeBytes || *base > std::numeric_limits<std::uint64_t>::max() - count)
+      return unavailable("stdout-buffer-too-large");
+    std::ostringstream address;
+    address << "0x" << std::hex << *base;
+    MiRecord record;
+    GdbError error;
+    if (!command("-data-read-memory-bytes " + address.str() + " " + std::to_string(count), false, record, error))
+      return unavailable("stdout-buffer-read-failed");
+    std::string bytes;
+    if (const auto* memory = field(record.fields, "memory")) {
+      auto appendCell = [&](const MiValue* cell) {
+        if (!cell) return true;
+        return appendHexBytes(valText(field(*cell, "contents")), bytes);
+      };
+      if (!memory->values.empty()) {
+        for (const auto& cell : memory->values) if (!appendCell(cell.get())) return unavailable("stdout-buffer-malformed");
+      } else {
+        for (const auto& [key, cell] : memory->fields) if (!appendCell(cell.get())) return unavailable("stdout-buffer-malformed");
+      }
+    }
+    if (bytes.size() != count) return unavailable("stdout-buffer-read-incomplete");
+    return nlohmann::json{{"available", true}, {"text", displayUtf8(bytes)}, {"totalBytes", count},
+                          {"retainedFromByte", 0}, {"truncated", false}};
+  }
+
   void captureIo(GdbStop& result) {
     // A FIFO can exceed the live pump's 64 KiB budget (F_SETPIPE_SZ or a
     // larger system page size). Capture the queued byte count once so the
@@ -418,6 +491,13 @@ struct GdbEngine::Impl {
     };
     result.stdoutSnapshot = snapshot(stdoutOutput, stdoutTotalBytes);
     result.stderrSnapshot = snapshot(stderrOutput, stderrTotalBytes);
+    if (!result.exited) {
+      const auto buffered = captureBufferedStdout();
+      if (buffered.value("available", false) && buffered.value("totalBytes", 0ULL) != 0) {
+        result.stdoutBufferedSnapshot = buffered;
+        result.stdoutSnapshot["buffered"] = buffered;
+      }
+    }
     result.input = {{"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes}};
   }
 
@@ -527,10 +607,15 @@ struct GdbEngine::Impl {
     }
     // Control-thread calls only publish intent. The owning worker sends an
     // interrupt after ^running, so same-packet pause cannot signal idle GDB.
+    const bool recoverableStep = waitStop &&
+        (commandText == "-exec-next" || commandText == "-exec-step" ||
+         commandText == "-exec-finish" || commandText == "-exec-step-instruction");
+    bool recoveringStep = false;
     bool pendingInterrupt = preempt == 1;
     bool interruptSent = false;
     bool done = false, running = false;
-    auto deadline = std::chrono::steady_clock::now() + options.commandTimeout;
+    auto deadline = std::chrono::steady_clock::now() +
+        (recoverableStep ? options.stepTimeout : options.commandTimeout);
     while (std::chrono::steady_clock::now() < deadline) {
       const int mode = control.exchange(0);
       if (preempt >= 2 || mode >= 2 || launchCancellation.stop_requested()) {
@@ -550,8 +635,15 @@ struct GdbEngine::Impl {
         std::string line = lines.substr(0, p);
         lines.erase(0, p + 1);
         if (processLine(std::move(line), tokenText, waitStop, done, running, stop, e)) {
+          if (waitStop && (stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally"))) {
+            if (recoveringStep) {
+              setError(e, "STEP_TIMEOUT",
+                       "source step did not reach a different source line before the step deadline; inferior was interrupted",
+                       true);
+            }
+            return true;
+          }
           if (!e.code.empty()) return false;
-          if (waitStop && (stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally"))) return true;
           if (!waitStop && done) return e.code.empty();
         }
         // Execution commands can fail before producing an asynchronous stop
@@ -562,9 +654,55 @@ struct GdbEngine::Impl {
       if (lines.size() > 1024u * 1024u) {
         failClosed(e, "LIMIT_EXCEEDED", "unterminated GDB/MI record exceeds line limit"); return false;
       }
-      if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) return true;
+      if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) {
+        if (recoveringStep) {
+          setError(e, "STEP_TIMEOUT",
+                   "source step did not reach a different source line before the step deadline; inferior was interrupted",
+                   true);
+        }
+        return true;
+      }
       if (!waitStop && done) return e.code.empty();
       if (output.exit) { failClosed(e, "LAUNCH_FAILED", "GDB exited before command completed"); return false; }
+    }
+    if (recoverableStep && !recoveringStep) {
+      // GDB's line stepping command has no completion point when execution
+      // remains on the same source line.  Interrupt the process group so GDB
+      // emits a real `*stopped` record, then retain the debugger session for
+      // the caller to inspect or continue.  This is intentionally surfaced as
+      // an incomplete step rather than pretending that a source transition
+      // happened.
+      process->interrupt();
+      recoveringStep = true;
+      deadline = std::chrono::steady_clock::now() +
+          std::min(options.commandTimeout, std::chrono::milliseconds(1000));
+      while (std::chrono::steady_clock::now() < deadline) {
+        ProcessOutput output;
+        try { drainIo(); output = process->poll(std::chrono::milliseconds(5)); drainIo(); }
+        catch (const std::exception& ex) { failClosed(e, "INTERNAL", ex.what()); return false; }
+        lines += output.out;
+        std::size_t p = 0;
+        while ((p = lines.find('\n')) != std::string::npos) {
+          std::string line = lines.substr(0, p);
+          lines.erase(0, p + 1);
+          if (processLine(std::move(line), tokenText, waitStop, done, running, stop, e)) {
+            if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) {
+              setError(e, "STEP_TIMEOUT",
+                       "source step did not reach a different source line before the step deadline; inferior was interrupted",
+                       true);
+              return true;
+            }
+            if (!e.code.empty()) return false;
+          }
+        }
+        if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) {
+          setError(e, "STEP_TIMEOUT",
+                   "source step did not reach a different source line before the step deadline; inferior was interrupted",
+                   true);
+          return true;
+        }
+        if (output.exit) { failClosed(e, "LAUNCH_FAILED", "GDB exited before interrupted step completed"); return false; }
+      }
     }
     failClosed(e, "TIMEOUT", "GDB command timed out");
     return false;
@@ -918,8 +1056,11 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
   else { error = {"UNSUPPORTED", "unknown execution command", false}; return false; }
   MiRecord stopped;
   if (!impl_->command(cmd, true, stopped, error, preempt)) return false;
-  if (!impl_->makeStop(stopped, result, error)) return false;
+  const bool incompleteStep = error.code == "STEP_TIMEOUT";
+  GdbError snapshotError;
+  if (!impl_->makeStop(stopped, result, snapshotError)) { error = std::move(snapshotError); return false; }
   if (impl_->process) result.processInstanceId = impl_->inferiorPid.empty() ? std::to_string(impl_->process->pid()) : impl_->inferiorPid;
+  if (incompleteStep) return false;
   return true;
 }
 

@@ -467,6 +467,22 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   }
   if (kind != "stop" && kind != "pause" && !engine_->resume(kind == "step" ? request.at("command").at("stepKind").get<std::string>() : "continue", stop, error)) {
     interruption = activeInterruption(string_at(request, "requestId"));
+    // A source-level step can have no different line to reach (the common
+    // `while (true) { continue; }` case).  GDB was interrupted at the step
+    // deadline and returned a real stopped snapshot; keep that session live
+    // while reporting the command as incomplete.  The frontend can inspect
+    // the checkpoint, choose instruction stepping, or continue execution.
+    if (error.code == "STEP_TIMEOUT" && stop.stopped && engine_->live()) {
+      auto observation = makeObservation(stop, "step-timeout");
+      auto state = makeState(observation, "stopped", stop.exitCode,
+                             stop.signalName.empty() ? std::nullopt : std::optional<std::string>(stop.signalName));
+      appendHistory(observation, state);
+      frames.push_back(event({{"kind", "observation"}, {"observation", observation}}, processInstanceId_, string_at(request, "requestId")));
+      frames.push_back(event({{"kind", "state"}, {"state", state}}, processInstanceId_, string_at(request, "requestId")));
+      const Json err = {{"code", error.code}, {"message", error.message}, {"retryable", error.retryable}};
+      emitCommandFinished(frames, request, "failed", err);
+      return frames;
+    }
     if (interruption == "stop") {
       stop = engine_->stopAndSnapshot();
       stop.exited = true; stop.processInstanceId = processInstanceId_; stop.reason = "stop";

@@ -119,6 +119,32 @@ void enterLoop(GdbEngine& engine, const GdbLaunchRequest& request, GdbStop& stop
                                 breakpoints, error), "cannot clear loop breakpoint");
 }
 
+void testBufferedStdout(const GdbOptions& options, GdbLaunchRequest request) {
+  request.argv = {"cout-pending"};
+  GdbEngine engine(options);
+  GdbStop stop;
+  launch(engine, request, stop);
+  const auto& source = request.sourceBundle.documents.front().text;
+  const auto marker = source.find("for (;;) {  // GDB_TEST_PENDING_LOOP");
+  require(marker != std::string::npos, "pending-output marker is missing");
+  const auto line = 1 + std::count(source.begin(), source.begin() + marker, '\n');
+  Json breakpoints;
+  GdbError error;
+  require(engine.setBreakpoints({{"documentId", "fixture"}, {"breakpoints", Json::array({
+    {{"id", "pending-loop"}, {"documentId", "fixture"}, {"enabled", true},
+     {"range", {{"start", {{"line", line}, {"column", 1}}},
+                {"end", {{"line", line}, {"column", 1}}}}}}
+  })}}, breakpoints, error), "cannot set pending-output breakpoint: " + error.message);
+  require(engine.resume("continue", stop, error), "cannot reach pending-output breakpoint: " + error.message);
+  require(stop.stdoutSnapshot.at("text") == "", "unflushed cout leaked into captured stdout");
+  require(stop.stdoutSnapshot.contains("buffered") &&
+          stop.stdoutSnapshot.at("buffered").at("available") == true &&
+          stop.stdoutSnapshot.at("buffered").at("text") == "pending\n" &&
+          stop.stdoutSnapshot.at("buffered").at("totalBytes") == 8,
+          "runtime did not expose the confirmed pending cout buffer: " + stop.stdoutSnapshot.dump());
+  (void)engine.stopAndSnapshot();
+}
+
 void testTimeoutAndReuse(const GdbOptions& options, const GdbLaunchRequest& request) {
   GdbEngine engine(options);
   GdbStop stopped;
@@ -327,6 +353,7 @@ int main(int argc, char** argv) {
     const auto source = std::filesystem::absolute(argv[3]);
     request.sourceBundle = {"fixture-bundle", {{"fixture", "fixture-revision", source, readFile(source)}}};
     testMissingWrapper(options, request);
+    testBufferedStdout(options, request);
     testTimeoutAndReuse(options, request);
     testUtf8Tail(options, request);
     testFinalPipeBacklog(options, request);

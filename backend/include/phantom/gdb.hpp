@@ -43,6 +43,12 @@ struct GdbOptions {
   std::size_t maxMemoryReadBytes = 64u * 1024u;
   std::size_t maxInstructions = 512;
   std::chrono::milliseconds commandTimeout{30000};
+  // Source-level stepping can legitimately have no different source line to
+  // reach (for example `while (true) { continue; }`).  Bound that operation
+  // separately so a line step cannot leave the session wedged for the full
+  // command timeout.  The engine interrupts the inferior and reports the
+  // resulting stop as an incomplete step.
+  std::chrono::milliseconds stepTimeout{1000};
 };
 
 struct GdbLaunchRequest {
@@ -73,6 +79,10 @@ struct GdbStop {
   nlohmann::json stack = nlohmann::json::array();
   nlohmann::json input = nlohmann::json::object();
   nlohmann::json stdoutSnapshot = nlohmann::json::object();
+  // Optional ABI-specific snapshot of bytes still held by the C stdout
+  // buffer at a real stop.  It is omitted when the runtime cannot prove the
+  // buffer layout (for example non-glibc or unsynchronised iostreams).
+  nlohmann::json stdoutBufferedSnapshot = nlohmann::json::object();
   nlohmann::json stderrSnapshot = nlohmann::json::object();
   // The complete stop record is retained for the owning service to attach a
   // stopId/stateRevision and to create an immutable history point.

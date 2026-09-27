@@ -140,6 +140,14 @@ export interface OutputSnapshotDTO {
   totalBytes: number;
   retainedFromByte: number;
   truncated: boolean;
+  /** Optional bytes still held by a runtime buffer at this stop. */
+  buffered?: {
+    available: true;
+    text: string;
+    totalBytes: number;
+    retainedFromByte: number;
+    truncated: boolean;
+  };
 }
 export interface StopObservationDTO {
   id: string;
@@ -148,7 +156,7 @@ export interface StopObservationDTO {
   processInstanceId: string;
   buildId: string;
   sourceBundleId: string;
-  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'mutation' | 'exit';
+  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'step-timeout' | 'mutation' | 'exit';
   /** Actual PC location before the next instruction, not proof this statement has completed. */
   location: SourceSpanDTO | null;
   threadId: string | null;
@@ -204,7 +212,7 @@ export interface BreakpointRequestDTO { id: string; range: SourceSpanDTO; enable
 export interface BreakpointDTO extends BreakpointRequestDTO { verified: boolean; resolvedRange?: SourceSpanDTO; message?: string }
 export interface InstructionDTO { addressHex: string; bytesHex: string; text: string; current: boolean; source?: SourceSpanDTO }
 export interface BackendErrorDTO {
-  code: 'UNSUPPORTED' | 'INVALID_REQUEST' | 'STALE_CONTEXT' | 'STALE_STOP' | 'BUSY' | 'BUILD_FAILED' | 'LAUNCH_FAILED' | 'READ_FAILED' | 'WRITE_FAILED' | 'TIMEOUT' | 'CANCELLED' | 'REPLAY_DIVERGED' | 'EVENT_GAP' | 'HISTORY_EVICTED' | 'LIMIT_EXCEEDED' | 'INTERNAL';
+  code: 'UNSUPPORTED' | 'INVALID_REQUEST' | 'STALE_CONTEXT' | 'STALE_STOP' | 'BUSY' | 'BUILD_FAILED' | 'LAUNCH_FAILED' | 'READ_FAILED' | 'WRITE_FAILED' | 'TIMEOUT' | 'STEP_TIMEOUT' | 'CANCELLED' | 'REPLAY_DIVERGED' | 'EVENT_GAP' | 'HISTORY_EVICTED' | 'LIMIT_EXCEEDED' | 'INTERNAL';
   message: string;
   retryable: boolean;
   detail?: string;

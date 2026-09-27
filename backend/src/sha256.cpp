@@ -61,7 +61,10 @@ std::string sha256_hex(std::span<const std::byte> bytes) {
   for (std::size_t i=0;i<rest;++i) tail[i]=bytes[full*64+i];
   tail[rest] = std::byte{0x80};
   const std::uint64_t bits = static_cast<std::uint64_t>(bytes.size()) * 8;
-  const auto offset = (rest + 1 <= 55) ? 56u : 120u;
+  // The 0x80 marker may occupy byte 55; the 64-bit length then starts at
+  // byte 56 and still fits in this block.  Using <=55 incorrectly added an
+  // entire padding block for every message whose remainder was exactly 55.
+  const auto offset = (rest + 1 <= 56u) ? 56u : 120u;
   for (unsigned i=0;i<8;++i) tail[offset+7-i] = static_cast<std::byte>((bits>>(i*8))&0xff);
   block(h, tail.data()); if (offset==120) block(h, tail.data()+64);
   std::ostringstream out; out << std::hex << std::setfill('0');
