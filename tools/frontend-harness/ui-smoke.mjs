@@ -1,0 +1,55 @@
+#!/usr/bin/env node
+import {readFile} from 'node:fs/promises';
+import vm from 'node:vm';
+import {webcrypto} from 'node:crypto';
+
+const ids = ['source', 'argv', 'input', 'environment', 'state', 'observation', 'stdout', 'stderr', 'log', 'status', 'connection', 'reset'];
+const elements = new Map(ids.map(id => [id, {
+  id,
+  value: id === 'source' ? 'int main() { return 0; }' : '',
+  textContent: '',
+  dataset: {},
+  classList: {add() {}, remove() {}},
+  addEventListener(type, callback) { this[`on${type}`] = callback; },
+}]));
+const actions = ['build', 'launch', 'step', 'continue', 'pause', 'stop', 'state', 'history'].map(kind => ({
+  dataset: {action: kind},
+  disabled: false,
+  addEventListener(type, callback) { this[`on${type}`] = callback; },
+}));
+
+let requestPayload;
+const context = {
+  document: {
+    getElementById: id => elements.get(id),
+    querySelectorAll: selector => selector === 'button[data-action]' ? actions : [],
+  },
+  fetch: async (url, options = {}) => ({
+    ok: true,
+    async json() {
+      if (url === '/api/request') {
+        requestPayload = JSON.parse(options.body);
+        return {ok: true, result: {kind: 'build', success: true, artifact: {id: 'ui-smoke-artifact'}}};
+      }
+      return {events: [], nextCursor: 0, connected: false, session: null, stderr: []};
+    },
+  }),
+  crypto: webcrypto,
+  TextEncoder,
+  Uint8Array,
+  JSON,
+  Date,
+  console,
+  setInterval() {},
+  location: {reload() {}},
+};
+context.window = context;
+vm.runInNewContext(await readFile(new URL('./app.js', import.meta.url), 'utf8'), context, {filename: 'app.js'});
+await new Promise(resolve => setTimeout(resolve, 20));
+
+if (!actions.find(button => button.dataset.action === 'step').disabled)
+  throw new Error('Step must be disabled before Launch');
+await actions.find(button => button.dataset.action === 'build').onclick();
+const hash = requestPayload?.command?.source?.documents?.[0]?.sha256;
+if (!/^[0-9a-f]{64}$/.test(hash || '')) throw new Error(`Build sent an invalid SHA-256 digest: ${hash}`);
+console.log('PASS frontend app digest and pre-launch controls');

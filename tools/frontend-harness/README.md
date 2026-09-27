@@ -11,6 +11,13 @@ node tools/frontend-harness/server.mjs \
 # открыть http://127.0.0.1:4177
 ```
 
+Проверки стенда без браузерных зависимостей:
+
+```bash
+node tools/frontend-harness/ui-smoke.mjs
+node tools/frontend-harness/smoke.mjs backend/out/linux-debug/phantom-backend
+```
+
 `--workspace` должен существовать или быть создан заранее. Backend сам создаёт `.phantom/backend-build`; исходник из поля редактора отправляется как immutable `main.cpp` snapshot.
 
 Стенд использует тот же wire protocol: `connect`, `build`, `launch`, `step`, `continue`, `pause`, `stop`, `getState`, `listHistory`. Он показывает состояние, observation, оба потока вывода, ошибки и события/ответы NDJSON. Кнопка Restart backend завершает дочерний процесс и начинает новую сессию. Для аргументов и environment используются отдельные строки; пробелы внутри значения сохраняются.
