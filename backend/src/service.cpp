@@ -37,6 +37,7 @@ bool redirects_output(std::string_view flag) {
   if (flag.rfind("-Wl,", 0) == 0 && (flag.find(",-o,") != std::string_view::npos || flag.ends_with(",-o"))) return true;
   return false;
 }
+constexpr std::uintmax_t maxArtifactBytes = 256u * 1024u * 1024u;
 } // namespace
 
 BackendService::BackendService(ServiceOptions options) : options_(std::move(options)) {
@@ -295,6 +296,11 @@ Json BackendService::handleBuild(const Json& request) {
   if (mainPath.empty()) throw std::runtime_error("source bundle has no C++ translation unit");
   std::filesystem::create_directories(outputDir);
   const auto binary = outputDir / ("phantom-" + stamp);
+  // Never let an old successful artifact make a failed/no-op compiler look
+  // successful. The output path is private to this immutable build stamp.
+  std::error_code removeError;
+  std::filesystem::remove(binary, removeError);
+  if (removeError) throw std::runtime_error("cannot remove stale build artifact: " + removeError.message());
   std::vector<std::string> argv{compiler}; argv.insert(argv.end(), flags.begin(), flags.end());
   for (const auto& translationUnit : translationUnits) argv.push_back(translationUnit.string());
   argv.push_back("-o"); argv.push_back(binary.string());
@@ -305,7 +311,12 @@ Json BackendService::handleBuild(const Json& request) {
   const bool success = result.exit && result.exit->exit_code == 0 && std::filesystem::is_regular_file(binary);
   Json artifact = nullptr;
   if (success) {
+    std::error_code sizeError;
+    const auto binarySize = std::filesystem::file_size(binary, sizeError);
+    if (sizeError || binarySize > maxArtifactBytes)
+      throw std::runtime_error(sizeError ? "cannot inspect compiler artifact size" : "compiler artifact exceeds 256 MiB limit");
     std::ifstream in(binary, std::ios::binary); std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    if (!in) throw std::runtime_error("cannot read compiler artifact");
     const auto binaryHash = sha256_hex(bytes);
     Json compilerInfo = {{"path", compiler}, {"version", "unknown"}};
     try {
@@ -314,9 +325,12 @@ Json BackendService::handleBuild(const Json& request) {
     } catch (...) { /* Build success is still useful; capability reports unknown version. */ }
     if (cancellation.stop_requested()) throw ProcessError(ProcessErrorCode::cancelled, "build cancelled");
     const auto id = sha256_hex(stamp + binaryHash + json_text(config));
+    const bool debugSymbols = std::any_of(flags.begin(), flags.end(), [](const std::string& flag) {
+      return (flag == "-g" || flag.rfind("-g", 0) == 0) && flag != "-g0";
+    });
     artifact = {{"id", id}, {"sourceBundleId", bundleId}, {"configurationRevisionId", config.at("revisionId")},
                 {"architecture", architecture}, {"targetTriple", "x86_64-pc-linux-gnu"}, {"compiler", compilerInfo},
-                {"command", argv}, {"binaryPath", binary.string()}, {"binarySha256", binaryHash}, {"debugSymbolsAvailable", true}};
+                {"command", argv}, {"binaryPath", binary.string()}, {"binarySha256", binaryHash}, {"debugSymbolsAvailable", debugSymbols}};
     artifact_ = Artifact{artifact, binary, sourceSnapshot};
   } else artifact_.reset();
   return okResponse(request, {{"kind", "build"}, {"artifact", artifact}, {"success", success}, {"command", argv},
@@ -325,8 +339,38 @@ Json BackendService::handleBuild(const Json& request) {
 
 std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameSink& publish) {
   std::vector<Json> frames;
+  const auto staleArtifact = [&](std::string message) {
+    const bool wasLive = engine_->live();
+    if (wasLive) engine_->stop();
+    artifact_.reset();
+    frames.push_back(errorResponse(request, "STALE_CONTEXT", std::move(message), false));
+    if (wasLive) publishFailedState(frames, request);
+    return frames;
+  };
   if (!artifact_ || string_at(artifact_->dto, "id") != request.at("command").at("buildId").get<std::string>()) {
     frames.push_back(errorResponse(request, "STALE_CONTEXT", "build artifact is unavailable", false)); return frames;
+  }
+  // Build identity includes the binary hash and the exact source snapshot.
+  // Recheck both immediately before launching: a workspace process may have
+  // replaced files after build, and GDB must never debug a different artifact
+  // under the old session identity.
+  {
+    std::error_code sizeError;
+    const auto binarySize = std::filesystem::file_size(artifact_->binary, sizeError);
+    if (sizeError || binarySize > maxArtifactBytes)
+      return staleArtifact(sizeError ? "build artifact cannot be inspected before launch" : "build artifact exceeds 256 MiB limit");
+    std::ifstream binary(artifact_->binary, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(binary)), {});
+    if (!binary || sha256_hex(bytes) != string_at(artifact_->dto, "binarySha256")) {
+      return staleArtifact("build artifact changed after compilation");
+    }
+    for (const auto& document : artifact_->source.at("documents")) {
+      std::ifstream source(document.at("path").get<std::string>(), std::ios::binary);
+      const std::string text((std::istreambuf_iterator<char>(source)), {});
+      if (!source || sha256_hex(text) != sha256_hex(document.at("text").get<std::string>())) {
+        return staleArtifact("source snapshot changed after compilation");
+      }
+    }
   }
   const auto& command = request.at("command");
   if (!command.value("stopAtEntry", true)) {
@@ -479,8 +523,14 @@ Json BackendService::handleHistory(const Json& request) {
     return okResponse(request, {{"kind", "observation"}, {"observation", it->observation}});
   }
   Json items = Json::array(); const auto after = command.at("afterOrdinal").is_null() ? 0ULL : command.at("afterOrdinal").get<std::uint64_t>(); const auto limit = std::min<std::size_t>(command.at("limit").get<std::size_t>(), options_.limits.maxPageSize);
-  for (const auto& entry : history_) { const auto p = entry.observation.at("point"); const auto ord = p.at("eventOrdinal").get<std::uint64_t>(); if (ord <= after) continue; if (items.size() >= limit) break; items.push_back({{"point", p}, {"stop", entry.observation.at("stop")}, {"label", entry.observation.value("reason", "stop")}, {"retained", true}}); }
-  return okResponse(request, {{"kind", "history"}, {"items", items}, {"hasMore", false}});
+  bool hasMore = false;
+  for (const auto& entry : history_) {
+    const auto p = entry.observation.at("point"); const auto ord = p.at("eventOrdinal").get<std::uint64_t>();
+    if (ord <= after) continue;
+    if (items.size() >= limit) { hasMore = true; break; }
+    items.push_back({{"point", p}, {"stop", entry.observation.at("stop")}, {"label", entry.observation.value("reason", "stop")}, {"retained", true}});
+  }
+  return okResponse(request, {{"kind", "history"}, {"items", items}, {"hasMore", hasMore}});
 }
 
 std::vector<Json> BackendService::connect(const Json& request) {
@@ -513,6 +563,9 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         (sessionId_.empty() || request.at("session").at("id").get<std::string>() != sessionId_ ||
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
+    if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents") &&
+        !sessionId_.empty() && request.at("session").is_null())
+      return {errorResponse(request, "STALE_CONTEXT", "history belongs to the current debugging session", false)};
     // pause/stop/cancel may already have interrupted the active GDB command
     // on the transport reader thread. Their queued protocol frame is an
     // acknowledgement, not a second debugger operation; issuing another
@@ -597,7 +650,8 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "listHistory" || kind == "readHistory") return {handleHistory(request)};
     if (kind == "replayEvents") {
       const auto after = request.at("command").at("afterSequence").get<std::uint64_t>(); Json events = Json::array();
-      if (!eventLog_.empty() && after < eventLog_.front().value("sequence", 0ULL) - 1)
+      if ((eventLog_.empty() && after < sequence_) ||
+          (!eventLog_.empty() && after < eventLog_.front().value("sequence", 0ULL) - 1))
         return {errorResponse(request, "EVENT_GAP", "requested event sequence has been evicted", true)};
       for (const auto& frame : eventLog_) if (frame.value("sequence", 0ULL) > after) events.push_back(frame);
       return {okResponse(request, {{"kind", "events"}, {"events", events}})};

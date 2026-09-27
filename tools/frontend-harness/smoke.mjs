@@ -11,7 +11,28 @@ const port = 4199;
 const server = spawn(process.execPath, [path.join(root,'tools/frontend-harness/server.mjs'),'--backend',backend,'--workspace',workspace,'--port',String(port)], {cwd:root,stdio:['ignore','pipe','pipe']});
 const wait = ms => new Promise(resolve => setTimeout(resolve,ms));
 async function post(pathname, value={}) { const r=await fetch(`http://127.0.0.1:${port}${pathname}`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(value)}); const x=await r.json(); if(!r.ok || x.ok===false) throw new Error(JSON.stringify(x)); return x; }
-async function events() { return (await (await fetch(`http://127.0.0.1:${port}/api/events`)).json()).events; }
+let eventCursor = 0;
+async function events() {
+  const value = await (await fetch(`http://127.0.0.1:${port}/api/events?after=${eventCursor}`)).json();
+  if (value.gap) throw new Error(`harness event gap after ${eventCursor}`);
+  eventCursor = value.nextCursor ?? eventCursor;
+  return value.events;
+}
+async function waitForCommand(requestId, initialStop = null) {
+  let latestStop = initialStop;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await wait(25);
+    for (const frame of await events()) {
+      if (frame.payload?.kind === 'observation') latestStop = frame.payload.observation.stop;
+      const finished = frame.payload?.kind === 'commandFinished' && frame.payload.requestId === requestId;
+      if (finished) {
+        if (frame.payload.outcome !== 'completed') throw new Error(`command ${requestId} ended ${frame.payload.outcome}`);
+        return latestStop;
+      }
+    }
+  }
+  throw new Error(`command ${requestId} did not finish`);
+}
 try {
   await wait(150);
   const source = '#include <iostream>\nint main(){ std::cout << "ok\\n"; return 0; }\n';
@@ -23,7 +44,15 @@ try {
   if (!stop) throw new Error('launch observation was not emitted');
   const step = await post('/api/request',{session:launch.result.session,expectedStop:stop,command:{kind:'step',stepKind:'over'}});
   if (step.result?.kind !== 'accepted') throw new Error('step was not accepted');
+  stop = await waitForCommand(step.requestId, stop);
   const stopResponse = await post('/api/request',{session:launch.result.session,expectedStop:stop,command:{kind:'stop'}});
   if (stopResponse.result?.kind !== 'accepted') throw new Error('stop was not accepted');
+  await waitForCommand(stopResponse.requestId, stop);
   console.log('PASS frontend harness build → launch → step → stop');
-} finally { server.kill('SIGTERM'); await rm(workspace,{recursive:true,force:true}); }
+} finally {
+  if (server.exitCode === null) {
+    server.kill('SIGTERM');
+    await new Promise(resolve => server.once('exit', resolve));
+  }
+  await rm(workspace,{recursive:true,force:true});
+}

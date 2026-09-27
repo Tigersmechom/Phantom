@@ -118,7 +118,7 @@ def main() -> int:
             if no_session.get("ok") or no_session.get("error", {}).get("code") != "STALE_CONTEXT":
                 fail("getState before launch must return a v1 error instead of a null state result", no_session)
             source_text = (
-                "int add(int a, int b) { return a + b; }\n"
+                "int add(int a, int b) { return a + b; } // 😀\n"
                 "int main() {\n"
                 "  int value = add(2, 3);\n"
                 "  value += 1;\n"
@@ -202,11 +202,14 @@ def main() -> int:
             location = observation.get("location")
             if not location or location["documentId"] != "main" or location["revisionId"] != "rev-1":
                 fail("GDB location was not mapped to submitted source", location)
+            expected_main_offset = len("int add(int a, int b) { return a + b; } // 😀\nint main() {\n".encode("utf-16-le")) // 2
+            if location["range"]["start"] != expected_main_offset or location["range"]["end"] != expected_main_offset:
+                fail("Unicode before GDB location produced an invalid UTF-16 offset", location)
             if observation["input"]["submitted"]["id"] != "input-1":
                 fail("submitted input identity was lost", observation["input"])
 
             session = launch["session"]
-            line_three_prefix = "int add(int a, int b) { return a + b; }\nint main() {\n"
+            line_three_prefix = "int add(int a, int b) { return a + b; } // 😀\nint main() {\n"
             line_three_offset = len(line_three_prefix.encode("utf-16-le")) // 2
             breakpoints = client.send(
                 {
@@ -311,6 +314,12 @@ def main() -> int:
             items = history.get("result", {}).get("items", [])
             if not history.get("ok") or len(items) < 2:
                 fail("history did not retain launch and step", history)
+            first_page = client.send({
+                **common, "requestId": "history-page-1", "session": session,
+                "command": {"kind": "listHistory", "branchId": "main", "afterOrdinal": None, "limit": 1},
+            })
+            if not first_page.get("ok") or len(first_page["result"]["items"]) != 1 or not first_page["result"]["hasMore"]:
+                fail("history pagination did not report a remaining page", first_page)
 
             stop = client.send(
                 {

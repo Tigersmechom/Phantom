@@ -443,9 +443,12 @@ struct GdbEngine::Impl {
     int currentLine = 1;
     while (currentLine < line && byte < document->text.size()) {
       const unsigned char c = static_cast<unsigned char>(document->text[byte]);
-      std::size_t width = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+      // Source text has already passed UTF-8 validation. Advance once per
+      // code point, rather than once per byte: a supplementary character is
+      // two UTF-16 code units, all other valid code points are one.
+      const std::size_t width = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+      utf16 += c < 0xf0 ? 1 : 2;
       if (c == '\n') ++currentLine;
-      if (currentLine <= line) utf16 += (c < 0xf0 ? 1 : 2);
       byte += std::min(width, document->text.size() - byte);
     }
     if (currentLine != line) return nullptr;
@@ -1003,8 +1006,23 @@ bool GdbEngine::setBreakpoints(const nlohmann::json& request, nlohmann::json& re
     if (!impl_->command("-break-insert -f " + miQuote(path.string() + ":" + std::to_string(line)), false, rec, error)) return false;
     const MiValue* bkpt = field(rec.fields, "bkpt");
     std::string number = valText(bkpt ? field(*bkpt, "number") : nullptr);
-    if (number.empty()) { item["verified"] = false; item["message"] = "GDB did not resolve breakpoint"; }
-    else { impl_->breakpoints.push_back({documentId, number}); item["verified"] = true; item["resolvedRange"] = bp.value("range", nlohmann::json::object()); }
+    if (number.empty()) {
+      item["verified"] = false; item["message"] = "GDB did not resolve breakpoint";
+    } else {
+      impl_->breakpoints.push_back({documentId, number});
+      item["verified"] = true;
+      // The requested editor range is not evidence of where GDB resolved the
+      // line. Publish a resolved span only when MI returned a concrete file
+      // and line that can be mapped back to the immutable source bundle.
+      const auto fullName = valText(bkpt ? field(*bkpt, "fullname") : nullptr);
+      const auto lineText = valText(bkpt ? field(*bkpt, "line") : nullptr);
+      int resolvedLine = 0;
+      const auto parsed = std::from_chars(lineText.data(), lineText.data() + lineText.size(), resolvedLine);
+      if (!fullName.empty() && parsed.ec == std::errc{} && parsed.ptr == lineText.data() + lineText.size()) {
+        const auto resolved = impl_->sourceLocation(fullName, resolvedLine);
+        if (!resolved.is_null()) item["resolvedRange"] = resolved;
+      }
+    }
     result.push_back(item);
   }
   return true;
@@ -1079,18 +1097,22 @@ bool GdbEngine::disassemble(std::string_view addressHex, std::size_t maxInstruct
   MiRecord rec;
   if (!impl_->command("-data-disassemble -s " + std::string(addressHex) + " -e 0x" + [&] { std::ostringstream o; o << std::hex << end; return o.str(); }() + " -- 0", false, rec, error)) return false;
   nlohmann::json instructions = nlohmann::json::array();
+  const auto isCurrent = [&](std::string_view text) {
+    const auto parsed = parseAddress(text);
+    return parsed && *parsed == *address;
+  };
   if (const MiValue* list = field(rec.fields, "asm_insns")) {
     for (const auto& insn : list->values) {
       auto addr = valText(field(*insn, "address"));
       instructions.push_back({{"addressHex", addr}, {"bytesHex", valText(field(*insn, "opcodes"))},
-                              {"text", valText(field(*insn, "inst"))}, {"current", addr == addressHex}});
+                              {"text", valText(field(*insn, "inst"))}, {"current", isCurrent(addr)}});
       if (instructions.size() >= maxInstructions) break;
     }
     for (const auto& [key, insn] : list->fields) {
       if (!insn) continue;
       auto addr = valText(field(*insn, "address"));
       instructions.push_back({{"addressHex", addr}, {"bytesHex", valText(field(*insn, "opcodes"))},
-                              {"text", valText(field(*insn, "inst"))}, {"current", addr == addressHex}});
+                              {"text", valText(field(*insn, "inst"))}, {"current", isCurrent(addr)}});
       if (instructions.size() >= maxInstructions) break;
     }
   }
