@@ -1,75 +1,104 @@
-# phantom backend — Linux starting point
+# phantom backend
 
-Статус: **компилируемый каркас самостоятельного процесса C++20**. Он не запускает
-отладчик, не исполняет Protocol v1, не записывает программы и не подключён к UI.
-`--self-check` печатает отчёт о своей сборке; все исследовательские возможности
-в нём выключены. Это не handshake и не доказательство работоспособности rr.
+Linux backend service на C++20. Процесс работает без Electron и UI и говорит с
+клиентом по UTF-8 NDJSON через stdin/stdout. Реализованный P0-срез проходит
+реальный цикл `build → launch → stop at entry → step → history` через GDB/MI.
 
-Основной план и критерии приёмки: [BACKEND_HANDOFF.md](../docs/BACKEND_HANDOFF.md).
-Установка Linux, команды клонирования и проверка rr:
-[LINUX_BACKEND.md](../docs/LINUX_BACKEND.md).
+Поддерживаемая конфигурация текущего адаптера: Linux x86_64, Clang/GCC-подобный
+компилятор, GDB с MI2. Исходники сначала проверяются и сохраняются в immutable
+snapshot, затем сборка и отладчик работают только с этим snapshot и артефактом.
+Пути ограничены workspace, команды компилятора запускаются без shell, а stdout,
+stderr, JSON, страницы переменных, память и история имеют явные лимиты.
+Аргументы inferior проходят проверку границ MI, а POSIX-окружение задаётся
+самой отлаживаемой программе после запуска GDB; `PATH`/`LD_*` из запроса не
+меняют процесс отладчика.
 
-## Сборка без frontend
+## Сборка и проверки
 
-Нужны C++20 compiler, CMake >= 3.21, Ninja и Python >= 3.8 для smoke test.
-Node.js, npm, Electron, Unreal, LLVM development libraries и SQLite для этого
-каркаса не нужны. Linux preset использует `clang++` из PATH.
+Нужны C++20 compiler, CMake >= 3.21, Ninja, Python >= 3.8 и GDB. Linux preset
+использует `clang++` из PATH.
 
 ```bash
 cd backend
 cmake --preset linux-debug
 cmake --build --preset linux-debug
 ctest --preset linux-debug
-./out/linux-debug/phantom-backend --version
 ./out/linux-debug/phantom-backend --self-check
 ```
 
-На macOS с установленным Ninja предусмотрен `macos-debug` (Apple Clang).
-Для проверки переносимой части без Ninja можно использовать Make:
+CTest включает CLI doctor, SHA-256, process/MI parser, strict DTO validation,
+bounded NDJSON transport и headless service integration. Последний тест компилирует небольшую C++20
+программу, запускает её через настоящий GDB и проверяет порядок событий,
+source identity, UTF-16 location, step, variables, history, stop, target-only
+environment и same-packet control для долгого continue.
+
+Для ручного запуска:
 
 ```bash
-cmake -S backend -B backend/out/macos-make -G 'Unix Makefiles' \
-  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_BUILD_TYPE=Debug
-cmake --build backend/out/macos-make
-ctest --test-dir backend/out/macos-make --output-on-failure
+./out/linux-debug/phantom-backend --stdio --workspace /path/to/project
 ```
 
-Сборка каркаса на macOS не означает поддержку будущего Linux recorder на macOS.
-Локальные пути и выбранный compiler можно задавать в игнорируемом
-`CMakeUserPresets.json`; общие presets должны оставаться переносимыми.
+Первый frame должен быть `{"kind":"connect","supportedProtocolVersions":[1]}`.
+Дальше идут v1 request frames; каждый response/event занимает одну строку.
+`--help`, `--version` и `--self-check` не являются handshake и не заменяют
+protocol capabilities.
 
-## Границы будущих компонентов
+## Честные границы текущего среза
 
-Это направления следующей реализации, а не уже существующие модули:
+- `capabilities.architectures` содержит только `x86_64`; arm64 отклоняется.
+- Настоящие source breakpoints, stack frames, line locations, stepping
+  (`over/into/out/instruction`) и immutable in-memory history работают через
+  GDB/MI. Location — zero-width span в начале подтверждённой строки: GDB обычно
+  не даёт колонку.
+- `inputTracking` равно `transport-only`. Inferior получает отдельный PTY, а MI
+  pipe никогда не доступен пользовательской программе. Submitted input
+  сохраняет точный текст и ID, а принятые PTY bytes получают deterministic EOF;
+  backend не выдаёт запись bytes за доказательство успешного C++ extraction.
+  Канонический PTY ограничивает каждую строку системным `MAX_CANON` (на
+  текущем Linux обычно 255 bytes); такой ввод отклоняется до запуска. Ввод с
+  PTY EOF control byte также отклоняется, чтобы не потерять байт молча.
+  PTY объединяет stdout/stderr, поэтому stderr snapshot пока пуст и отдельный
+  stream capture будет отдельным transport-профилем.
+- `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
+  expression traces, source disassembly и verified restore выключены и отвечают
+  `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес
+  и проверяют лимиты.
+- GDB values без надёжного type information помечаются `unavailable`, а не
+  выдаются за типизированный результат. Оптимизированные/неизвестные значения
+  сохраняют явную причину неполноты.
 
-| Слой | Ответственность |
+После EOF transport отменяет активную операцию, дренирует уже принятую очередь
+и только затем освобождает GDB/process group. Отмена и stop не оставляют
+принадлежащих сессии дочерних процессов.
+
+## Структура
+
+| Путь | Назначение |
 | --- | --- |
-| `protocol` | Версионирование, framing/transport, команды/события, cancellation, capabilities и проверка входных сообщений |
-| `engine` | Управление процессом/отладчиком, настоящие остановки и восстановление; Linux rr/GDB и возможный отдельный LLDB adapter |
-| `trace` | Неизменяемые события, идентичность объектов/активаций, точные значения, покрытие записи и контрольные точки |
-| `query` | Индексы и чистые запросы к истории, temporal predicates, отсутствие побочных эффектов в исследуемой программе |
-| `instrumentation` | Clang/LLVM и runtime для наблюдаемых вычислений/жизненных циклов; отдельный opt-in профиль сборки |
+| `src/main.cpp` | NDJSON framing, bounded frames, worker queue, CLI doctor |
+| `src/validation.cpp` | pre-DOM bounds, duplicate keys, UTF-8/UTF-16 и DTO validation |
+| `src/process.cpp` | shell-free fork/exec, pipes, deadlines, process groups, SIGPIPE safety |
+| `src/mi.cpp` | strict reusable GDB/MI records и line buffering |
+| `src/gdb.cpp` | GDB/MI adapter, source mapping, stack/variables/memory/asm |
+| `src/service.cpp` | build identity, lifecycle, events, history и capability gate |
+| `src/sha256.cpp` | dependency-free SHA-256 для source/artifact identity |
+| `tests/service_integration.py` | headless real-debugger acceptance path |
+| `tests/transport_test.py` | bounded NDJSON framing, EOF and signal cleanup |
 
-Создавать каталоги и зависимости следует вместе с первой работающей функцией.
-Форматы C++ и TypeScript должны проверяться общими fixtures; JSON из
-`--self-check` намеренно не является дублирующим контрактом отладчика.
+Главный план, DTO semantics, recorder/instrumentation research и P0–P10 остаются
+в [BACKEND_HANDOFF.md](../docs/BACKEND_HANDOFF.md). Документ проверки контрактов
+и framing находится в [contract-review.md](docs/contract-review.md). Подготовка
+Linux toolchain и результаты rr probe сохранены в `.phantom/setup/`.
 
-## Первые задачи backend-агента
+## Следующие backend-профили
 
-1. Выполнить doctor и реальную rr fixture на Linux, сохранить версии CPU/kernel/
-   compiler/debugger и результат прямого/обратного прохода. Не выдавать наличие
-   исполняемого файла за capability. rr event number не равен source step.
-2. По основному handoff согласовать семантику шага, объектной идентичности,
-   неполных наблюдений и transport. Все отсутствующие capabilities остаются off.
-3. Сделать минимальный настоящий цикл launch → stop → read → step → exit с
-   отдельным жизненным циклом процесса и тестом без UI.
-4. Исследовать точную трассу выражения и жизненного цикла, запись/воспроизведение
-   и вмешательство как разные прототипы. Фиксировать ограничения, не заменять
-   ненаблюдаемые данные догадками.
-5. До разработки Clang-плагина зафиксировать одну major-версию LLVM и полный
-   набор совместимых Clang/LLVM headers/libraries/toolchain. Текущий scaffold
-   не зависит от ABI LLVM и ничего о совместимости будущего плагина не обещает.
+Следующий transport-профиль может заменить PTY на доверенный pipe-wrapper: это
+даст раздельные stdout/stderr, произвольные бинарные bytes и half-close без
+канонического лимита строки. Он должен быть отдельным capability-gated режимом,
+а текущий merged PTY нельзя выдавать за него.
 
-`fixtures/rr-smoke.cpp` — обычная C++ программа для внешней проверки rr;
-по умолчанию она не собирается. `tests/cli_smoke.py` проверяет границу процесса,
-честность отчёта и отказ неподдерживаемых команд. Проверок debugger/trace пока нет.
+После этого можно добавлять rr только с manifest артефакта, проверкой PMU/ptrace
+ограничений и явным `REPLAY_DIVERGED`; отсутствие rr не должно маскироваться
+обычным GDB запуском. Expression/lifetime instrumentation требует совместимого
+Clang/LLVM toolchain, immutable event schema и coverage gaps — эти функции не
+должны появляться в capabilities до наличия соответствующих доказательств.
