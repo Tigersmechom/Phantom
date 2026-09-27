@@ -1,0 +1,188 @@
+.brand {
+  text-transform: none;
+  letter-spacing: 2.8px;
+}
+.motion-value {
+  display: inline-block;
+  position: relative;
+  transform-origin: 50% 50%;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.motion-value-baseline {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  padding: 0;
+  margin: 0;
+  vertical-align: baseline;
+  pointer-events: none;
+}
+.motion-value.is-unavailable {
+  color: var(--dim);
+  font-size: 0.72em;
+  letter-spacing: 0;
+}
+.inspector .scalar-card strong,
+.inspector .array-cell strong {
+  animation: none;
+}
+.inspector .scalar-card strong {
+  position: relative;
+  font-size: calc(30px * var(--debug-number-scale, 1));
+  line-height: 1.3;
+  letter-spacing: -0.06em;
+}
+.inspector .array-cell strong {
+  font-size: calc(16px * var(--debug-number-scale, 1));
+  min-height: calc(28px * var(--debug-number-scale, 1));
+}
+.inspector .prefix-cells strong {
+  font-size: calc(14px * var(--debug-number-scale, 1));
+}
+.inspector .array-count,
+.inspector .array-note {
+  font-size: calc(9px * var(--debug-number-scale, 1));
+}
+.inspector .variable-name {
+  font-size: calc(12px * var(--debug-name-scale, 1));
+}
+.inspector .state-heading h1 {
+  font-size: calc(19px * var(--debug-name-scale, 1));
+  overflow-wrap: anywhere;
+}
+.inspector .stack-row > span:nth-child(2) {
+  font-size: calc(9px * var(--debug-name-scale, 1));
+}
+.inspector .array-cell {
+  border-radius: 7px;
+}
+.inspector .array-cells {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(max-content, 1fr);
+  overflow-x: auto;
+  padding: 5px 3px 8px;
+  margin: -5px -3px -8px;
+}
+.inspector .array-cell > span {
+  font-size: calc(8px * var(--debug-number-scale, 1));
+}
+.inspector .array-cell strong {
+  padding-inline: 6px;
+  white-space: nowrap;
+  transition:
+    border-color 0.2s,
+    background 0.35s,
+    color 0.2s;
+}
+.inspector .array-cell.reading > i {
+  animation: read-spark 0.5s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.inspector .is-unavailable {
+  font-variant-numeric: normal;
+}
+.inspector .value-unit {
+  margin-left: 8px;
+}
+.inspector .scalar-card .value-unit {
+  position: absolute;
+  right: 0;
+  bottom: 4px;
+  margin-left: 0;
+}
+.inspector .timeline-track .current i {
+  animation: trace-arrive 0.32s ease-out;
+}
+.inspector .timeline-track {
+  gap: 2px;
+}
+.inspector.is-playing .state-orb::after {
+  animation: execution-breathe 2.4s ease-in-out infinite;
+}
+.inspector .io-content textarea {
+  font-size: var(--input-font-size, 14px);
+}
+.inspector .io-content pre {
+  font-size: var(--output-font-size, 14px);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  border-radius: 5px;
+}
+.program-state-empty > span {
+  display: block;
+}
+.terminal-trash:hover {
+  color: var(--text-bright);
+  background: var(--panel-3);
+}
+.operation-speed {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.operation-speed select {
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  padding: 4px 0;
+  outline-offset: 3px;
+}
+.operation-speed option {
+  background: var(--panel);
+}
+@keyframes read-spark {
+  0% {
+    transform: scale(0.4);
+    opacity: 0.2;
+  }
+  30% {
+    transform: scale(1.7);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes trace-arrive {
+  from {
+    transform: scaleY(2.8);
+    filter: brightness(1.6);
+  }
+  to {
+    transform: scaleY(1);
+    filter: brightness(1);
+  }
+}
+@keyframes execution-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.35;
+  }
+  50% {
+    transform: scale(1.14);
+    opacity: 0.8;
+  }
+}
+@media (max-width: 1100px) {
+  .operation-speed {
+    font-size: 9px;
+    gap: 2px;
+  }
+  .brand {
+    letter-spacing: 1.6px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .inspector .array-cell.reading > i,
+  .inspector .timeline-track .current i,
+  .inspector.is-playing .state-orb::after {
+    animation: none;
+  }
+}

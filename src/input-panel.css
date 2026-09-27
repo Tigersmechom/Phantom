@@ -1,0 +1,89 @@
+.input-trace-editor {
+  position: relative;
+  isolation: isolate;
+  flex: 1;
+  min-width: 0;
+  min-height: 28px;
+  overflow: hidden;
+}
+.input-trace-editor .input-trace-textarea,
+.input-trace-mirror {
+  box-sizing: border-box;
+  border: 0;
+  margin: 0;
+  padding: 2px 3px 8px;
+  font-family: var(--stdin-font, var(--mono, monospace));
+  font-size: var(--input-font-size, 14px);
+  font-weight: 400;
+  line-height: 1.8;
+  letter-spacing: 0;
+  word-spacing: 0;
+  font-variant-ligatures: none;
+  font-feature-settings:
+    "liga" 0,
+    "calt" 0;
+  font-kerning: none;
+  text-align: left;
+  text-indent: 0;
+  text-transform: none;
+  tab-size: 4;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+.input-trace-editor .input-trace-textarea {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  resize: none;
+  background: transparent;
+  color: var(--text-bright, #eceef4);
+  caret-color: var(--text-bright, #eceef4);
+  outline: none;
+  overflow: auto;
+}
+.input-trace-mirror {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  visibility: hidden;
+  pointer-events: none;
+}
+.input-trace-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+.input-trace-rect {
+  position: absolute;
+  display: block;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.input-trace-consumed {
+  background: color-mix(in srgb, var(--accent, #c1dca7) 12%, transparent);
+  box-shadow: inset 0 -2px 0
+    color-mix(in srgb, var(--accent, #c1dca7) 45%, transparent);
+}
+.input-trace-active {
+  background: color-mix(in srgb, var(--accent, #c1dca7) 24%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent, #c1dca7) 65%, transparent),
+    0 0 9px color-mix(in srgb, var(--accent, #c1dca7) 12%, transparent);
+}
+.input-trace-editor[data-trace-status="waiting"] .input-trace-active {
+  background: transparent;
+  outline: 1px dashed var(--accent, #c1dca7);
+  outline-offset: -1px;
+  box-shadow: none;
+}
+.input-trace-editor[data-trace-status="error"] .input-trace-active {
+  background: #d96b6826;
+  box-shadow: inset 0 0 0 1px #d96b6899;
+}

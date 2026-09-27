@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>phantom — интерфейс</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #101114; color: #d7d9e0; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; padding: 40px 5vw 70px; }
+      header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #ffffff15; padding-bottom: 25px; margin-bottom: 35px; }
+      h1 { font-size: 28px; font-weight: 450; letter-spacing: -.6px; margin: 0; }
+      small { color: #7c818d; font-size: 11px; }
+      a { color: #b8d69f; text-decoration: none; }
+      .studies { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
+      .study:last-child { grid-column: 1 / -1; max-width: 1100px; margin: auto; }
+      h2 { font-size: 16px; font-weight: 450; margin: 0 0 7px; }
+      img { width: 100%; display: block; border: 1px solid #ffffff20; border-radius: 8px; box-shadow: 0 20px 60px #0004; margin-top: 18px; }
+      footer { margin-top: 40px; border-top: 1px solid #ffffff15; padding-top: 18px; font-size: 11px; color: #7c818d; line-height: 1.8; }
+      @media (max-width: 800px) { .studies { display: block; } .study { margin-bottom: 32px; } header { gap: 20px; } }
+    </style>
+  </head>
+  <body>
+    <header><h1>phantom</h1><a href="http://127.0.0.1:5173/">Открыть ↗</a></header>
+    <main class="studies">
+      <article class="study"><h2>Obsidian</h2><small>Редактор · кадр 23</small><a href="01-obsidian.png"><img src="01-obsidian.png" alt="phantom: тёмная тема, редактор и переменные после первого вычисления" /></a></article>
+      <article class="study"><h2>Porcelain</h2><small>Редактор · кадр 23</small><a href="02-porcelain.png"><img src="02-porcelain.png" alt="phantom: светлая тема, редактор и переменные" /></a></article>
+      <article class="study"><h2>Spectral</h2><small>3D · вычисление a + b</small><a href="spectral.png"><img src="spectral.png" alt="phantom: объёмный код и вычисление суммы в функции add" /></a></article>
+    </main>
+    <footer>В приложении phantom работают сборка C++, запуск и системный терминал. Debug и ASM пока демонстрационные.</footer>
+  </body>
+</html>

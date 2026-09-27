@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>phantom · результаты в 3D</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;background:#101319;color:#e5eaf0;font:14px/1.6 -apple-system,BlinkMacSystemFont,sans-serif}
+  main{max-width:1500px;margin:auto;padding:30px}header{display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap}
+  h1{font-size:18px;font-weight:500;margin:0}nav{display:flex;gap:6px;flex-wrap:wrap}button{font:inherit;color:#a5afba;border:1px solid #303844;border-radius:8px;padding:9px 14px;background:transparent;cursor:pointer}
+  button[aria-pressed=true]{color:#c0eadb;background:#c0eadb12;border-color:#c0eadb70}button:focus-visible{outline:2px solid #c0eadb;outline-offset:3px}
+  p{color:#98a5b3;max-width:900px;margin:18px 0}figure{margin:0}img{display:block;width:100%;height:auto;border:1px solid #303844;border-radius:12px;background:#181d25}
+  figcaption{margin:12px 0;color:#74818f;font-size:12px}a{color:#b1d7ca}details{margin-top:22px}summary{cursor:pointer;color:#acb9c7}details img{margin-top:14px}
+  @media(max-width:700px){main{padding:16px}button{padding:7px 9px}}
+</style>
+<main>
+  <header><h1>phantom · результаты в 3D</h1><nav aria-label="Варианты размещения">
+    <button type="button" data-style="float" aria-pressed="false">Над выражением</button>
+    <button type="button" data-style="rail" aria-pressed="true">На полях</button>
+    <button type="button" data-style="inline" aria-pressed="false">В плоскости</button>
+  </nav></header>
+  <p id="description">Аргументы в отдельных цветных рамках: толстые пунктирные указатели связывают каждое значение с его местом в коде.</p>
+  <figure><img id="preview" src="variant-rail.png" alt="Отдельные аргументы и результаты на полях 3D-кода"><figcaption>Один подготовленный пример вычислений для сравнения трёх вариантов. Анимации доступны в приложении: настройки → 3D и камера → результаты вычислений.</figcaption></figure>
+  <details><summary>Посмотреть в окне приложения</summary><img id="native-preview" src="native-variant-rail.png" alt="Выбранный вариант в приложении phantom"></details>
+</main>
+<script>
+const descriptions={float:'Небольшие плашки над выражениями: результат рядом с кодом, цифры остаются вертикальными и легко читаются.',rail:'Аргументы в отдельных цветных рамках: толстые пунктирные указатели связывают каждое значение с его местом в коде.',inline:'Значения в плоскости кода: компактные плашки повторяют перспективу и наклон букв.'};
+for(const button of document.querySelectorAll('button'))button.addEventListener('click',()=>{
+  for(const other of document.querySelectorAll('button'))other.setAttribute('aria-pressed',String(other===button));
+  const style=button.dataset.style;
+  document.querySelector('#description').textContent=descriptions[style];
+  document.querySelector('#preview').src=`variant-${style}.png`;
+  document.querySelector('#preview').alt=button.textContent;
+  document.querySelector('#native-preview').src=`native-variant-${style}.png`;
+});
+</script>
+</html>

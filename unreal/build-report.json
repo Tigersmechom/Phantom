@@ -1,0 +1,11 @@
+{
+  "map": "/Game/Nocturne/CinematicIDE",
+  "text_actors": 103,
+  "geometry": "Text3D extrusion + 4-segment bevel",
+  "palette_source": "src/xcode-palette.json / dark.raw",
+  "camera": "NOCTURNE_Camera",
+  "engine": "5.8.2-56702186+++UE5+Release-5.8",
+  "rendered": false,
+  "render_output": "failed-offscreen-black.png",
+  "render_status": "GPU commandlet exited successfully after cold compilation, but visual inspection found a completely black frame (RGB min=max=0). One ticked editor attempt was stopped during renewed material compilation. No verified render."
+}

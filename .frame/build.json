@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "compiler": "/usr/bin/clang++",
+  "flags": [
+    "-std=c++20",
+    "-g",
+    "-O0",
+    "-Wall",
+    "-Wextra"
+  ],
+  "outputDirectory": ".frame/build"
+}

@@ -1,0 +1,52 @@
+import { chromium } from 'playwright';
+import assert from 'node:assert/strict';
+
+const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true });
+try {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('http://127.0.0.1:5173/', { waitUntil: 'networkidle' });
+  const editor = page.getByTestId('stdin-editor');
+  const active = page.locator('[data-input-state="active"]');
+  const consumed = page.locator('[data-input-state="consumed"]');
+  const frame = number => page.getByRole('button', { name: `Кадр ${number}`, exact: true }).click();
+  assert.equal(await active.count(), 0);
+  await frame(4);
+  assert.equal(await active.count(), 1, 'The next cin token is marked before extraction');
+  assert.equal(await consumed.count(), 0);
+  const first = await active.boundingBox();
+  await frame(5);
+  assert.equal(await active.count(), 0);
+  assert.equal(await consumed.count(), 1, 'Completed extraction becomes consumed');
+  await frame(6);
+  assert.equal(await active.count(), 1);
+  assert.ok((await active.boundingBox()).x > first.x, 'cin marker advances to the next token');
+  await frame(15);
+  assert.equal(await consumed.count(), 6);
+  assert.equal(await page.getByTestId('input-panel').getAttribute('data-trace-status'), 'complete');
+  await frame(6);
+  assert.equal(await consumed.count(), 1, 'History restores input state, not just the values');
+  await editor.fill('  10\n\t20  30\n40 50 60  ');
+  assert.equal(await active.count(), 0, 'Editing stdin invalidates trace from the earlier submission');
+  assert.equal(await consumed.count(), 0);
+  await page.getByLabel('Операций в секунду').selectOption('0.25');
+  await page.locator('#run-button').click();
+  await page.locator('#run-button').click();
+  await frame(4);
+  const multilineFirst = await active.boundingBox();
+  await frame(6);
+  assert.ok((await active.boundingBox()).y > multilineFirst.y, 'Exact submitted newlines and tabs drive the marker');
+  await frame(56);
+  assert.equal(await page.locator('.has-output').textContent(), 'sum = 210\n');
+  await page.getByRole('button', { name: 'Basic', exact: true }).click();
+  assert.equal(await consumed.count(), 0, 'Basic transport does not pretend to observe cin extractions');
+  await page.getByRole('button', { name: 'Debug', exact: true }).click();
+  await page.getByRole('button', { name: 'Восстановить пример', exact: true }).click();
+  assert.equal(await editor.inputValue(), '3  1  4  1  5  9');
+  assert.equal(await consumed.count(), 0);
+  assert.deepEqual(errors, []);
+  console.log('PASS: App cin binding/read/history, exact multiline submitted input, edit invalidation and no fabricated Basic tracking.');
+} finally {
+  await browser.close();
+}

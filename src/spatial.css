@@ -1,0 +1,55 @@
+.spatial-code {
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  height: 100%;
+  min-height: 250px;
+  overflow: hidden;
+  background: #08090d;
+  color: #c3c6d1;
+  --spatial-text: #c3c6d1;
+  --spatial-muted: #9297a7;
+  --spatial-control: rgba(22, 24, 32, .82);
+  --spatial-overlay: rgba(8, 9, 13, .55);
+}
+
+.spatial-code--light {
+  background: #e6e7eb;
+  --spatial-text: #42424c;
+  --spatial-muted: #62616e;
+  --spatial-control: rgba(248, 248, 251, .86);
+  --spatial-overlay: rgba(230, 231, 235, .7);
+}
+
+.spatial-code__viewport { position: absolute; inset: 0; }
+.spatial-code__viewport canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; outline: 0; }
+.spatial-code__viewport canvas:focus-visible { box-shadow: inset 0 0 0 1px rgba(172, 222, 219, .35); }
+.spatial-code__viewport canvas:active { cursor: grabbing; }
+.spatial-code__vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 47%, transparent 28%, rgba(3, 4, 9, .10) 63%, rgba(3, 4, 9, .42) 100%);
+}
+.spatial-code--light .spatial-code__vignette { opacity: .12; }
+.spatial-code__camera-status {
+  position: absolute;
+  z-index: 4;
+  right: 16px;
+  top: 14px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: var(--spatial-overlay);
+  backdrop-filter: blur(8px);
+  color: var(--spatial-text);
+  font: 10px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  pointer-events: none;
+}
+.spatial-code__loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 15px; color: var(--spatial-muted); font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.spatial-code__loading span { letter-spacing: .15em; }
+.spatial-code__fallback { position: absolute; inset: 0; overflow: auto; padding: 60px 35px 30px; color: var(--spatial-text); background: var(--spatial-control); }
+.spatial-code__fallback p { color: var(--spatial-muted); font: 12px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.spatial-code__fallback pre { font: 13px/1.8 ui-monospace, monospace; }
+@media (max-width: 480px) {
+  .spatial-code__camera-status { right: 12px; font-size: 9px; }
+}

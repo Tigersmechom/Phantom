@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.DS_Store
+unreal/Intermediate/
+unreal/Saved/
+unreal/DerivedDataCache/
+unreal/*.log
+__pycache__/
+release/
+.frame/build/
+
+# Local backend builds and captured execution data.
+backend/build/
+backend/out/
+backend/CMakeUserPresets.json
+backend/compile_commands.json
+.phantom/
+.cache/
+*.core
+core.[0-9]*
+
+# Local credentials and editor state are never part of the source handoff.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.idea/
+.vscode/
+
+# Generated local verification reports.
+previews/*-report.json

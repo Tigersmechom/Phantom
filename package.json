@@ -1,0 +1,50 @@
+{
+  "name": "phantom",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "node tests/smoke.mjs",
+    "start": "node scripts/launch-desktop.mjs",
+    "dev:desktop": "node scripts/dev-desktop.mjs",
+    "rebuild:native": "electron-rebuild -f -w node-pty",
+    "package:mac": "npm run build && node scripts/package-mac.mjs",
+    "test:native": "node tests/native-project.mjs && node tests/native-electron.mjs",
+    "test:editor": "node tests/editor-check.mjs --selection",
+    "test:spatial": "node tests/spatial-check.mjs",
+    "test:experience": "node tests/experience-check.mjs",
+    "test:desktop": "node tests/desktop-ui.mjs",
+    "test:settings": "node tests/settings-workspace.mjs",
+    "test:demo": "node --test tests/demo.test.mjs",
+    "test:input": "node tests/input-integration.mjs",
+    "test:scope": "node tests/inspector-scope-check.mjs",
+    "handoff:backend": "python3 scripts/create-backend-handoff.py"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "lucide-react": "1.48.0",
+    "node-pty": "^1.1.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "three": "^0.183.2"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "@electron/rebuild": "^4.2.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.183.0",
+    "electron": "44.4.5",
+    "playwright": "^1.58.0",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "description": "A spatial C++ workspace for macOS",
+  "main": "electron/main.cjs",
+  "productName": "phantom"
+}

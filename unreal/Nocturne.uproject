@@ -1,0 +1,12 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.8",
+  "Category": "Design experiments",
+  "Description": "Nocturne: a cinematic IDE typography study with true extruded 3D code.",
+  "DisableEnginePluginsByDefault": true,
+  "Plugins": [
+    { "Name": "PythonScriptPlugin", "Enabled": true },
+    { "Name": "EditorScriptingUtilities", "Enabled": true },
+    { "Name": "Text3D", "Enabled": true }
+  ]
+}
