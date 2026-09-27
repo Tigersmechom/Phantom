@@ -283,6 +283,55 @@ flowchart TD
 - **Исследование:** сохранение evaluation order, sequencing, copy elision, short-circuit, exceptions, templates/macros, proxy references, volatile/atomics, стандартная библиотека и неинструментированные модули. Нужна опубликованная матрица coverage; «каждая операция любого C++» не является исходным обещанием.
 - **Приёмка:** declarations с/без initialization, vector zero init, несколько calls в одном выражении, temporary lifetimes и nesting имеют подтверждённые ID/границы; hooks не перевычисляют operands и не меняют число побочных эффектов в проверяемых fixtures. Неизвестный порядок остаётся неизвестным. Unsupported module/optimized operation виден как gap.
 
+### Assertion checkpoints: assert как breakpoint
+
+Это отдельная обязательная возможность поверх P2 и P5. Поддерживаемые вызовы
+`assert` должны рассматриваться как исполняемые checkpoints: программа запускается
+обычно и останавливается на первом **сработавшем assertion** (условие ложно),
+публикуя точную source location, текст условия/сообщения если они доступны,
+stack, значения и состояние до аварийного завершения. Это не должно быть
+подстановкой значения условия или повторным вызовом выражения.
+
+В остановленном состоянии пользователь должен иметь два явно различимых действия:
+
+- `continue` — продолжить обычную семантику программы; для стандартного C/C++
+  `assert` это обычно означает `__assert_fail`/`SIGABRT` и завершение процесса;
+- `ignore assertion and continue` — создать явно помеченную управляемую ветвь,
+  в которой текущий assertion пропускается и исполнение продолжается. Такая
+  ветвь обязана сохранять исходную историю, audit вмешательства и указание на
+  то, что дальнейшее состояние получено после изменения поведения.
+
+«Проигнорировать» нельзя реализовать простым продолжением после `SIGABRT`:
+обычный процесс уже завершён. Нужен проверенный механизм — например,
+instrumented assertion hook или replay/branch с известной точкой продолжения.
+Если бинарь собран с `NDEBUG`, runtime assertion отсутствует и capability не
+должна обещать остановку. До реализации механизма команда и capability должны
+возвращать `UNSUPPORTED`, а не молча менять PC или результат условия.
+
+Практический вариант требует разделить compile profiles:
+
+1. `assert-observe`: assertions сохраняются. Clang/compile database находит их
+   expressions, а GDB получает реальные source/function breakpoints или
+   остановку в безопасном instrumented hook. При ложном условии сохраняются
+   location, доступные operands и состояние непосредственно перед abort.
+2. `assert-continue`/`NDEBUG`: проверки компилируются без assertion side effect.
+   Этот бинарь полезен для отдельной сравнительной ветви, но не продолжает уже
+   остановившийся процесс: после `SIGABRT` его состояние потеряно. Продолжение
+   требует deterministic replay/checkpoint до assertion либо hook, который
+   возвращается в caller по явной команде.
+
+Простая установка breakpoint на строку перед `assert` останавливает и успешные
+проверки, а breakpoint на `__assert_fail` зависит от ABI и не даёт безопасного
+`return`: функция объявлена `noreturn`, и возврат из неё может нарушить ожидания
+компилятора. Поэтому `NDEBUG` не является самостоятельной реализацией кнопки
+`ignore`; это отдельный профиль для controlled comparison/branch.
+
+Приёмка включает: несколько assertions в одной функции, assertion в цикле и
+рекурсии, недоступные/оптимизированные значения, пользовательское сообщение,
+`NDEBUG`, abort без доступного hook, повторное срабатывание после продолжения,
+отмену и stale-stop. Для каждого случая нужны positive/negative fixtures и
+раздельные результаты normal-termination и ignored-branch.
+
 ### P3. History DB, temporal DSL и временные остановки
 
 - **Зависимости:** P1; богатые queries требуют P2.
@@ -349,6 +398,7 @@ flowchart TD
 | clangd или свой semantic service, учебные diagnostics, lvalue/xvalue/prvalue | P2; старт с clangd, исследование расширений/альтернативы на Clang, static annotation отдельно от execution |
 | Счётчик, hover полной доступной истории переменной, шаги ±N | P1; logical identity, captured coverage, без скрытого execution |
 | segfault/assert/RE/UB/while(true), красная/жёлтая карточка | P6; evidence, timeout не доказательство infinite loop |
+| Assertions как checkpoints/breakpoints, остановка на первом срабатывании и продолжение с явным ignore | P2 + P5; сначала наблюдаемый assertion hook, затем audit/replay branch; обычный SIGABRT сам по себе не продолжает процесс |
 | Момент инвалидирования pointer/reference, heap corruption | P2/P6; symptom versus cause, allocation/lifetime generations |
 | «x==10 и был 5 последние 20», временные остановки | P3; явно заданное окно и online/post-hoc semantics |
 | History DB: i==j, a[5] changed, size(v) grew, p invalid, foo(arg<0), sum<previous | P3; typed read-only query, exact values, unknown |
@@ -452,6 +502,7 @@ Backend-агент при необходимости предлагает изм
 
 - Собирается произвольный простой C++ с фактическими флагами и выбранной архитектурой; команда/диагностика доступны. Build fail не запускает прежний бинарник.
 - Реальные stepping/call stack и остановка подтверждаются backend. Для `int n;` без наблюдаемой операции нет фабрикации; отсутствие границы явно допускается capability.
+- Assertion failure останавливается на точной доступной source location с состоянием до abort; `continue` и `ignore assertion` имеют разные наблюдаемые исходы. Ignore не меняет исходную историю и не маскирует отсутствие hook.
 - uint64 > 2^53, отрицательные int64, ноль, −0, IEEE NaN и unavailable проходят JSON и renderer без подмены/округления.
 - История не двигает inferior, сохранённые снимки не мутируются, live handles не читают прошлое. Round trip вперёд/назад к одной точке сохраняет unavailable и известный ноль различными. Replay либо подтверждается проверкой, либо честно отказывает/расходится.
 - При входе в функцию инспектор показывает параметры и locals выбранной активации, без смешивания с caller; после выхода области и возврата видимость восстанавливается по сохранённому кадру. Проверить рекурсивные вызовы/одинаковые имена переменных и повторный просмотр истории.
