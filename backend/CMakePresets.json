@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "linux-debug",
+      "displayName": "Linux / Clang / Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/linux-debug",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "macOS / Apple Clang / Debug (scaffold only)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/macos-debug",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "macos-debug", "configurePreset": "macos-debug" }
+  ],
+  "testPresets": [
+    { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } },
+    { "name": "macos-debug", "configurePreset": "macos-debug", "output": { "outputOnFailure": true } }
+  ]
+}

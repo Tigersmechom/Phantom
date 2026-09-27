@@ -1,0 +1,50 @@
+name: Linux backend foundation
+
+on:
+  push:
+    branches: [main, backend/linux]
+    paths:
+      - 'backend/**'
+      - 'scripts/backend-doctor.sh'
+      - '.github/workflows/backend-linux.yml'
+  pull_request:
+    branches: [main, backend/linux]
+    paths:
+      - 'backend/**'
+      - 'scripts/backend-doctor.sh'
+      - '.github/workflows/backend-linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang cmake ninja-build python3
+      - name: Check environment script syntax
+        run: bash -n scripts/backend-doctor.sh
+      - name: Configure
+        working-directory: backend
+        run: cmake --preset linux-debug
+      - name: Build
+        working-directory: backend
+        run: cmake --build --preset linux-debug
+      - name: Test scaffold contract
+        working-directory: backend
+        run: ctest --preset linux-debug
+      - name: Build and execute the recorder fixture normally
+        working-directory: backend
+        run: |
+          cmake --build --preset linux-debug --target phantom-rr-fixture
+          ./out/linux-debug/phantom-rr-fixture
+      # rr record/replay requires a separately verified CPU/PMU configuration.
+      # This job validates Linux compilation, not recorder capability.
