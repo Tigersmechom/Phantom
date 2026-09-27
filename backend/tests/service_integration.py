@@ -98,7 +98,7 @@ def main() -> int:
                 {
                     "protocolVersion", "backendName", "backendVersion", "architectures", "stepKinds",
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
-                    "inputTracking", "expressionGroups", "history", "restore", "asm", "memoryRead",
+                    "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead",
                     "eventReplay", "limits",
                 },
                 "BackendCapabilitiesDTO",

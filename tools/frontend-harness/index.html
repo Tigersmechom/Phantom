@@ -26,14 +26,15 @@ int main() {
   return value;
 }</textarea>
       </label>
+      <p id="build-status" class="hint">Исходник ещё не собран.</p>
       <div class="grid">
         <label>Аргументы<textarea id="argv"></textarea></label>
-        <label>stdin<textarea id="input">hello\n</textarea></label>
+        <label>stdin при запуске<textarea id="input"></textarea></label>
         <label>Environment<textarea id="environment">PHANTOM_HARNESS=1</textarea></label>
         <label>Ожидаемый cout (статическая эвристика)<textarea id="theoretical-cout" readonly>Вычисляется по простым строковым литералам std::cout; динамические значения не исполняются.</textarea></label>
-        <label>Незасброшенный cout (runtime)<textarea id="buffered-cout" readonly>Ожидание остановки процесса.</textarea></label>
       </div>
-      <p class="hint">stdout содержит только байты, которые программа уже сбросила в pipe. При запуске через pipe обычный <code>std::cout &lt;&lt; "...\n"</code> может оставаться в буфере до flush или завершения процесса. Runtime-поле показывает этот буфер только когда backend подтвердил его чтение; статический прогноз не выдаётся за факт.</p>
+      <label class="inline"><input id="input-eof" type="checkbox">Закрыть stdin после начального текста (EOF, пакетный режим)</label>
+      <p class="hint">По умолчанию stdin открыт: пустое поле означает ожидание ввода. После Launch можно отправить ещё текст или явно передать EOF. Изменение начального текста после Launch не отправляет его программе.</p>
       <div class="buttons">
         <button data-action="build" title="Скомпилировать immutable snapshot">Build</button>
         <button data-action="launch" title="Запустить и остановиться на main">Launch</button>
@@ -46,10 +47,21 @@ int main() {
         <button id="reset" title="Завершить текущую сессию и начать заново">Перезапустить backend</button>
       </div>
       <pre id="status">Сначала выполните Build.</pre>
+      <div class="live-input">
+        <label>Ввод в запущенную программу<textarea id="stdin-live" rows="2"></textarea></label>
+        <label class="inline"><input id="input-newline" type="checkbox" checked>Добавить перевод строки при отправке</label>
+        <div class="buttons">
+          <button data-action="appendInput">Отправить stdin</button>
+          <button data-action="closeInput">Передать EOF</button>
+        </div>
+        <p id="input-status" class="hint">Процесс ещё не запущен.</p>
+      </div>
     </section>
     <section class="panels">
-      <article><h2>State</h2><pre id="state">—</pre></article>
+      <article><h2>State</h2><p id="state-status" class="hint">—</p><pre id="state">—</pre></article>
       <article><h2>Observation</h2><pre id="observation">—</pre></article>
+      <article><h2>Переменные текущей остановки</h2><pre id="variables">—</pre></article>
+      <article><h2>Несброшенный вывод</h2><pre id="buffered-cout">Ожидание остановки процесса.</pre><p id="buffer-status" class="hint">—</p><p class="hint">Свободное место в буфере не определяет точный момент сброса: flush, endl, связанный cin или крупная запись могут сбросить вывод раньше.</p></article>
       <article><h2>stdout (сброшенный)</h2><pre id="stdout">—</pre><p id="stdout-check" class="check">Буфер cout не проверен.</p></article>
       <article><h2>stderr / errors</h2><pre id="stderr">—</pre></article>
       <article><h2>History (остановки)</h2><pre id="history">—</pre></article>

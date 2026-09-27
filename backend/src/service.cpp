@@ -52,6 +52,7 @@ BackendService::BackendService(ServiceOptions options) : options_(std::move(opti
   gdbOptions.maxVariablesPerPage = options_.limits.maxPageSize;
   gdbOptions.maxMemoryReadBytes = options_.limits.maxMemoryReadBytes;
   gdbOptions.maxInstructions = options_.limits.maxInstructions;
+  gdbOptions.maxInputBytes = options_.limits.maxInputBytes;
   engine_ = std::make_unique<GdbEngine>(std::move(gdbOptions));
 }
 
@@ -102,7 +103,7 @@ Json BackendService::capabilities() const {
       {"stepKinds", {"over", "into", "out", "instruction"}},
       {"sourceBreakpoints", true}, {"conditionalBreakpoints", false},
       {"hitCountBreakpoints", false}, {"variableWrite", false},
-      {"inputTracking", "transport-only"}, {"expressionGroups", false}, {"history", true},
+      {"inputTracking", "transport-only"}, {"interactiveInput", true}, {"expressionGroups", false}, {"history", true},
       {"restore", "none"}, {"asm", {{"currentPc", true}, {"sourceRange", false}}},
       {"memoryRead", true}, {"eventReplay", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
@@ -382,6 +383,8 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   for (const auto& arg : command.at("argv")) launch.argv.push_back(arg.get<std::string>());
   for (auto it = command.at("environment").begin(); it != command.at("environment").end(); ++it) launch.environment.emplace_back(it.key(), it.value().get<std::string>());
   launch.input = command.at("input").at("text").get<std::string>();
+  launch.inputId = command.at("input").at("id").get<std::string>();
+  launch.closeInputAfterWrite = command.at("input").at("closeAfterWrite").get<bool>();
   launch.sourceBundle.id = string_at(artifact_->dto, "sourceBundleId");
   for (const auto& document : artifact_->source.at("documents")) {
     launch.sourceBundle.documents.push_back({document.at("documentId"), document.at("revisionId"),
@@ -527,6 +530,21 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   }
 }
 
+Json BackendService::handleInput(const Json& request) {
+  const auto& command = request.at("command");
+  Json input;
+  GdbError error;
+  bool ok = false;
+  if (command.at("kind") == "appendInput")
+    ok = engine_->appendInput(command.at("id").get<std::string>(), command.at("text").get<std::string>(), input, error);
+  else
+    ok = engine_->closeInput(input, error);
+  if (!ok) return errorResponse(request, error.code.empty() ? "INTERNAL" : error.code, error.message, error.retryable);
+  submittedInputId_ = input.at("submitted").at("id").get<std::string>();
+  submittedInput_ = input.at("submitted").at("text").get<std::string>();
+  return okResponse(request, {{"kind", "input"}, {"input", std::move(input)}});
+}
+
 Json BackendService::handleHistory(const Json& request) {
   const auto& command = request.at("command"); const auto kind = command.at("kind").get<std::string>();
   if ((kind == "listHistory" && command.at("branchId") != "main") ||
@@ -603,9 +621,10 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       }
     }
     if (shuttingDown_.load() && (kind == "build" || kind == "launch" || kind == "step" ||
-                                 kind == "continue" || kind == "pause" || kind == "stop"))
+                                 kind == "continue" || kind == "pause" || kind == "stop" ||
+                                 kind == "appendInput" || kind == "closeInput"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
-    const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" ||
+    const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
                              kind == "setBreakpoints" || kind == "writeVariable";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
@@ -662,6 +681,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       catch (const std::exception& e) { artifact_.reset(); return {errorResponse(request, "BUILD_FAILED", e.what(), false)}; }
     }
     if (kind == "launch") return handleLaunch(request, publish);
+    if (kind == "appendInput" || kind == "closeInput") return {handleInput(request)};
     if (kind == "step" || kind == "continue" || kind == "pause" || kind == "stop") return handleExecution(request, kind, publish);
     if (kind == "listHistory" || kind == "readHistory") return {handleHistory(request)};
     if (kind == "replayEvents") {
@@ -705,6 +725,30 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     }
     return {errorResponse(request, "UNSUPPORTED", "command is not implemented", false)};
   } catch (const std::exception& e) { return engineError(request, {"INTERNAL", e.what(), false}); }
+}
+
+std::optional<Json> BackendService::inputControl(const Json& request, bool waitForActive) {
+  try { validate_request(request, options_.limits); } catch (...) { return std::nullopt; }
+  const auto kind = request.at("command").at("kind").get<std::string>();
+  if (kind != "appendInput" && kind != "closeInput") return std::nullopt;
+  std::unique_lock controlLock(controlMutex_);
+  if (waitForActive && (!active_ || !active_->ready))
+    controlWake_.wait_for(controlLock, std::chrono::seconds(2), [this] {
+      return (active_.has_value() && active_->ready) || shuttingDown_.load();
+    });
+  if (!active_ || !active_->ready) return std::nullopt;
+  if (active_->kind != "continue")
+    return errorResponse(request, "BUSY", "interactive input is available while Continue is running", true);
+  if (request.at("workspace") != active_->workspace || request.at("session") != active_->session)
+    return errorResponse(request, "STALE_CONTEXT", "input request does not match the active session", false);
+  if (request.at("expectedStop") != active_->expectedStop)
+    return errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false);
+  Json input; GdbError error;
+  bool ok = kind == "appendInput"
+      ? engine_->appendInput(request.at("command").at("id").get<std::string>(), request.at("command").at("text").get<std::string>(), input, error)
+      : engine_->closeInput(input, error);
+  if (!ok) return errorResponse(request, error.code.empty() ? "INTERNAL" : error.code, error.message, error.retryable);
+  return okResponse(request, {{"kind", "input"}, {"input", std::move(input)}});
 }
 
 bool BackendService::control(const Json& request, bool waitForActive) {

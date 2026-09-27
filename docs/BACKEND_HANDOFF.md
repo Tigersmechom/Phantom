@@ -144,6 +144,8 @@ backend прерывает inferior на реальном остановленн
 
 `RuntimeValueDTO` различает available и unavailable с причиной: `not-declared`, `uninitialized`, `not-captured`, `out-of-scope`, `optimized-out`, `read-error`, `truncated`, `unsupported`. **Uninitialized допустимо лишь при подтверждении**; сырые байты стека сами по себе не доказывают корректное значение или инициализацию.
 
+Native GDB дополнительно может прикрепить к `VariableDTO` физический `addressHex` и bounded `storage`: `state:'observed'` означает только успешное чтение байтов текущего frame, а `lifetime:'unknown'` намеренно сохраняет неизвестность времени жизни C++-объекта. Это не адрес pointee для указателя. `rawBytesHex` не преобразуется в `RuntimeValueDTO` и может содержать padding или старый мусор. Если DWARF не даёт доказуемую location/size, storage остаётся `unknown` с причиной; source line сама по себе не используется как доказательство выделения/инициализации. Точное `not-declared` для top-level locals требует lifecycle metadata от compiler/instrumentation: обычный `-O0 -g` часто оставляет весь function frame одним `DW_OP_fbreg`.
+
 Целые передаются десятичными строками с разрядностью/знаком. `18446744073709551615` нельзя пропускать через `Number`, `parseInt` или JSON-number. IEEE float NaN/±Infinity/−0 имеют отдельную classification и строковое представление; они не являются unavailable. Текущий inspector для `null` рисует «NaN» как визуальную заглушку demo, но новый presenter обязан сохранять различие причин и настоящего IEEE NaN. Известные нули в `vector<int>(n)` и `vector<int>(n + 1, 0)` остаются нулями.
 
 Существующий `ExpressionStage` из `execution-types.ts` уже принимает `number|string|null`, чтобы renderer мог показать точные строки. Это presentation-модель: будущий presenter преобразует структурированное значение в строку/подпись, **не вычисляет выражение** и не сужает число. `RuntimeValueDTO` и `ExpressionTraceDTO` пока не подключены к native bridge автоматически.
@@ -160,7 +162,7 @@ Trace ID отличает конкретное выполнение, включ�
 
 ## 7. STDIN: отображение не равно разбору C++
 
-`SubmittedInputDTO` содержит **ID и точный text**, encoding UTF-8 и **`closeAfterWrite:true`**. В протоколе v1 только фиксированный stdin: append/интерактивного дописывания пока нет. `false` не является поддержанным запросом и отклоняется; будущий interactive input потребует новой согласованной capability и команд append/close. Waiting может наблюдаться до доставки подготовленных данных, но UI v1 не обещает продолжить ввод в уже закрытый pipe.
+`SubmittedInputDTO` содержит **ID и точный text**, encoding UTF-8 и `closeAfterWrite`. При `true` backend закрывает stdin после доставки начального текста и получает EOF; при `false` pipe остаётся открытым. Capability `interactiveInput:true` включает команды `appendInput{id,text}` и `closeInput`: они требуют актуальный `expectedStop`, повторная отправка того же ID с тем же текстом идемпотентна, конфликтующий повтор отклоняется. Во время живого `continue` эти команды получают ответ через transport control path, поэтому не стоят в очереди за долгим ожиданием `cin`; `closeInput` явно передаёт EOF. Ограничены суммарные bytes и число chunks, а `deliveredBytes` по-прежнему означает запись в pipe, а не подтверждённое извлечение `std::cin`.
 
 `InputTrace.revision` для совместимости с текущим `InputPanel` означает **саму точную строку text, не ID и не hash**. Это намеренно названное исключение; настоящий ID — `submitted.id`. `InputPanel` отображает диапазоны только если editable value дословно равен trace.revision. Изменение поля не меняет уже отправленный input/историю.
 
@@ -248,7 +250,7 @@ flowchart TD
 
 ## 11. Эволюция контракта: семь обязательных направлений review
 
-Существующий v1 уже покрывает workspace/session/process identity, subscribe-before-connect, event gaps, exact values, history/live, UTF-16, expression DAG, fixed stdin, limits/cancel. Сохранять это. Следующие семь расширений нужны для программы ниже, но **ещё не реализованы в `src/backend-contract.ts`**. Сначала schema/семантика/fixtures отдельным patch, затем C++ runtime validators и presenter. Несовместимое wire-изменение требует новой согласуемой версии; добавление поля без определения поведения не закрывает пункт.
+Существующий v1 уже покрывает workspace/session/process identity, subscribe-before-connect, event gaps, exact values, history/live, UTF-16, expression DAG, bounded stdin transport, limits/cancel. Сохранять это. Следующие семь расширений нужны для программы ниже, но **ещё не реализованы в `src/backend-contract.ts`**. Сначала schema/семантика/fixtures отдельным patch, затем C++ runtime validators и presenter. Несовместимое wire-изменение требует новой согласуемой версии; добавление поля без определения поведения не закрывает пункт.
 
 Это семь направлений совместного review, не требование создать семь сервисов или немедленно расширить каждую команду. В первом вертикальном срезе вводить только действительно используемые данные; остальные идеи сохраняются здесь до соответствующего этапа. Предпочитать небольшой общий набор событий и запросов разрастанию публичного API на каждую панель.
 

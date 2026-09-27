@@ -67,10 +67,13 @@ protocol capabilities.
   (`over/into/out/instruction`) и immutable in-memory history работают через
   GDB/MI. Location — zero-width span в начале подтверждённой строки: GDB обычно
   не даёт колонку.
-- `inputTracking` равно `transport-only`. Inferior получает stdin, stdout и
+- `inputTracking` равно `transport-only`; `interactiveInput` позволяет оставить
+  stdin открытым и передавать `appendInput`/`closeInput` во время `continue`.
+  Inferior получает stdin, stdout и
   stderr через отдельный доверенный `phantom-io-wrapper` и приватные FIFO; MI
   pipe никогда не доступен пользовательской программе. Submitted input
-  сохраняет точный текст и ID, а доставленные bytes получают deterministic EOF;
+  сохраняет точный текст и ID; `closeAfterWrite:true` даёт deterministic EOF,
+  а `false` ждёт явного `closeInput`;
   backend не выдаёт запись bytes за доказательство успешного C++ extraction.
   У pipe нет терминального `MAX_CANON`: NUL, Ctrl-D, CR/LF и длинные строки
   передаются без редактирования. v1 принимает UTF-8 текст до 1 MiB, а не
@@ -79,6 +82,15 @@ protocol capabilities.
   `retainedFromByte` и `truncated`. В текстовом DTO невалидные байты вывода
   заменяются U+FFFD; счётчики сохраняют размеры исходного потока.
   На остановке сохраняется весь уже ожидающий хвост, включая увеличенные FIFO.
+  Для Linux/glibc остановка может дополнительно содержать подтверждённый
+  `stdout.buffered`: pending bytes, режим буферизации и текущую свободную
+  ёмкость full-buffer. Это диагностическое окно, а не точный обратный отсчёт
+  до flush: `endl`, `flush`, связанный `cin` и крупная запись могут сбросить
+  данные раньше.
+- Для локальных переменных Observation может содержать `addressHex` и
+  bounded `storage.rawBytesHex` собственного storage. `state:observed` означает
+  только успешное чтение байтов; `lifetime:unknown` не превращается в
+  подтверждённое C++ значение, особенно для stack slots до начала lifetime.
 - MI обрабатывается потоково: потреблённые ответы GDB не накапливаются за всё
   время сессии. Лимит отдельной записи и ограниченные порции чтения сохраняют
   границы памяти и возможность вовремя обработать timeout/cancel.

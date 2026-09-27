@@ -144,7 +144,9 @@ int stdio_mode(std::filesystem::path workspace) {
     return false;
   };
   std::atomic<bool> outputFailed{false};
+  std::mutex outputMutex;
   auto writeFrames = [&](const std::vector<Json>& frames) {
+    std::lock_guard outputLock(outputMutex);
     for (const auto& frame : frames) {
       const auto wire = frame.dump(-1, ' ', false) + '\n';
       std::size_t offset = 0;
@@ -268,6 +270,14 @@ int stdio_mode(std::filesystem::path workspace) {
                 // With no earlier frame in flight there is no dequeue race.
                 // A standalone pause/stop can go straight to the worker.
                 (void)service.control(candidate, pendingFrames.load() != 0);
+              } else if (kind == "appendInput" || kind == "closeInput") {
+                phantom::validate_request(candidate);
+                if (const auto immediate = service.inputControl(candidate, pendingFrames.load() != 0)) {
+                  (void)writeFrames({*immediate});
+                  buffer.clear();
+                  discarding = false;
+                  continue;
+                }
               }
             }
           } catch (...) {

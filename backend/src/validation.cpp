@@ -143,7 +143,7 @@ void session(const Json& s,const ValidationLimits& l){if(s.is_null())return;exac
 void stop(const Json& s,const ValidationLimits& l){exact_keys(s,{"stopId","stateRevision"},"stop");id(req(s,"stopId","stop"),"stop.stopId",l);safe_uint(req(s,"stateRevision","stop"),"stop.stateRevision");}
 void source_bundle(const Json& s,const ValidationLimits& l){exact_keys(s,{"id","documents"},"source");id(req(s,"id","source"),"source.id",l);array_limit(req(s,"documents","source"),"source.documents",l.maxDocuments);std::unordered_set<std::string> ids;std::size_t total=0;for(const auto&d:req(s,"documents","source")){document(d,l);if(!ids.insert(d["documentId"].get<std::string>()).second)invalid("source.documents","duplicate documentId");total+=d["text"].get_ref<const std::string&>().size();if(total>l.maxSourceBytes)limit("source.documents","source bundle exceeds byte budget");}}
 void config(const Json& c,const ValidationLimits& l){exact_keys(c,{"revisionId","compiler","flags","outputDirectory"},"configuration");id(req(c,"revisionId","configuration"),"configuration.revisionId",l);string_value(req(c,"compiler","configuration"),"configuration.compiler",l.maxStringBytes);array_limit(req(c,"flags","configuration"),"configuration.flags",l.maxArguments);for(const auto&x:req(c,"flags","configuration"))string_value(x,"configuration.flags",l.maxArgumentBytes,false);string_value(req(c,"outputDirectory","configuration"),"configuration.outputDirectory",l.maxStringBytes);}
-void submitted(const Json&s,const ValidationLimits&l){exact_keys(s,{"id","text","encoding","closeAfterWrite"},"input");id(req(s,"id","input"),"input.id",l);string_value(req(s,"text","input"),"input.text",l.maxInputBytes,false);enum_string(req(s,"encoding","input"),"input.encoding",{"utf-8"});if(!req(s,"closeAfterWrite","input").is_boolean()||!req(s,"closeAfterWrite","input").get<bool>())invalid("input.closeAfterWrite","v1 requires true");}
+void submitted(const Json&s,const ValidationLimits&l){exact_keys(s,{"id","text","encoding","closeAfterWrite"},"input");id(req(s,"id","input"),"input.id",l);string_value(req(s,"text","input"),"input.text",l.maxInputBytes,false);enum_string(req(s,"encoding","input"),"input.encoding",{"utf-8"});boolean(req(s,"closeAfterWrite","input"),"input.closeAfterWrite");}
 bool environment_name(std::string_view name) {
   if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_')) return false;
   return std::all_of(name.begin() + 1, name.end(), [](unsigned char c) {
@@ -237,7 +237,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState") { only({"kind"}); return; }
@@ -250,6 +250,8 @@ void validate_request(const Json& r, const ValidationLimits& l) {
     if(total>l.maxEnvironmentBytes) limit("command.environment","environment exceeds limit"); boolean(req(c,"stopAtEntry","command"),"command.stopAtEntry"); return;
   }
   if (kind == "step") { only({"kind","stepKind"}); enum_string(req(c,"stepKind","command"),"command.stepKind",{"over","into","out","instruction"}); return; }
+  if (kind == "appendInput") { only({"kind","id","text"}); id(req(c,"id","command"),"command.id",l); string_value(req(c,"text","command"),"command.text",l.maxInputBytes,false); return; }
+  if (kind == "closeInput") { only({"kind"}); return; }
   if (kind == "listHistory") { only({"kind","branchId","afterOrdinal","limit"}); id(req(c,"branchId","command"),"command.branchId",l); const auto& a=req(c,"afterOrdinal","command"); if(!a.is_null()) safe_uint(a,"command.afterOrdinal"); positive_uint(req(c,"limit","command"),"command.limit",l.maxPageSize); return; }
   if (kind == "readHistory") { only({"kind","point"}); const auto& p=req(c,"point","command"); exact_keys(p,{"branchId","eventOrdinal"},"command.point"); id(req(p,"branchId","command.point"),"command.point.branchId",l); safe_uint(req(p,"eventOrdinal","command.point"),"command.point.eventOrdinal"); return; }
   if (kind == "restoreExecution") { only({"kind","point","strategy"}); unsupported("command.strategy","verified replay is capability-gated"); }

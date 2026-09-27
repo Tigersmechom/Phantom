@@ -56,8 +56,8 @@ export interface SubmittedInputDTO {
   id: string;
   text: string;
   encoding: 'utf-8';
-  /** Protocol v1 has fixed stdin only; append/interactive input is not part of this contract. */
-  closeAfterWrite: true;
+  /** true closes stdin after these bytes; false keeps it open for appendInput/closeInput. */
+  closeAfterWrite: boolean;
 }
 export type UnavailableReasonDTO = 'not-declared' | 'uninitialized' | 'not-captured' | 'out-of-scope' | 'optimized-out' | 'read-error' | 'truncated' | 'unsupported';
 export type ScalarValueDTO =
@@ -70,6 +70,28 @@ export type ScalarValueDTO =
 export type RuntimeValueDTO =
   | { availability: 'available'; value: ScalarValueDTO }
   | { availability: 'unavailable'; reason: UnavailableReasonDTO; detail?: string };
+export type VariableStorageUnknownReasonDTO =
+  | 'location-unavailable'
+  | 'unsupported-name'
+  | 'no-own-storage'
+  | 'size-unavailable'
+  | 'too-large'
+  | 'read-error';
+/**
+ * Physical bytes for the variable's own storage slot. This is intentionally
+ * separate from RuntimeValueDTO: a readable stack slot does not prove that
+ * the C++ object's lifetime has begun or that its bytes form an initialized
+ * value. `addressHex` is the storage address, never a pointer's pointee.
+ */
+export interface VariableStorageDTO {
+  state: 'observed' | 'unknown';
+  lifetime: 'unknown';
+  addressHex: string | null;
+  byteLength: number | null;
+  /** Bounded raw bytes from the current stop; padding and stale bytes remain possible. */
+  rawBytesHex?: string;
+  reason?: VariableStorageUnknownReasonDTO;
+}
 export interface VariableDTO {
   id: string;
   name: string;
@@ -80,6 +102,9 @@ export interface VariableDTO {
   locator: string;
   value: RuntimeValueDTO;
   writable: boolean;
+  /** Current-frame storage address, if GDB supplied a safe location. */
+  addressHex?: string | null;
+  storage?: VariableStorageDTO;
   children?: VariableDTO[];
 }
 export interface StackFrameDTO {
@@ -143,10 +168,28 @@ export interface OutputSnapshotDTO {
   /** Optional bytes still held by a runtime buffer at this stop. */
   buffered?: {
     available: true;
+    /** This is the glibc C stdout stream; cout uses it only while synchronized. */
+    source: 'glibc-_IO_FILE';
+    stream: 'stdout';
+    association: 'cout-if-synchronized';
+    mode: 'full' | 'line' | 'unbuffered' | 'unknown';
+    flushPolicy: 'buffer-full-or-explicit' | 'newline-or-explicit' | 'every-write' | 'unknown';
+    pendingBytes: number;
+    /** Null when line buffering/ABI metadata cannot define a byte threshold. */
+    capacityBytes: number | null;
+    remainingCapacityBytes: number | null;
+    storageCapacityBytes: number | null;
+    metadataAvailable: boolean;
+    metadataReason?: string;
     text: string;
     totalBytes: number;
     retainedFromByte: number;
     truncated: boolean;
+    textStatus?: 'unavailable';
+    textReason?: string;
+  } | {
+    available: false;
+    reason: string;
   };
 }
 export interface StopObservationDTO {
@@ -200,6 +243,7 @@ export interface BackendCapabilitiesDTO {
   hitCountBreakpoints: boolean;
   variableWrite: boolean;
   inputTracking: InputStateDTO['tracking'];
+  interactiveInput: boolean;
   expressionGroups: boolean;
   history: boolean;
   restore: 'none' | 'verified-replay';
@@ -221,6 +265,8 @@ export type BackendCommandDTO =
   | { kind: 'capabilities' }
   | { kind: 'build'; source: SourceBundleDTO; configuration: BuildConfigurationDTO; architecture: ArchitectureDTO }
   | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean }
+  | { kind: 'appendInput'; id: string; text: string }
+  | { kind: 'closeInput' }
   | { kind: 'step'; stepKind: 'over' | 'into' | 'out' | 'instruction' }
   | { kind: 'continue' }
   | { kind: 'pause' }
@@ -248,6 +294,7 @@ export interface BackendRequestDTO {
 export type BackendResultDTO =
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }
   | { kind: 'accepted' }
+  | { kind: 'input'; input: InputStateDTO }
   /** Assigned before inferior events; buffer early events by causedByRequestId until this arrives. */
   | { kind: 'launchAccepted'; session: SessionRefDTO; throughSequence: 0 }
   | { kind: 'build'; artifact: BuildArtifactDTO | null; success: boolean; command: string[]; stdout: string; stderr: string; exitCode: number | null; truncated: boolean }

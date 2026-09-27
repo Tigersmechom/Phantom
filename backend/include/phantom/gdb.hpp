@@ -42,6 +42,7 @@ struct GdbOptions {
   std::size_t maxVariablesPerPage = 128;
   std::size_t maxMemoryReadBytes = 64u * 1024u;
   std::size_t maxInstructions = 512;
+  std::size_t maxInputBytes = 1024u * 1024u;
   std::chrono::milliseconds commandTimeout{30000};
   // Source-level stepping can legitimately have no different source line to
   // reach (for example `while (true) { continue; }`).  Bound that operation
@@ -56,6 +57,8 @@ struct GdbLaunchRequest {
   std::vector<std::string> argv;
   std::vector<std::pair<std::string, std::string>> environment;
   std::string input;
+  std::string inputId = "input-none";
+  bool closeInputAfterWrite = true;
   bool stopAtEntry = true;
   GdbSourceBundle sourceBundle;
 };
@@ -80,8 +83,10 @@ struct GdbStop {
   nlohmann::json input = nlohmann::json::object();
   nlohmann::json stdoutSnapshot = nlohmann::json::object();
   // Optional ABI-specific snapshot of bytes still held by the C stdout
-  // buffer at a real stop.  It is omitted when the runtime cannot prove the
-  // buffer layout (for example non-glibc or unsynchronised iostreams).
+  // buffer at a real stop. The snapshot identifies this as glibc stdout and
+  // only associates it with cout when sync_with_stdio is still enabled. It
+  // is omitted for a dead inferior; unsupported layouts carry an explicit
+  // unavailable status rather than guessing.
   nlohmann::json stdoutBufferedSnapshot = nlohmann::json::object();
   nlohmann::json stderrSnapshot = nlohmann::json::object();
   // The complete stop record is retained for the owning service to attach a
@@ -100,6 +105,12 @@ class GdbEngine {
               GdbError& error, std::stop_token cancellation = {});
   bool resume(std::string_view stepKind, GdbStop& result, GdbError& error);
   bool pause(GdbStop& result, GdbError& error);
+
+  // Thread-safe transport mutations. These only queue/write pipe bytes;
+  // they never issue MI commands or evaluate code in the inferior.
+  bool appendInput(std::string_view id, std::string_view text,
+                   nlohmann::json& result, GdbError& error);
+  bool closeInput(nlohmann::json& result, GdbError& error);
 
   // interrupt(1) asks the current command to stop at the next safe MI
   // boundary; interrupt(2) also terminates the inferior.  It is safe to call

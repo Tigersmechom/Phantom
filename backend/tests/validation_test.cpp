@@ -67,5 +67,15 @@ int main() {
   launch["command"]["argv"] = Json::array();
   launch["command"]["environment"] = {{"BAD-NAME", "x"}};
   assert(validation_fails(launch, "INVALID_REQUEST"));
+  launch["command"]["environment"] = Json::object();
+  launch["command"]["input"]["closeAfterWrite"] = false;
+  assert(!validation_fails(launch));
+  Json append = launch;
+  append["session"] = {{"id", "s"}, {"generation", 1}};
+  append["expectedStop"] = {{"stopId", "stop-1"}, {"stateRevision", 1}};
+  append["command"] = {{"kind", "appendInput"}, {"id", "chunk-1"}, {"text", "41"}};
+  assert(!validation_fails(append));
+  append["command"] = {{"kind", "closeInput"}};
+  assert(!validation_fails(append));
   std::cout << "validation tests passed\n";
 }

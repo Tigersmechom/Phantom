@@ -110,6 +110,22 @@ void enterLoop(GdbEngine& engine, const GdbLaunchRequest& request, GdbStop& stop
   require(stop.stopped && stop.stack.size() >= 2, "loop snapshot has no caller frame");
   require(stop.stdoutSnapshot.at("text") == "loop-out\n" &&
           stop.stderrSnapshot.at("text") == "loop-err\n", "loop output streams are incorrect");
+  const auto& loopVariables = stop.stack.front().at("variables");
+  const auto aggregate = std::find_if(loopVariables.begin(), loopVariables.end(),
+      [](const Json& variable) { return variable.value("name", "") == "aggregate"; });
+  require(aggregate != loopVariables.end(), "aggregate variable missing from loop frame");
+  require(aggregate->value("addressHex", "").rfind("0x", 0) == 0,
+          "aggregate storage address is not exposed");
+  require(aggregate->contains("storage") && aggregate->at("storage").at("state") == "observed" &&
+          aggregate->at("storage").at("lifetime") == "unknown" &&
+          aggregate->at("storage").at("byteLength") == sizeof(int) * 2 &&
+          aggregate->at("storage").at("rawBytesHex").get<std::string>().size() == sizeof(int) * 2 * 2,
+          "aggregate raw storage metadata is incomplete: " + aggregate->dump());
+  const auto markerVariable = std::find_if(loopVariables.begin(), loopVariables.end(),
+      [](const Json& variable) { return variable.value("name", "") == "marker"; });
+  require(markerVariable != loopVariables.end() && markerVariable->value("addressHex", "").rfind("0x", 0) == 0 &&
+          markerVariable->at("storage").at("state") == "observed",
+          "scalar storage address metadata is incomplete");
   Json variables;
   require(engine.readVariables("frame:1", 0, 32, variables, error),
           "cannot select caller frame: " + error.message);
@@ -119,8 +135,14 @@ void enterLoop(GdbEngine& engine, const GdbLaunchRequest& request, GdbStop& stop
                                 breakpoints, error), "cannot clear loop breakpoint");
 }
 
-void testBufferedStdout(const GdbOptions& options, GdbLaunchRequest request) {
-  request.argv = {"cout-pending"};
+void testBufferedMode(const GdbOptions& options, GdbLaunchRequest request,
+                      const std::string& mode,
+                      const std::string& expectedCaptured,
+                      const std::string& expectedBuffered,
+                      const std::string& expectedMode,
+                      std::optional<std::uint64_t> expectedCapacity,
+                      std::optional<std::uint64_t> expectedRemaining) {
+  request.argv = {mode};
   GdbEngine engine(options);
   GdbStop stop;
   launch(engine, request, stop);
@@ -136,13 +158,43 @@ void testBufferedStdout(const GdbOptions& options, GdbLaunchRequest request) {
                 {"end", {{"line", line}, {"column", 1}}}}}}
   })}}, breakpoints, error), "cannot set pending-output breakpoint: " + error.message);
   require(engine.resume("continue", stop, error), "cannot reach pending-output breakpoint: " + error.message);
-  require(stop.stdoutSnapshot.at("text") == "", "unflushed cout leaked into captured stdout");
-  require(stop.stdoutSnapshot.contains("buffered") &&
-          stop.stdoutSnapshot.at("buffered").at("available") == true &&
-          stop.stdoutSnapshot.at("buffered").at("text") == "pending\n" &&
-          stop.stdoutSnapshot.at("buffered").at("totalBytes") == 8,
-          "runtime did not expose the confirmed pending cout buffer: " + stop.stdoutSnapshot.dump());
+  require(stop.stdoutSnapshot.at("text") == expectedCaptured,
+          "captured stdout is incorrect for " + mode + ": got " +
+              std::to_string(stop.stdoutSnapshot.at("text").get<std::string>().size()) +
+              " expected " + std::to_string(expectedCaptured.size()));
+  if (mode == "cout-empty") {
+    require(!stop.stdoutSnapshot.contains("buffered"),
+            "uninitialized stdout buffer should remain an absent optional field");
+    (void)engine.stopAndSnapshot();
+    return;
+  }
+  require(stop.stdoutSnapshot.contains("buffered"),
+          "runtime omitted the buffered stdout status for " + mode);
+  const auto& buffered = stop.stdoutSnapshot.at("buffered");
+  require(buffered.at("available") == true && buffered.at("source") == "glibc-_IO_FILE" &&
+          buffered.at("stream") == "stdout" && buffered.at("association") == "cout-if-synchronized" &&
+          buffered.at("mode") == expectedMode && buffered.at("text") == expectedBuffered &&
+          buffered.at("pendingBytes") == expectedBuffered.size() &&
+          buffered.at("totalBytes") == expectedBuffered.size(),
+          "runtime did not expose the confirmed pending cout buffer for " + mode + ": " + stop.stdoutSnapshot.dump());
+  if (expectedCapacity) require(buffered.at("capacityBytes") == *expectedCapacity,
+                                "wrong buffered capacity for " + mode + ": " + buffered.dump());
+  else require(buffered.at("capacityBytes").is_null(), "line mode reported a byte capacity: " + buffered.dump());
+  if (expectedRemaining) require(buffered.at("remainingCapacityBytes") == *expectedRemaining,
+                                 "wrong remaining buffered capacity for " + mode + ": " + buffered.dump());
+  else require(buffered.at("remainingCapacityBytes").is_null(), "line mode reported remaining capacity: " + buffered.dump());
   (void)engine.stopAndSnapshot();
+}
+
+void testBufferedStdout(const GdbOptions& options, GdbLaunchRequest request) {
+  testBufferedMode(options, request, "cout-pending", "", "pending\n", "full", 4096, 4088);
+  testBufferedMode(options, request, "cout-empty", "", "", "full", std::nullopt, std::nullopt);
+  testBufferedMode(options, request, "cout-line", "", "line", "line", std::nullopt, std::nullopt);
+  testBufferedMode(options, request, "cout-unbuffered", "direct", "", "unbuffered", 0, 0);
+  // The fixture writes fixed chunks so this regression does not inherit the
+  // implementation's BUFSIZ macro (which differs from glibc's FIFO window).
+  testBufferedMode(options, request, "cout-boundary", "", std::string(4095, 'x'), "full", 4096, 1);
+  testBufferedMode(options, request, "cout-full", std::string(4096, 'x'), "x", "full", 4096, 4095);
 }
 
 void testTimeoutAndReuse(const GdbOptions& options, const GdbLaunchRequest& request) {
@@ -311,7 +363,7 @@ void testUnterminatedMi(GdbOptions options, const GdbLaunchRequest& request) {
   TemporaryDirectory temporary;
   const auto script = temporary.path / "fake-gdb";
   writeExecutable(script, "#!/bin/sh\n"
-                  "dd if=/dev/zero bs=1048577 count=1 2>/dev/null | tr '\\000' x\n"
+                  "python3 -c 'import sys;sys.stdout.write(\"x\"*1048577)'\n"
                   "exec sleep 30\n");
   options.gdbPath = script;
   options.commandTimeout = 5s;

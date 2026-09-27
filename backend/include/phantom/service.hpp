@@ -40,6 +40,10 @@ class BackendService final {
   // The transport may submit a validated control request while the worker is
   // executing. Context and target matching happen before any signal is sent.
   bool control(const Json& request, bool waitForActive = true);
+  // Input can unblock an executing inferior, so its response cannot wait
+  // behind that execution request. nullopt asks the normal worker to handle
+  // a stopped-session command (or canonical validation/context error).
+  std::optional<Json> inputControl(const Json& request, bool waitForActive = true);
   // May be called by the transport reader while the serialized worker is in
   // a long-running GDB command. It never waits for the service mutex; when a
   // control frame races dequeue of its target, it waits briefly on the
@@ -64,6 +68,7 @@ class BackendService final {
   Json handleBuild(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
+  Json handleInput(const Json& request);
   Json handleHistory(const Json& request);
   std::filesystem::path safePath(const std::string& supplied, bool allowMissing) const;
   void appendHistory(const Json& observation, const Json& state);

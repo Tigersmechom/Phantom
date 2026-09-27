@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <poll.h>
 #include <regex>
@@ -230,8 +231,12 @@ struct GdbEngine::Impl {
   std::string stderrOutput;
   std::size_t stdoutTotalBytes = 0;
   std::size_t stderrTotalBytes = 0;
+  mutable std::mutex inputMutex;
   std::size_t deliveredInputBytes = 0;
   std::string pendingInput;
+  std::string inputId;
+  std::map<std::string, std::string> inputChunks;
+  bool closeInputAfterWrite = true;
   bool wrapperReady = false;
   GdbSourceBundle sourceBundle;
   std::string inferiorPid;
@@ -321,10 +326,15 @@ struct GdbEngine::Impl {
     }
     stdoutOutput.clear(); stderrOutput.clear();
     stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
-    pendingInput = request.input; wrapperReady = false;
+    pendingInput = request.input; inputId = request.inputId;
+    inputChunks.clear();
+    inputChunks.emplace(inputId, request.input);
+    closeInputAfterWrite = request.closeInputAfterWrite;
+    wrapperReady = false;
     return true;
   }
   void cleanupTemp() noexcept {
+    std::lock_guard inputLock(inputMutex);
     if (stdinKeepFd >= 0) { (void)::close(stdinKeepFd); stdinKeepFd = -1; }
     if (stdinFd >= 0) { (void)::close(stdinFd); stdinFd = -1; }
     if (readyFd >= 0) { (void)::close(readyFd); readyFd = -1; }
@@ -337,7 +347,8 @@ struct GdbEngine::Impl {
     ptyPath.clear(); stdinFifo.clear(); stdoutFifo.clear(); stderrFifo.clear(); readyFifo.clear();
     stdoutOutput.clear(); stderrOutput.clear();
     stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
-    pendingInput.clear(); wrapperReady = false;
+    pendingInput.clear(); inputId.clear(); inputChunks.clear();
+    closeInputAfterWrite = true; wrapperReady = false;
     if (!tempDir.empty()) { std::error_code ec; std::filesystem::remove_all(tempDir, ec); }
     tempDir.clear();
   }
@@ -361,7 +372,7 @@ struct GdbEngine::Impl {
     }
   }
 
-  void feedInput() {
+  void feedInputLocked() {
     if (!wrapperReady && readyFd >= 0) {
       char marker = 0;
       if (::read(readyFd, &marker, 1) == 1 && marker == 1) {
@@ -373,6 +384,15 @@ struct GdbEngine::Impl {
       }
     }
     if (!wrapperReady || stdinFd < 0) return;
+    // Once the wrapper's bootstrap reader is gone, HUP/ERR means the
+    // inferior closed fd 0. Mark the transport closed even when there are no
+    // pending bytes to write; otherwise an interactive Continue could wait
+    // forever for an EOF that the target can no longer observe.
+    pollfd stdinStatus{stdinFd, POLLOUT | POLLERR | POLLHUP, 0};
+    if (::poll(&stdinStatus, 1, 0) > 0 && (stdinStatus.revents & (POLLERR | POLLHUP))) {
+      (void)::close(stdinFd); stdinFd = -1;
+      return;
+    }
     if (deliveredInputBytes < pendingInput.size()) {
       sigset_t blocked{}, previous{}, pending{};
       ::sigemptyset(&blocked); ::sigaddset(&blocked, SIGPIPE);
@@ -392,9 +412,26 @@ struct GdbEngine::Impl {
         if (writeError != EPIPE) throw std::runtime_error("cannot write inferior stdin");
       }
     }
-    if (stdinFd >= 0 && deliveredInputBytes == pendingInput.size()) {
+    if (stdinFd >= 0 && closeInputAfterWrite && deliveredInputBytes == pendingInput.size()) {
       (void)::close(stdinFd); stdinFd = -1;
     }
+  }
+
+  void feedInput() {
+    std::lock_guard inputLock(inputMutex);
+    feedInputLocked();
+  }
+
+  nlohmann::json inputSnapshotLocked() const {
+    return {{"submitted", {{"id", inputId}, {"text", pendingInput}, {"encoding", "utf-8"},
+                            {"closeAfterWrite", closeInputAfterWrite}}},
+            {"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes},
+            {"trace", nullptr}, {"stream", nullptr}};
+  }
+
+  bool inputRemainsOpen() const {
+    std::lock_guard inputLock(inputMutex);
+    return stdinFd >= 0 && !closeInputAfterWrite;
   }
 
   void drainIo() {
@@ -408,11 +445,13 @@ struct GdbEngine::Impl {
     feedInput();
   }
 
-  // glibc keeps bytes written through a synchronised std::cout in stdout's
-  // _IO_FILE write window until a flush.  GDB can inspect that window while
-  // the inferior is stopped. This is deliberately an optional probe: the
-  // layout is not a C++ or POSIX contract, so unsupported runtimes simply do
-  // not expose a buffered snapshot instead of guessing.
+  // glibc keeps bytes written through the C stdout stream (and through a
+  // synchronised std::cout) in stdout's _IO_FILE write window until a flush.
+  // GDB can inspect that window while the inferior is stopped. This is
+  // deliberately an optional probe: the layout is not a C++ or POSIX
+  // contract, and sync_with_stdio(false) means that std::cout may no longer
+  // use this C stream. Therefore the public snapshot identifies itself as
+  // glibc stdout and never claims that the bytes definitely came from cout.
   nlohmann::json captureBufferedStdout() {
     const auto unavailable = [](std::string reason) {
       return nlohmann::json{{"available", false}, {"reason", std::move(reason)}};
@@ -427,29 +466,102 @@ struct GdbEngine::Impl {
       value = result->text;
       return true;
     };
-    std::string baseText, pointerText;
-    if (!evaluate("(unsigned long)((struct _IO_FILE*)stdout)->_IO_write_base", baseText) ||
-        !evaluate("(unsigned long)((struct _IO_FILE*)stdout)->_IO_write_ptr", pointerText))
-      return unavailable("stdout-buffer-layout-unavailable");
-    const auto base = parseUnsigned(baseText);
-    const auto pointer = parseUnsigned(pointerText);
-    if (!base || !pointer || *pointer < *base) return unavailable("stdout-buffer-range-unavailable");
+    std::string identity;
+    if (!evaluate("(int)((unsigned long)::stdout == (unsigned long)&'_IO_2_1_stdout_')", identity) || identity != "1")
+      return unavailable("stdout-runtime-unavailable");
+    // Name the known libc object directly: a user local named stdout must
+    // not redirect this probe into arbitrary user storage. GDB casts and
+    // memory reads never call functions in the stopped inferior.
+    const auto member = [&](std::string_view name) -> std::optional<std::uint64_t> {
+      std::string text;
+      if (!evaluate("(unsigned long)((struct _IO_FILE*)&'_IO_2_1_stdout_')->" + std::string(name), text))
+        return std::nullopt;
+      return parseUnsigned(text);
+    };
+    const auto flags = member("_flags");
+    const auto descriptor = member("_fileno");
+    std::string narrow;
+    if (!flags || ((*flags & 0xffff0000u) != 0xfbad0000u) || !descriptor || *descriptor != STDOUT_FILENO ||
+        !evaluate("(int)(((struct _IO_FILE*)&'_IO_2_1_stdout_')->_mode <= 0)", narrow) || narrow != "1")
+      return unavailable("stdout-layout-unsupported");
+    const auto base = member("_IO_write_base");
+    const auto pointer = member("_IO_write_ptr");
+    const auto bufferBase = member("_IO_buf_base");
+    const auto bufferEnd = member("_IO_buf_end");
+    if (!base || !pointer || !bufferBase || !bufferEnd || *pointer < *base || *bufferEnd < *bufferBase ||
+        (*bufferBase == 0 && (*base != 0 || *pointer != 0 || *bufferEnd != 0)) ||
+        (*bufferBase != 0 && (*base < *bufferBase || *base > *bufferEnd || *pointer > *bufferEnd)))
+      return unavailable("stdout-buffer-range-unavailable");
     const auto count = *pointer - *base;
-    if (count == 0) return nlohmann::json{{"available", true}, {"text", ""}, {"totalBytes", 0},
-                                           {"retainedFromByte", 0}, {"truncated", false}};
+    // _IO_UNBUFFERED and _IO_LINE_BUF are private glibc constants. Keep the
+    // values local to this ABI-specific probe instead of exporting them as a
+    // general C++ stream contract.
+    const bool unbuffered = (*flags & 0x0002u) != 0;
+    const bool lineBuffered = (*flags & 0x0200u) != 0;
+    const std::string mode = unbuffered ? "unbuffered" :
+        lineBuffered ? "line" : "full";
+    std::optional<std::uint64_t> capacity;
+    std::optional<std::uint64_t> remaining;
+    if (!unbuffered && !lineBuffered && *bufferBase != 0) {
+      capacity = *bufferEnd - *base;
+      remaining = *bufferEnd - *pointer;
+    } else if (unbuffered) {
+      capacity = 0;
+      remaining = 0;
+    }
+    const auto flushPolicy = unbuffered ? "every-write" :
+        lineBuffered ? "newline-or-explicit" : "buffer-full-or-explicit";
+    const auto storageCapacity = *bufferBase != 0
+        ? std::optional<std::uint64_t>(*bufferEnd - *bufferBase) : std::nullopt;
+    const bool metadataAvailable = storageCapacity.has_value() || unbuffered;
+    // Counters cross into JavaScript as numbers; reject corrupt spans which
+    // could no longer be represented exactly, before doing any memory read.
+    constexpr std::uint64_t maxSafeInteger = 9007199254740991ULL;
+    if (count > maxSafeInteger || (storageCapacity && *storageCapacity > maxSafeInteger))
+      return unavailable("stdout-buffer-range-unavailable");
+    nlohmann::json result = {
+        {"available", true},
+        {"source", "glibc-_IO_FILE"},
+        {"stream", "stdout"},
+        {"association", "cout-if-synchronized"},
+        {"mode", mode},
+        {"flushPolicy", flushPolicy},
+        {"pendingBytes", count},
+        {"capacityBytes", capacity ? nlohmann::json(*capacity) : nlohmann::json(nullptr)},
+        {"remainingCapacityBytes", remaining ? nlohmann::json(*remaining) : nlohmann::json(nullptr)},
+        {"storageCapacityBytes", storageCapacity ? nlohmann::json(*storageCapacity) : nlohmann::json(nullptr)},
+        {"metadataAvailable", metadataAvailable},
+        {"text", ""},
+        {"totalBytes", count},
+        {"retainedFromByte", 0},
+        {"truncated", false}};
+    if (!metadataAvailable) result["metadataReason"] = "stdout-buffer-not-initialized";
+    // No pending bytes is useful information too: direct write(2), flushed
+    // cout, and unbuffered/line-buffered streams should not make the field
+    // disappear.  Keep the runtime status in the snapshot even in this case.
+    if (count == 0) return result;
     // GDB/MI returns the memory contents in one result record. Keep the
     // optional probe well below the 1 MiB MI record limit even when the
     // retained stdout budget is larger; a huge buffered write is reported as
     // unavailable rather than risking a fatal parser overflow.
     const auto maxProbeBytes = std::min<std::size_t>(options.maxOutputBytes, 64u * 1024u);
-    if (count > maxProbeBytes || *base > std::numeric_limits<std::uint64_t>::max() - count)
-      return unavailable("stdout-buffer-too-large");
+    if (count > maxProbeBytes || *base > std::numeric_limits<std::uint64_t>::max() - count) {
+      result["retainedFromByte"] = count;
+      result["truncated"] = true;
+      result["textStatus"] = "unavailable";
+      result["textReason"] = "stdout-buffer-too-large";
+      result["available"] = true;
+      return result;
+    }
     std::ostringstream address;
     address << "0x" << std::hex << *base;
     MiRecord record;
     GdbError error;
-    if (!command("-data-read-memory-bytes " + address.str() + " " + std::to_string(count), false, record, error))
-      return unavailable("stdout-buffer-read-failed");
+    if (!command("-data-read-memory-bytes " + address.str() + " " + std::to_string(count), false, record, error)) {
+      result["textStatus"] = "unavailable";
+      result["textReason"] = "stdout-buffer-read-failed";
+      return result;
+    }
     std::string bytes;
     if (const auto* memory = field(record.fields, "memory")) {
       auto appendCell = [&](const MiValue* cell) {
@@ -457,14 +569,26 @@ struct GdbEngine::Impl {
         return appendHexBytes(valText(field(*cell, "contents")), bytes);
       };
       if (!memory->values.empty()) {
-        for (const auto& cell : memory->values) if (!appendCell(cell.get())) return unavailable("stdout-buffer-malformed");
+        for (const auto& cell : memory->values) if (!appendCell(cell.get())) {
+          result["textStatus"] = "unavailable";
+          result["textReason"] = "stdout-buffer-malformed";
+          return result;
+        }
       } else {
-        for (const auto& [key, cell] : memory->fields) if (!appendCell(cell.get())) return unavailable("stdout-buffer-malformed");
+        for (const auto& [key, cell] : memory->fields) if (!appendCell(cell.get())) {
+          result["textStatus"] = "unavailable";
+          result["textReason"] = "stdout-buffer-malformed";
+          return result;
+        }
       }
     }
-    if (bytes.size() != count) return unavailable("stdout-buffer-read-incomplete");
-    return nlohmann::json{{"available", true}, {"text", displayUtf8(bytes)}, {"totalBytes", count},
-                          {"retainedFromByte", 0}, {"truncated", false}};
+    if (bytes.size() != count) {
+      result["textStatus"] = "unavailable";
+      result["textReason"] = "stdout-buffer-read-incomplete";
+      return result;
+    }
+    result["text"] = displayUtf8(bytes);
+    return result;
   }
 
   void captureIo(GdbStop& result) {
@@ -493,12 +617,20 @@ struct GdbEngine::Impl {
     result.stderrSnapshot = snapshot(stderrOutput, stderrTotalBytes);
     if (!result.exited) {
       const auto buffered = captureBufferedStdout();
-      if (buffered.value("available", false) && buffered.value("totalBytes", 0ULL) != 0) {
+      // Keep the optional extension absent for a stop where stdout's runtime
+      // buffer has not even been initialized. This preserves the v1 output
+      // shape for ordinary programs while still reporting a confirmed empty
+      // buffer after a real cout interaction (metadataAvailable=true).
+      if (buffered.is_object() && buffered.contains("available") &&
+          (buffered.value("pendingBytes", 0ULL) != 0 || buffered.value("metadataAvailable", false))) {
         result.stdoutBufferedSnapshot = buffered;
         result.stdoutSnapshot["buffered"] = buffered;
       }
     }
-    result.input = {{"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes}};
+    {
+      std::lock_guard inputLock(inputMutex);
+      result.input = inputSnapshotLocked();
+    }
   }
 
   nlohmann::json sourceLocation(std::string_view fullName, int line) const {
@@ -614,9 +746,14 @@ struct GdbEngine::Impl {
     bool pendingInterrupt = preempt == 1;
     bool interruptSent = false;
     bool done = false, running = false;
-    auto deadline = std::chrono::steady_clock::now() +
-        (recoverableStep ? options.stepTimeout : options.commandTimeout);
+    bool interactiveContinue = commandText == "-exec-continue" && inputRemainsOpen();
+    auto deadline = interactiveContinue ? std::chrono::steady_clock::time_point::max() :
+        std::chrono::steady_clock::now() + (recoverableStep ? options.stepTimeout : options.commandTimeout);
     while (std::chrono::steady_clock::now() < deadline) {
+      if (interactiveContinue && !inputRemainsOpen()) {
+        interactiveContinue = false;
+        deadline = std::chrono::steady_clock::now() + options.commandTimeout;
+      }
       const int mode = control.exchange(0);
       if (preempt >= 2 || mode >= 2 || launchCancellation.stop_requested()) {
         process->terminate(); live = false;
@@ -802,6 +939,13 @@ struct GdbEngine::Impl {
       vars.push_back({{"id", activation + ":" + name}, {"name", name}, {"type", type},
                       {"scopeId", activation}, {"activationId", activation},
                       {"locator", activation + ":" + name}, {"value", runtimeValue(type, text)},
+                      // The address is filled by enrichVariableTypes.  Keep
+                      // an explicit null for names for which GDB cannot
+                      // prove a current storage location.
+                      {"addressHex", nullptr},
+                      {"storage", {{"state", "unknown"}, {"lifetime", "unknown"},
+                                    {"addressHex", nullptr},
+                                    {"byteLength", nullptr}, {"reason", "location-unavailable"}}},
                       {"writable", false}});
     }
     // A few GDB versions omit the tuple braces and emit a result-list such as
@@ -818,6 +962,10 @@ struct GdbEngine::Impl {
         vars.push_back({{"id", activation + ":" + name}, {"name", name}, {"type", type},
                         {"scopeId", activation}, {"activationId", activation},
                         {"locator", activation + ":" + name}, {"value", runtimeValue(type, text)},
+                        {"addressHex", nullptr},
+                        {"storage", {{"state", "unknown"}, {"lifetime", "unknown"},
+                                      {"addressHex", nullptr},
+                                      {"byteLength", nullptr}, {"reason", "location-unavailable"}}},
                         {"writable", false}});
       };
       for (const auto& [key, value] : list->fields) {
@@ -834,10 +982,101 @@ struct GdbEngine::Impl {
     // GDB's typed variable-object API for each plain identifier.  We never
     // pass an arbitrary expression from the client: names originate from the
     // debugger's local-variable list, and failures remain unavailable.
+    // Resolve the address and a bounded raw byte slice separately from the
+    // semantic value.  A fixed stack slot can be physically readable before
+    // a C++ object's lifetime begins; therefore `lifetime` deliberately stays
+    // `unknown` and raw bytes must never be presented as an initialized value.
+    const auto unknownStorage = [](std::string reason) {
+      return nlohmann::json{{"state", "unknown"}, {"lifetime", "unknown"},
+                            {"addressHex", nullptr},
+                            {"byteLength", nullptr}, {"reason", std::move(reason)}};
+    };
+    const auto canonicalAddress = [](std::uint64_t address) {
+      std::ostringstream out; out << "0x" << std::hex << address; return out.str();
+    };
+    const auto hexBytes = [](std::string_view bytes) {
+      static constexpr char digits[] = "0123456789abcdef";
+      std::string out; out.reserve(bytes.size() * 2);
+      for (const unsigned char byte : bytes) {
+        out.push_back(digits[byte >> 4]); out.push_back(digits[byte & 0x0f]);
+      }
+      return out;
+    };
+    const auto readMemoryHex = [&](std::string_view address, std::size_t count,
+                                   std::string& bytes) {
+      MiRecord record;
+      GdbError local;
+      if (!command("-data-read-memory-bytes " + std::string(address) + " " +
+                    std::to_string(count), false, record, local)) return false;
+      const auto* memory = field(record.fields, "memory");
+      if (!memory) return false;
+      auto appendCell = [&](const MiValue* cell) {
+        return cell && appendHexBytes(valText(field(*cell, "contents")), bytes);
+      };
+      if (!memory->values.empty()) {
+        for (const auto& cell : memory->values) if (!appendCell(cell.get())) return false;
+      } else {
+        for (const auto& [key, cell] : memory->fields)
+          if (!appendCell(cell.get())) return false;
+      }
+      return bytes.size() == count;
+    };
+    const auto evaluate = [&](std::string_view expression, std::string& value) {
+      MiRecord record;
+      GdbError local;
+      if (!command("-data-evaluate-expression " + std::string(expression), false, record, local)) return false;
+      const auto* result = field(record.fields, "value");
+      if (!result || result->text.empty()) return false;
+      value = result->text;
+      return true;
+    };
     for (auto& variable : variables) {
       const auto name = variable.value("name", "");
-      if (name.empty() || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+      if (name.empty() || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos) {
+        variable["addressHex"] = nullptr;
+        variable["storage"] = unknownStorage("unsupported-name");
         continue;
+      }
+      variable["addressHex"] = nullptr;
+      variable["storage"] = unknownStorage("location-unavailable");
+      // The name was supplied by GDB's local-variable list and is restricted
+      // to an identifier. `&name` and `sizeof(name)` do not execute an
+      // inferior function; startup also disables GDB's function calls below.
+      std::string addressText;
+      if (evaluate("&" + name, addressText)) {
+        const auto address = parseAddress(addressText);
+        if (address) {
+          const auto addressHex = canonicalAddress(*address);
+          variable["addressHex"] = addressHex;
+          std::string sizeText;
+          const auto unknownSize = [&] (std::string reason) {
+            variable["storage"] = {{"state", "unknown"}, {"lifetime", "unknown"},
+                                    {"addressHex", addressHex}, {"byteLength", nullptr},
+                                    {"reason", std::move(reason)}};
+          };
+          // A stop can contain many locals; cap each raw slice below the
+          // protocol's general memory-read limit so 128 variables cannot
+          // inflate one observation into megabytes of hex text.
+          constexpr std::size_t maxStorageSliceBytes = 4096;
+          const auto storageLimit = std::min(options.maxMemoryReadBytes, maxStorageSliceBytes);
+          if (!evaluate("sizeof(" + name + ")", sizeText)) { unknownSize("size-unavailable"); }
+          else if (const auto size = parseUnsigned(sizeText); !size || *size > storageLimit) {
+            unknownSize(size ? "too-large" : "size-unavailable");
+            if (size) variable["storage"]["byteLength"] = *size;
+          } else {
+            std::string bytes;
+            if (readMemoryHex(addressHex, static_cast<std::size_t>(*size), bytes)) {
+              variable["storage"] = {{"state", "observed"}, {"lifetime", "unknown"},
+                                      {"addressHex", addressHex}, {"byteLength", *size},
+                                      {"rawBytesHex", hexBytes(bytes)}};
+            } else {
+              variable["storage"] = {{"state", "unknown"}, {"lifetime", "unknown"},
+                                      {"addressHex", addressHex}, {"byteLength", *size},
+                                      {"reason", "read-error"}};
+            }
+          }
+        }
+      }
       MiRecord created;
       GdbError local;
       if (!command("-var-create - * " + name, false, created, local)) {
@@ -849,6 +1088,13 @@ struct GdbEngine::Impl {
       if (type && !type->text.empty()) {
         variable["type"] = type->text;
         variable["value"] = runtimeValue(type->text, value ? value->text : std::string{});
+        // A C++ reference aliases another object; `&reference` names that
+        // pointee and is not the reference's own storage. Do not publish it
+        // as this variable's address/raw bytes.
+        if (type->text.find('&') != std::string::npos) {
+          variable["addressHex"] = nullptr;
+          variable["storage"] = unknownStorage("no-own-storage");
+        }
       }
       const auto* objectName = field(created.fields, "name");
       if (objectName && !objectName->text.empty()) {
@@ -986,6 +1232,9 @@ struct GdbEngine::Impl {
     live = true;
     auto setup = [&](std::string_view c) { MiRecord ignored; return command(c, false, ignored, e); };
     if (!setup("-gdb-set pagination off") || !setup("-gdb-set confirm off") ||
+        // Address/sizeof probes are intentionally non-evaluating.  Refuse
+        // any fallback that would invoke a user function or overloaded call.
+        !setup("-gdb-set may-call-functions off") || !setup("-gdb-set overload-resolution off") ||
         !setup("-gdb-set startup-with-shell on") || !setup("-gdb-set print pretty off") ||
         !setup("-gdb-set print elements 128") ||
         !setup("-interpreter-exec console " + miQuote("set inferior-tty " + ptyPath.string()))) return false;
@@ -1041,6 +1290,49 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   if (!impl_->command("-exec-run", true, stopped, error)) { stop(); return false; }
   if (!impl_->makeStop(stopped, result, error)) { stop(); return false; }
   result.processInstanceId = impl_->inferiorPid.empty() ? std::to_string(impl_->process->pid()) : impl_->inferiorPid;
+  return true;
+}
+
+bool GdbEngine::appendInput(std::string_view id, std::string_view text,
+                            nlohmann::json& result, GdbError& error) {
+  if (!live()) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  if (id.empty()) { error = {"INVALID_REQUEST", "input id must not be empty", false}; return false; }
+  std::lock_guard inputLock(impl_->inputMutex);
+  if (!impl_->live.load() || impl_->control.load() >= 2) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  const auto existing = impl_->inputChunks.find(std::string(id));
+  if (existing != impl_->inputChunks.end()) {
+    if (existing->second != text) {
+      error = {"STALE_CONTEXT", "input id was already used with different text", false}; return false;
+    }
+    result = impl_->inputSnapshotLocked();
+    return true;
+  }
+  if (impl_->stdinFd < 0 && impl_->wrapperReady) {
+    error = {"STALE_CONTEXT", "inferior stdin is already closed", false}; return false;
+  }
+  // Empty chunks still consume bookkeeping and must not provide an unbounded
+  // way to grow a session while keeping the byte budget at zero.
+  if (impl_->inputChunks.size() >= 4096) {
+    error = {"LIMIT_EXCEEDED", "too many interactive input chunks", false}; return false;
+  }
+  if (impl_->pendingInput.size() > impl_->options.maxInputBytes ||
+      text.size() > impl_->options.maxInputBytes - impl_->pendingInput.size()) {
+    error = {"LIMIT_EXCEEDED", "interactive input exceeds configured limit", false}; return false;
+  }
+  impl_->inputChunks.emplace(std::string(id), std::string(text));
+  impl_->pendingInput.append(text);
+  impl_->feedInputLocked();
+  result = impl_->inputSnapshotLocked();
+  return true;
+}
+
+bool GdbEngine::closeInput(nlohmann::json& result, GdbError& error) {
+  if (!live()) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  std::lock_guard inputLock(impl_->inputMutex);
+  if (!impl_->live.load() || impl_->control.load() >= 2) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  impl_->closeInputAfterWrite = true;
+  impl_->feedInputLocked();
+  result = impl_->inputSnapshotLocked();
   return true;
 }
 

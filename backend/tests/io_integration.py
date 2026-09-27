@@ -158,6 +158,68 @@ def main() -> int:
                 fail("IO fixture build failed", build)
             build_id = build["result"]["artifact"]["id"]
 
+            # An open stdin must keep Continue alive until the transport sends
+            # data and then explicit EOF. These two control requests are sent
+            # while the serialized GDB continue is still running; the backend
+            # answers them on the reader path so they cannot queue behind it.
+            interactive_launch = client.send({
+                **common, "requestId": "launch-interactive",
+                "command": {
+                    "kind": "launch", "buildId": build_id,
+                    "input": {"id": "input-interactive", "text": "",
+                              "encoding": "utf-8", "closeAfterWrite": False},
+                    "argv": ["echo"], "environment": {}, "stopAtEntry": True,
+                },
+            })
+            if not interactive_launch.get("ok"):
+                fail("interactive launch was not accepted", interactive_launch)
+            interactive_entry, _ = execution_events(client, "launch-interactive")
+            interactive_session = interactive_launch["session"]
+            interactive_stop = interactive_entry["stop"]
+            continue_response = client.send({
+                **common, "requestId": "continue-interactive",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "continue"},
+            })
+            if not continue_response.get("ok"):
+                fail("interactive continue was not accepted", continue_response)
+            append_response = client.send({
+                **common, "requestId": "append-interactive",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "abc"},
+            })
+            if not append_response.get("ok") or append_response.get("result", {}).get("kind") != "input":
+                fail("interactive append was not acknowledged immediately", append_response)
+            retry_response = client.send({
+                **common, "requestId": "append-interactive-retry",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "abc"},
+            })
+            if (not retry_response.get("ok") or
+                    retry_response.get("result", {}).get("input", {}).get("deliveredBytes") != 3):
+                fail("retrying an input chunk duplicated or lost bytes", retry_response)
+            conflict_response = client.send({
+                **common, "requestId": "append-interactive-conflict",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "different"},
+            })
+            if conflict_response.get("ok") or conflict_response.get("error", {}).get("code") != "STALE_CONTEXT":
+                fail("conflicting input chunk reuse was accepted", conflict_response)
+            close_response = client.send({
+                **common, "requestId": "close-interactive",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "closeInput"},
+            })
+            if not close_response.get("ok") or close_response.get("result", {}).get("kind") != "input":
+                fail("interactive EOF was not acknowledged immediately", close_response)
+            interactive_observation, interactive_state = execution_events(client, "continue-interactive")
+            if interactive_observation.get("stdout", {}).get("text") != "abc":
+                fail("interactive input was not delivered to the inferior", interactive_observation)
+            if interactive_observation.get("input", {}).get("deliveredBytes") != 3 or interactive_state.get("phase") != "terminated":
+                fail("interactive input accounting or termination is incorrect", {
+                    "input": interactive_observation.get("input"), "state": interactive_state,
+                })
+
             def run(name: str, text: str, mode: str = "echo",
                     arguments: list[str] | None = None,
                     environment: dict[str, str] | None = None) -> tuple[dict, dict]:

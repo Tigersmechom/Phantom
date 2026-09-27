@@ -3,11 +3,16 @@ import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
-const ids = ['source', 'argv', 'input', 'environment', 'theoretical-cout', 'buffered-cout', 'state', 'observation', 'stdout', 'stdout-check', 'stderr', 'history', 'log', 'status', 'connection', 'reset'];
+const ids = ['source', 'argv', 'input', 'environment', 'input-eof', 'theoretical-cout',
+  'stdin-live', 'input-newline', 'input-status', 'build-status', 'state-status',
+  'state', 'observation', 'variables', 'buffered-cout', 'buffer-status',
+  'stdout', 'stdout-check', 'stderr', 'history', 'log', 'status', 'connection', 'reset'];
 const elements = new Map(ids.map(id => [id, {
   id,
   value: id === 'source' ? '#include <iostream>\nint main() { std::cout << "ready\\n"; return 0; }' : id === 'buffered-cout' ? 'Ожидание runtime остановки процесса.' : '',
   textContent: '',
+  checked: id === 'input-newline',
+  disabled: false,
   dataset: {},
   classList: {add() {}, remove() {}},
   addEventListener(type, callback) { this[`on${type}`] = callback; },
