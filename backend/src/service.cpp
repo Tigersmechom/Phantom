@@ -63,6 +63,23 @@ void BackendService::clearActive(std::string_view requestId) noexcept {
   controlWake_.notify_all();
 }
 
+std::string BackendService::activeInterruption(std::string_view requestId) const {
+  std::lock_guard lock(controlMutex_);
+  return active_ && active_->id == requestId ? active_->interruption : std::string{};
+}
+
+void BackendService::publishFailedState(std::vector<Json>& frames, const Json& request) {
+  // A fatal GDB/MI failure closes the owned debugger. Do not leave the last
+  // stopped snapshot looking live after the process has already disappeared.
+  if (engine_->live()) return;
+  if (liveState_.is_object()) {
+    liveState_["phase"] = "failed";
+    liveState_["live"] = nullptr;
+    liveState_["exit"] = nullptr;
+    frames.push_back(event({{"kind", "state"}, {"state", liveState_}}, processInstanceId_, string_at(request, "requestId")));
+  }
+}
+
 Json BackendService::capabilities() const {
   return {
       {"protocolVersion", 1}, {"backendName", "phantom-linux"},
@@ -344,10 +361,13 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   if (kind == "stop") { engine_->interrupt(2); engine_->stop(); }
   GdbError error; GdbStop stop;
   if (kind == "pause" && !engine_->pause(stop, error)) {
+    interruption = activeInterruption(string_at(request, "requestId"));
+    publishFailedState(frames, request);
     const Json err = {{"code", error.code.empty() ? "INTERNAL" : error.code}, {"message", error.message}, {"retryable", error.retryable}};
     emitCommandFinished(frames, request, "failed", err); return frames;
   }
   if (kind != "stop" && kind != "pause" && !engine_->resume(kind == "step" ? request.at("command").at("stepKind").get<std::string>() : "continue", stop, error)) {
+    interruption = activeInterruption(string_at(request, "requestId"));
     if (interruption == "stop") {
       engine_->stop();
       stop = GdbStop{}; stop.exited = true; stop.processInstanceId = processInstanceId_; stop.reason = "stop";
@@ -358,9 +378,11 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
       emitCommandFinished(frames, request, "completed");
       return frames;
     }
+    publishFailedState(frames, request);
     const Json err = {{"code", error.code.empty() ? "INTERNAL" : error.code}, {"message", error.message}, {"retryable", error.retryable}};
     emitCommandFinished(frames, request, "failed", err); return frames;
   }
+  interruption = activeInterruption(string_at(request, "requestId"));
   if (stop.exited) engine_->stop();
   if (kind == "stop" || kind == "pause") { stop = GdbStop{}; stop.exited = kind == "stop"; stop.processInstanceId = processInstanceId_; stop.reason = kind; }
   const auto reason = stop.exited ? "exit" :

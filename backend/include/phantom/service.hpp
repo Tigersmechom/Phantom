@@ -67,6 +67,8 @@ class BackendService final {
   std::filesystem::path safePath(const std::string& supplied, bool allowMissing) const;
   void appendHistory(const Json& observation, const Json& state);
   void clearActive(std::string_view requestId) noexcept;
+  std::string activeInterruption(std::string_view requestId) const;
+  void publishFailedState(std::vector<Json>& frames, const Json& request);
   void emitCommandFinished(std::vector<Json>& frames, const Json& request,
                            std::string_view outcome,
                            std::optional<Json> error = std::nullopt);

@@ -185,6 +185,14 @@ struct GdbEngine::Impl {
   void setError(GdbError& e, std::string code, std::string msg, bool retry = false) {
     e = GdbError{std::move(code), std::move(msg), retry};
   }
+  void failClosed(GdbError& e, std::string code, std::string message, bool retry = true) {
+    if (process) process->terminate();
+    process.reset();
+    live = false;
+    breakpoints.clear();
+    cleanupTemp();
+    setError(e, std::move(code), std::move(message), retry);
+  }
   bool prepareTemp(const std::string& input, GdbError& e) {
     std::string pattern = (std::filesystem::temp_directory_path() /
                            "phantom-gdb-XXXXXX").string();
@@ -410,7 +418,7 @@ struct GdbEngine::Impl {
       process->write(tokenText + std::string(commandText) + "\n",
                      std::chrono::steady_clock::now() + options.commandTimeout);
     } catch (const std::exception& ex) {
-      setError(e, "INTERNAL", ex.what(), true); return false;
+      failClosed(e, "INTERNAL", ex.what()); return false;
     }
     // A control frame may have arrived after the service accepted this
     // operation but just before resume() wrote its MI command. Preserve that
@@ -429,7 +437,7 @@ struct GdbEngine::Impl {
       }
       ProcessOutput output;
       try { output = process->poll(std::chrono::milliseconds(20)); }
-      catch (const std::exception& ex) { setError(e, "INTERNAL", ex.what(), true); return false; }
+      catch (const std::exception& ex) { failClosed(e, "INTERNAL", ex.what()); return false; }
       drainPty();
       lines += output.out;
       std::size_t p = 0;
@@ -448,9 +456,9 @@ struct GdbEngine::Impl {
       }
       if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) return true;
       if (!waitStop && done) return e.code.empty();
-      if (output.exit) { setError(e, "LAUNCH_FAILED", "GDB exited before command completed", true); return false; }
+      if (output.exit) { failClosed(e, "LAUNCH_FAILED", "GDB exited before command completed"); return false; }
     }
-    setError(e, "TIMEOUT", "GDB command timed out", true);
+    failClosed(e, "TIMEOUT", "GDB command timed out");
     return false;
   }
 
