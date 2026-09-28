@@ -172,6 +172,7 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   observation["processInstanceId"] = process;
   observation["buildId"] = artifact_ ? string_at(artifact_->dto, "id") : "";
   observation["sourceBundleId"] = artifact_ ? string_at(artifact_->dto, "sourceBundleId") : "";
+  const bool inputWait = reason == "input-wait";
   observation["reason"] = std::move(reason);
   observation["location"] = stop.location;
   observation["threadId"] = stop.threadId.empty() ? Json(nullptr) : Json(stop.threadId);
@@ -179,6 +180,12 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   if (!observation.contains("input")) {
     auto input = defaultInput();
     if (stop.input.is_object()) for (auto it = stop.input.begin(); it != stop.input.end(); ++it) input[it.key()] = it.value();
+    // Native GDB can prove that the stop is in the inferior's stdin path,
+    // but cannot prove the exact C++ extraction range.  Keep the transport
+    // counters and mark only the state that is actually observed.
+    if (inputWait) {
+      input["status"] = "waiting";
+    }
     observation["input"] = std::move(input);
   }
   if (!observation.contains("stdout")) observation["stdout"] = stop.stdoutSnapshot.is_object() && stop.stdoutSnapshot.contains("text") ? stop.stdoutSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
@@ -458,7 +465,8 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
   // All execution requests are serialized. If pause reaches this path the
   // inferior is already stopped; an asynchronous interrupt would have no new
   // stop record to wait for and would incorrectly time out.
-  if (kind == "pause" && liveState_.value("phase", "") == "stopped") {
+  if (kind == "pause" && (liveState_.value("phase", "") == "stopped" ||
+                           liveState_.value("phase", "") == "waitingForInput")) {
     emitCommandFinished(frames, request, "completed");
     return frames;
   }
@@ -472,18 +480,18 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
     interruption = activeInterruption(string_at(request, "requestId"));
     // A source-level step can have no different line to reach (the common
     // `while (true) { continue; }` case).  GDB was interrupted at the step
-    // deadline and returned a real stopped snapshot; keep that session live
-    // while reporting the command as incomplete.  The frontend can inspect
-    // the checkpoint, choose instruction stepping, or continue execution.
-    if (error.code == "STEP_TIMEOUT" && stop.stopped && engine_->live()) {
-      auto observation = makeObservation(stop, "step-timeout");
-      auto state = makeState(observation, "stopped", stop.exitCode,
+    // deadline and returned a real stopped snapshot; keep that session live.
+    // A blocked stdin read is reported separately as a recoverable input wait.
+    if ((error.code == "STEP_TIMEOUT" || error.code == "INPUT_WAIT") && stop.stopped && engine_->live()) {
+      const bool inputWait = error.code == "INPUT_WAIT" || stop.reason == "input-wait";
+      auto observation = makeObservation(stop, inputWait ? "input-wait" : "step-timeout");
+      auto state = makeState(observation, inputWait ? "waitingForInput" : "stopped", stop.exitCode,
                              stop.signalName.empty() ? std::nullopt : std::optional<std::string>(stop.signalName));
       appendHistory(observation, state);
       frames.push_back(event({{"kind", "observation"}, {"observation", observation}}, processInstanceId_, string_at(request, "requestId")));
       frames.push_back(event({{"kind", "state"}, {"state", state}}, processInstanceId_, string_at(request, "requestId")));
       const Json err = {{"code", error.code}, {"message", error.message}, {"retryable", error.retryable}};
-      emitCommandFinished(frames, request, "failed", err);
+      emitCommandFinished(frames, request, inputWait ? "waiting" : "failed", err);
       return frames;
     }
     if (interruption == "stop") {
@@ -737,8 +745,8 @@ std::optional<Json> BackendService::inputControl(const Json& request, bool waitF
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return std::nullopt;
-  if (active_->kind != "continue")
-    return errorResponse(request, "BUSY", "interactive input is available while Continue is running", true);
+  if (active_->kind != "continue" && active_->kind != "step")
+    return errorResponse(request, "BUSY", "interactive input is available while execution is running", true);
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session)
     return errorResponse(request, "STALE_CONTEXT", "input request does not match the active session", false);
   if (request.at("expectedStop") != active_->expectedStop)

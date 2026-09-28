@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fcntl.h>
@@ -188,6 +189,20 @@ void testBufferedMode(const GdbOptions& options, GdbLaunchRequest request,
           "write-window fields disagree with compatibility aliases for " + mode + ": " + buffered.dump());
   require(buffered.contains("storageCapacityBytes"),
           "buffer snapshot omitted physical storage capacity for " + mode + ": " + buffered.dump());
+  if (buffered.at("pendingBytes").is_number_unsigned() &&
+      buffered.at("writeWindowCapacityBytes").is_number_unsigned() &&
+      buffered.at("writeWindowRemainingBytes").is_number_unsigned()) {
+    require(buffered.at("pendingBytes").get<std::uint64_t>() +
+                buffered.at("writeWindowRemainingBytes").get<std::uint64_t>() ==
+            buffered.at("writeWindowCapacityBytes").get<std::uint64_t>(),
+            "pending and remaining bytes do not partition the active write window for " + mode + ": " + buffered.dump());
+  }
+  if (buffered.at("storageCapacityBytes").is_number_unsigned() &&
+      buffered.at("writeWindowCapacityBytes").is_number_unsigned()) {
+    require(buffered.at("storageCapacityBytes").get<std::uint64_t>() >=
+                buffered.at("writeWindowCapacityBytes").get<std::uint64_t>(),
+            "write window exceeds physical storage for " + mode + ": " + buffered.dump());
+  }
   (void)engine.stopAndSnapshot();
 }
 

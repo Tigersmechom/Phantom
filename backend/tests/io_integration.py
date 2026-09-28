@@ -1,6 +1,8 @@
 """Exercise inferior pipe I/O through the public NDJSON boundary and real GDB.
 
 Input is fixed UTF-8 text, but its encoded bytes include NUL and control bytes.
+The interactive case deliberately delivers two chunks while the inferior is
+running, so the test catches accidental eager delivery of the future chunk.
 The delivered counter measures writes into the pipe, not inferior consumption.
 """
 
@@ -19,6 +21,7 @@ SOURCE = r"""#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <iostream>
 
 bool write_all(int fd, const char* bytes, std::size_t size) {
   while (size != 0) {
@@ -33,6 +36,12 @@ bool write_all(int fd, const char* bytes, std::size_t size) {
 
 int main(int argc, char** argv) {
   if (argc < 2) return 90;
+  if (std::strcmp(argv[1], "cin-wait") == 0) {
+    int value = 0;
+    std::cin >> value;
+    std::cout << "value=" << value << "\n";
+    return 0;
+  }
   if (std::strcmp(argv[1], "early-close") == 0) {
     ::close(STDIN_FILENO);
     if (!write_all(STDOUT_FILENO, "closed\n", 7)) return 91;
@@ -102,6 +111,23 @@ def execution_events(client: Client, request_id: str) -> tuple[dict, dict]:
     if finished.get("requestId") != request_id or finished.get("outcome") != "completed":
         fail("execution did not complete", finished)
     return frames[0]["payload"]["observation"], frames[1]["payload"]["state"]
+
+
+def execution_wait_events(client: Client, request_id: str) -> tuple[dict, dict, dict]:
+    frames = []
+    for _ in range(8):
+        frame = client.recv()
+        frames.append(frame)
+        if frame.get("payload", {}).get("kind") == "commandFinished":
+            break
+    kinds = [frame.get("payload", {}).get("kind") for frame in frames]
+    if kinds != ["observation", "state", "commandFinished"]:
+        fail("incomplete input-wait event sequence", {"requestId": request_id, "kinds": kinds})
+    finished = frames[-1]["payload"]
+    if (finished.get("requestId") != request_id or finished.get("outcome") != "waiting" or
+            finished.get("error", {}).get("code") != "INPUT_WAIT"):
+        fail("input wait was not exposed as a resumable outcome", finished)
+    return (frames[0]["payload"]["observation"], frames[1]["payload"]["state"], finished)
 
 
 def expect_output(snapshot: dict, text: str, label: str, raw_bytes: int | None = None,
@@ -186,18 +212,26 @@ def main() -> int:
             append_response = client.send({
                 **common, "requestId": "append-interactive",
                 "session": interactive_session, "expectedStop": interactive_stop,
-                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "abc"},
+                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "left"},
             })
             if not append_response.get("ok") or append_response.get("result", {}).get("kind") != "input":
                 fail("interactive append was not acknowledged immediately", append_response)
             retry_response = client.send({
                 **common, "requestId": "append-interactive-retry",
                 "session": interactive_session, "expectedStop": interactive_stop,
-                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "abc"},
+                "command": {"kind": "appendInput", "id": "input-interactive-1", "text": "left"},
             })
             if (not retry_response.get("ok") or
-                    retry_response.get("result", {}).get("input", {}).get("deliveredBytes") != 3):
+                    retry_response.get("result", {}).get("input", {}).get("deliveredBytes") != 4):
                 fail("retrying an input chunk duplicated or lost bytes", retry_response)
+            second_response = client.send({
+                **common, "requestId": "append-interactive-2",
+                "session": interactive_session, "expectedStop": interactive_stop,
+                "command": {"kind": "appendInput", "id": "input-interactive-2", "text": " right"},
+            })
+            if (not second_response.get("ok") or
+                    second_response.get("result", {}).get("input", {}).get("deliveredBytes") != 10):
+                fail("second interactive input chunk was not appended in order", second_response)
             conflict_response = client.send({
                 **common, "requestId": "append-interactive-conflict",
                 "session": interactive_session, "expectedStop": interactive_stop,
@@ -212,12 +246,84 @@ def main() -> int:
             })
             if not close_response.get("ok") or close_response.get("result", {}).get("kind") != "input":
                 fail("interactive EOF was not acknowledged immediately", close_response)
+            closed_input = close_response["result"]["input"]
+            if (closed_input.get("submitted", {}).get("text") != "" or
+                    closed_input["submitted"].get("closeAfterWrite") is not False or
+                    closed_input.get("revision", {}).get("text") != "left right" or
+                    closed_input.get("eof") != "requested"):
+                fail("input revisions or EOF rewrote the original launch submission", closed_input)
             interactive_observation, interactive_state = execution_events(client, "continue-interactive")
-            if interactive_observation.get("stdout", {}).get("text") != "abc":
+            if interactive_observation.get("stdout", {}).get("text") != "left right":
                 fail("interactive input was not delivered to the inferior", interactive_observation)
-            if interactive_observation.get("input", {}).get("deliveredBytes") != 3 or interactive_state.get("phase") != "terminated":
+            if interactive_observation.get("input", {}).get("deliveredBytes") != 10 or interactive_state.get("phase") != "terminated":
                 fail("interactive input accounting or termination is incorrect", {
                     "input": interactive_observation.get("input"), "state": interactive_state,
+                })
+
+            # A source step that reaches a blocking formatted extraction must
+            # produce a distinct waiting checkpoint, retain the user frame,
+            # and remain resumable after a chunk arrives.
+            wait_launch = client.send({
+                **common, "requestId": "launch-cin-wait",
+                "command": {
+                    "kind": "launch", "buildId": build_id,
+                    "input": {"id": "input-cin-wait", "text": "",
+                              "encoding": "utf-8", "closeAfterWrite": False},
+                    "argv": ["cin-wait"], "environment": {}, "stopAtEntry": True,
+                },
+            })
+            if not wait_launch.get("ok"):
+                fail("cin wait launch was not accepted", wait_launch)
+            wait_entry, _ = execution_events(client, "launch-cin-wait")
+            wait_observation, wait_state, _ = wait_entry, None, None
+            for attempt in range(4):
+                wait_step = client.send({
+                    **common, "requestId": f"step-cin-wait-{attempt}", "session": wait_launch["session"],
+                    "expectedStop": wait_observation["stop"],
+                    "command": {"kind": "step", "stepKind": "over"},
+                })
+                if not wait_step.get("ok"):
+                    fail("cin wait step was not accepted", wait_step)
+                frames = [client.recv() for _ in range(3)]
+                wait_observation = frames[0]["payload"]["observation"]
+                wait_state = frames[1]["payload"]["state"]
+                finished = frames[2]["payload"]
+                if finished.get("outcome") == "waiting":
+                    break
+                if finished.get("outcome") != "completed" or wait_state.get("phase") != "stopped":
+                    fail("cin wait stepping failed before the extraction", {"frames": frames})
+            else:
+                fail("cin wait never reached a blocking extraction", wait_observation)
+            if (wait_observation.get("reason") != "input-wait" or
+                    wait_state.get("phase") != "waitingForInput" or
+                    wait_observation.get("input", {}).get("status") != "waiting"):
+                fail("cin wait checkpoint did not carry waiting state", {
+                    "observation": wait_observation, "state": wait_state,
+                })
+            if wait_observation.get("location", {}).get("documentId") != "io":
+                fail("cin wait checkpoint lost the submitted source location", wait_observation.get("location"))
+            main_frames = [frame for frame in wait_observation.get("stack", []) if frame.get("functionName") == "main"]
+            if not main_frames or not any(variable.get("name") == "value" for variable in main_frames[0].get("variables", [])):
+                fail("cin wait checkpoint lost user-frame locals", wait_observation.get("stack"))
+            wait_input = client.send({
+                **common, "requestId": "append-cin-wait", "session": wait_launch["session"],
+                "expectedStop": wait_observation["stop"],
+                "command": {"kind": "appendInput", "id": "input-cin-wait-1", "text": "42\n"},
+            })
+            if not wait_input.get("ok"):
+                fail("cin wait input append was rejected", wait_input)
+            continue_wait = client.send({
+                **common, "requestId": "continue-cin-wait", "session": wait_launch["session"],
+                "expectedStop": wait_observation["stop"], "command": {"kind": "continue"},
+            })
+            if not continue_wait.get("ok"):
+                fail("cin wait continue was rejected", continue_wait)
+            resumed_observation, resumed_state = execution_events(client, "continue-cin-wait")
+            if (resumed_observation.get("reason") != "exit" or
+                    resumed_state.get("phase") != "terminated" or
+                    resumed_observation.get("stdout", {}).get("text") != "value=42\n"):
+                fail("cin wait checkpoint did not resume after input", {
+                    "observation": resumed_observation, "state": resumed_state,
                 })
 
             def run(name: str, text: str, mode: str = "echo",

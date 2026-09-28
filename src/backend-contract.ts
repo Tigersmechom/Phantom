@@ -153,6 +153,7 @@ export interface ExpressionTraceDTO {
   complete: boolean;
 }
 export interface InputStateDTO {
+  /** Original launch input; append/EOF updates are represented below. */
   submitted: SubmittedInputDTO;
   /** `observed-extractions` is the pre-revision spelling kept for old fixtures. */
   tracking: 'none' | 'transport-only' | 'semantic' | 'observed-extractions';
@@ -279,7 +280,7 @@ export interface BreakpointRequestDTO { id: string; range: SourceSpanDTO; enable
 export interface BreakpointDTO extends BreakpointRequestDTO { verified: boolean; resolvedRange?: SourceSpanDTO; message?: string }
 export interface InstructionDTO { addressHex: string; bytesHex: string; text: string; current: boolean; source?: SourceSpanDTO }
 export interface BackendErrorDTO {
-  code: 'UNSUPPORTED' | 'INVALID_REQUEST' | 'STALE_CONTEXT' | 'STALE_STOP' | 'BUSY' | 'BUILD_FAILED' | 'LAUNCH_FAILED' | 'READ_FAILED' | 'WRITE_FAILED' | 'TIMEOUT' | 'STEP_TIMEOUT' | 'CANCELLED' | 'REPLAY_DIVERGED' | 'EVENT_GAP' | 'HISTORY_EVICTED' | 'LIMIT_EXCEEDED' | 'INTERNAL';
+  code: 'UNSUPPORTED' | 'INVALID_REQUEST' | 'STALE_CONTEXT' | 'STALE_STOP' | 'BUSY' | 'BUILD_FAILED' | 'LAUNCH_FAILED' | 'READ_FAILED' | 'WRITE_FAILED' | 'TIMEOUT' | 'STEP_TIMEOUT' | 'INPUT_WAIT' | 'CANCELLED' | 'REPLAY_DIVERGED' | 'EVENT_GAP' | 'HISTORY_EVICTED' | 'LIMIT_EXCEEDED' | 'INTERNAL';
   message: string;
   retryable: boolean;
   detail?: string;
@@ -344,7 +345,7 @@ export type BackendEventPayloadDTO =
   | { kind: 'restoreProgress'; completedCommands: number; totalCommands: number; phase: 'replaying' | 'verifying'; candidateProcessInstanceId: string }
   | { kind: 'branchCreated'; branchId: string; parent: HistoryPointDTO }
   | { kind: 'historyEvicted'; branchId: string; throughOrdinal: number }
-  | { kind: 'commandFinished'; requestId: string; outcome: 'completed' | 'cancelled' | 'failed'; error?: BackendErrorDTO }
+  | { kind: 'commandFinished'; requestId: string; outcome: 'completed' | 'waiting' | 'cancelled' | 'failed'; error?: BackendErrorDTO }
   | { kind: 'error'; error: BackendErrorDTO };
 export interface BackendEventDTO {
   protocolVersion: BackendProtocolVersion;

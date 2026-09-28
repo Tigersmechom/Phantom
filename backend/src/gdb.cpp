@@ -138,6 +138,27 @@ std::string displayUtf8(std::string_view bytes) {
   return text;
 }
 
+// Input range offsets in the protocol are UTF-16 code-unit offsets, while
+// the pipe cursor is necessarily counted in bytes.  The native profile only
+// exposes the transport boundary (`deliveredBytes`), but converting that
+// boundary here keeps `exposedRanges` valid for non-ASCII drafts as well.
+std::size_t utf16Length(std::string_view text, std::size_t bytes) {
+  bytes = std::min(bytes, text.size());
+  std::size_t units = 0;
+  for (std::size_t at = 0; at < bytes;) {
+    const auto c = static_cast<unsigned char>(text[at]);
+    const std::size_t width = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 :
+        c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 1;
+    // Input is validated as UTF-8 at the protocol boundary. A pipe write can
+    // nevertheless stop in the middle of a multibyte sequence; do not expose
+    // a UTF-16 range that would split a code point.
+    if (width > bytes - at) break;
+    units += width == 4 ? 2 : 1;
+    at += width;
+  }
+  return units;
+}
+
 std::string base64(std::string_view bytes) {
   static constexpr char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -235,7 +256,10 @@ struct GdbEngine::Impl {
   std::size_t deliveredInputBytes = 0;
   std::string pendingInput;
   std::string inputId;
+  std::string inputRevisionId;
+  std::string inputParentRevisionId;
   std::map<std::string, std::string> inputChunks;
+  bool submittedInputClosed = true;
   bool closeInputAfterWrite = true;
   bool wrapperReady = false;
   GdbSourceBundle sourceBundle;
@@ -244,6 +268,62 @@ struct GdbEngine::Impl {
   std::vector<BreakpointEntry> breakpoints;
   int selectedFrame = 0;
   nlohmann::json lastStack = nlohmann::json::array();
+  // When input blocks, the selected source frame is a caller of the native
+  // input operation. Finish its immediate callee to return to that precise
+  // activation; line+1 guesses can skip control flow or target no code.
+  bool inputWaitActive = false;
+  int inputWaitFrame = -1;
+  nlohmann::json inputWaitLocation = nullptr;
+
+  static bool isInputRuntimeFrame(std::string_view function) {
+    return function.find("__GI___libc_read") != std::string_view::npos ||
+           function.find("__libc_read") != std::string_view::npos ||
+           function.find("_IO_new_file_underflow") != std::string_view::npos ||
+           function.find("_IO_default_uflow") != std::string_view::npos ||
+           function.find("stdio_sync_filebuf") != std::string_view::npos ||
+           function.find("basic_istream") != std::string_view::npos ||
+           function.find("_M_extract") != std::string_view::npos;
+  }
+
+  // Linux exposes blocked syscalls without running code in the inferior.
+  // Verify the descriptor's inode against our actual FIFO: a read from a
+  // socket/file (or a user function named getline) is not an input wait.
+  bool isInputDescriptor(std::uint64_t fd) const {
+    if (inferiorPid.empty() || fd > std::numeric_limits<int>::max()) return false;
+    std::lock_guard inputLock(inputMutex);
+    if (stdinFd < 0 || closeInputAfterWrite) return false;
+    struct stat actual{}, expected{};
+    const auto path = "/proc/" + inferiorPid + "/fd/" + std::to_string(fd);
+    return ::stat(path.c_str(), &actual) == 0 && ::fstat(stdinFd, &expected) == 0 &&
+        S_ISFIFO(actual.st_mode) && actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino;
+  }
+
+  bool inputReadInProgress() const {
+    if (inferiorPid.empty()) return false;
+    std::ifstream syscall("/proc/" + inferiorPid + "/syscall");
+    long number = -1;
+    std::string descriptor;
+    if (!(syscall >> number >> descriptor) || number != SYS_read) return false;
+    const auto fd = parseUnsigned(descriptor);
+    return fd && isInputDescriptor(*fd);
+  }
+
+  bool interruptedInputRead() {
+    // At the interrupt stop, verify Linux's restartable read registers again.
+    // This rejects the race where data arrived or a breakpoint was hit after
+    // the /proc sample. This adapter advertises x86_64 only.
+    MiRecord record;
+    GdbError ignored;
+    if (!command("-stack-select-frame 0", false, record, ignored)) return false;
+    if (!command("-data-evaluate-expression \"(long)$orig_rax\"", false, record, ignored) ||
+        valText(field(record.fields, "value")) != std::to_string(SYS_read)) return false;
+    if (!command("-data-evaluate-expression \"(long)$rax\"", false, record, ignored)) return false;
+    const auto result = valText(field(record.fields, "value"));
+    if (result != "-512" && result != "-513" && result != "-514" && result != "-516") return false;
+    if (!command("-data-evaluate-expression \"(unsigned long)$rdi\"", false, record, ignored)) return false;
+    const auto fd = parseUnsigned(valText(field(record.fields, "value")));
+    return fd && isInputDescriptor(*fd);
+  }
 
   void setError(GdbError& e, std::string code, std::string msg, bool retry = false) {
     e = GdbError{std::move(code), std::move(msg), retry};
@@ -327,8 +407,10 @@ struct GdbEngine::Impl {
     stdoutOutput.clear(); stderrOutput.clear();
     stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
     pendingInput = request.input; inputId = request.inputId;
+    inputRevisionId = request.inputId; inputParentRevisionId.clear();
     inputChunks.clear();
     inputChunks.emplace(inputId, request.input);
+    submittedInputClosed = request.closeInputAfterWrite;
     closeInputAfterWrite = request.closeInputAfterWrite;
     wrapperReady = false;
     return true;
@@ -348,7 +430,8 @@ struct GdbEngine::Impl {
     stdoutOutput.clear(); stderrOutput.clear();
     stdoutTotalBytes = 0; stderrTotalBytes = 0; deliveredInputBytes = 0;
     pendingInput.clear(); inputId.clear(); inputChunks.clear();
-    closeInputAfterWrite = true; wrapperReady = false;
+    inputRevisionId.clear(); inputParentRevisionId.clear();
+    submittedInputClosed = true; closeInputAfterWrite = true; wrapperReady = false;
     if (!tempDir.empty()) { std::error_code ec; std::filesystem::remove_all(tempDir, ec); }
     tempDir.clear();
   }
@@ -423,10 +506,28 @@ struct GdbEngine::Impl {
   }
 
   nlohmann::json inputSnapshotLocked() const {
-    return {{"submitted", {{"id", inputId}, {"text", pendingInput}, {"encoding", "utf-8"},
-                            {"closeAfterWrite", closeInputAfterWrite}}},
-            {"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes},
-            {"trace", nullptr}, {"stream", nullptr}};
+    const auto submitted = inputChunks.find(inputId);
+    const auto exposedUnits = utf16Length(pendingInput, deliveredInputBytes);
+    nlohmann::json exposed = nlohmann::json::array();
+    if (exposedUnits != 0) exposed.push_back({{"start", 0}, {"end", exposedUnits}});
+    const auto eof = closeInputAfterWrite ? "requested" : "open";
+    const auto status = stdinFd < 0 ? "complete" :
+        deliveredInputBytes < pendingInput.size() ? "reading" : "idle";
+    nlohmann::json snapshot = {
+        {"submitted", {{"id", inputId},
+                        {"text", submitted == inputChunks.end() ? std::string{} : submitted->second},
+                        {"encoding", "utf-8"}, {"closeAfterWrite", submittedInputClosed}}},
+        {"revision", {{"id", inputRevisionId.empty() ? inputId : inputRevisionId},
+                       {"parentId", inputParentRevisionId.empty() ? nlohmann::json(nullptr) : nlohmann::json(inputParentRevisionId)},
+                       {"text", pendingInput}}},
+        {"exposedRanges", std::move(exposed)}, {"status", status}, {"eof", eof},
+        {"tracking", "transport-only"}, {"deliveredBytes", deliveredInputBytes},
+        {"trace", nullptr}, {"stream", nullptr}};
+    // Exact extraction and the currently requested range are semantic facts.
+    // Native GDB cannot prove either one, so omitting them is preferable to a
+    // misleading null range (and keeps the DTO distinguishable from an empty
+    // confirmed range).
+    return snapshot;
   }
 
   bool inputRemainsOpen() const {
@@ -740,6 +841,10 @@ struct GdbEngine::Impl {
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
                GdbError& e, int preempt = 0) {
     e = {};
+    // Callers may reuse the record for a finish followed by a source step.
+    // A poll containing only the previous prompt must not let that old stop
+    // satisfy the new command before its acknowledgement arrives.
+    stop = MiRecord{};
     if (!process) { setError(e, "INVALID_REQUEST", "GDB is not running"); return false; }
     const auto token = nextToken++;
     std::string tokenText = std::to_string(token);
@@ -755,6 +860,8 @@ struct GdbEngine::Impl {
         (commandText == "-exec-next" || commandText == "-exec-step" ||
          commandText == "-exec-finish" || commandText == "-exec-step-instruction");
     bool recoveringStep = false;
+    bool checkingInput = false;
+    auto nextInputProbe = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     bool pendingInterrupt = preempt == 1;
     bool interruptSent = false;
     bool done = false, running = false;
@@ -775,6 +882,18 @@ struct GdbEngine::Impl {
       if (waitStop && running && pendingInterrupt && !interruptSent) {
         process->interrupt(); interruptSent = true;
       }
+      if (waitStop && running && !interruptSent && !pendingInterrupt &&
+          (recoverableStep || commandText == "-exec-continue") &&
+          std::chrono::steady_clock::now() >= nextInputProbe) {
+        nextInputProbe = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        if (inputReadInProgress()) {
+          process->interrupt();
+          interruptSent = true;
+          checkingInput = true;
+          interactiveContinue = false;
+          deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+      }
       ProcessOutput output;
       try { drainIo(); output = process->poll(std::chrono::milliseconds(5)); drainIo(); }
       catch (const std::exception& ex) { failClosed(e, "INTERNAL", ex.what()); return false; }
@@ -785,7 +904,8 @@ struct GdbEngine::Impl {
         lines.erase(0, p + 1);
         if (processLine(std::move(line), tokenText, waitStop, done, running, stop, e)) {
           if (waitStop && (stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally"))) {
-            if (recoveringStep) {
+            if (checkingInput) setError(e, "INPUT_CHECK", "interrupted a pending stdin read", true);
+            else if (recoveringStep) {
               setError(e, "STEP_TIMEOUT",
                        "source step did not reach a different source line before the step deadline; inferior was interrupted",
                        true);
@@ -804,7 +924,8 @@ struct GdbEngine::Impl {
         failClosed(e, "LIMIT_EXCEEDED", "unterminated GDB/MI record exceeds line limit"); return false;
       }
       if (waitStop && stop.type == '*' && (stop.klass == "stopped" || stop.klass == "exited" || stop.klass == "exited-normally")) {
-        if (recoveringStep) {
+        if (checkingInput) setError(e, "INPUT_CHECK", "interrupted a pending stdin read", true);
+        else if (recoveringStep) {
           setError(e, "STEP_TIMEOUT",
                    "source step did not reach a different source line before the step deadline; inferior was interrupted",
                    true);
@@ -1120,7 +1241,7 @@ struct GdbEngine::Impl {
     (void)outerError;
   }
 
-  bool snapshotStack(GdbStop& result, GdbError& e) {
+  bool snapshotStack(GdbStop& result, GdbError& e, bool chooseUserFrame = true) {
     MiRecord frames;
     if (!command("-stack-list-frames", false, frames, e)) return false;
     const MiValue* stack = field(frames.fields, "stack");
@@ -1176,6 +1297,31 @@ struct GdbEngine::Impl {
                            {"variables", std::move(variables)}});
       }
     }
+    // If GDB stopped inside libc while servicing a blocking stdin read, the
+    // selected frame is usually frame 0 and consequently has no user locals.
+    // Re-select the first submitted source frame and collect variables there,
+    // while preserving every native frame in the returned stack.  This keeps
+    // `main` visible without fabricating a source location for libc.
+    if (chooseUserFrame && selectedFrame == 0 && !output.empty() &&
+        output.front().value("location", nlohmann::json(nullptr)).is_null() &&
+        isInputRuntimeFrame(output.front().value("functionName", ""))) {
+      for (const auto& frame : output) {
+        const auto levelText = frame.value("id", "frame:0");
+        if (frame.value("location", nlohmann::json(nullptr)).is_null() ||
+            isInputRuntimeFrame(frame.value("functionName", ""))) continue;
+        const auto colon = levelText.find(':');
+        if (colon == std::string::npos) continue;
+        int level = 0;
+        try { level = std::stoi(levelText.substr(colon + 1)); } catch (...) { continue; }
+        MiRecord selected;
+        GdbError selectedError;
+        if (command("-stack-select-frame " + std::to_string(level), false, selected, selectedError)) {
+          selectedFrame = level;
+          return snapshotStack(result, e, false);
+        }
+        break;
+      }
+    }
     lastStack = output;
     result.stack = std::move(output);
     return true;
@@ -1183,6 +1329,7 @@ struct GdbEngine::Impl {
 
   bool makeStop(const MiRecord& stop, GdbStop& result, GdbError& e) {
     result = GdbStop{};
+    selectedFrame = 0;
     result.stopped = stop.klass == "stopped";
     result.reason = valText(field(stop.fields, "reason"));
     result.exited = stop.klass == "exited" || stop.klass == "exited-normally" ||
@@ -1291,6 +1438,9 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   impl_->control.store(0);
   impl_->inferiorPid.clear();
   impl_->lines.clear(); impl_->nextToken = 1; impl_->selectedFrame = 0;
+  impl_->inputWaitActive = false;
+  impl_->inputWaitFrame = -1;
+  impl_->inputWaitLocation = nullptr;
   impl_->sourceBundle = request.sourceBundle;
   if (!impl_->prepareTemp(request, error)) return false;
   if (!impl_->startGdb(request, error)) { stop(); return false; }
@@ -1319,6 +1469,9 @@ bool GdbEngine::appendInput(std::string_view id, std::string_view text,
     result = impl_->inputSnapshotLocked();
     return true;
   }
+  if (impl_->closeInputAfterWrite) {
+    error = {"STALE_CONTEXT", "EOF has already been requested for stdin", false}; return false;
+  }
   if (impl_->stdinFd < 0 && impl_->wrapperReady) {
     error = {"STALE_CONTEXT", "inferior stdin is already closed", false}; return false;
   }
@@ -1332,6 +1485,8 @@ bool GdbEngine::appendInput(std::string_view id, std::string_view text,
     error = {"LIMIT_EXCEEDED", "interactive input exceeds configured limit", false}; return false;
   }
   impl_->inputChunks.emplace(std::string(id), std::string(text));
+  impl_->inputParentRevisionId = impl_->inputRevisionId;
+  impl_->inputRevisionId = std::string(id);
   impl_->pendingInput.append(text);
   impl_->feedInputLocked();
   result = impl_->inputSnapshotLocked();
@@ -1359,11 +1514,67 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
   else if (stepKind == "continue") cmd = "-exec-continue";
   else { error = {"UNSUPPORTED", "unknown execution command", false}; return false; }
   MiRecord stopped;
-  if (!impl_->command(cmd, true, stopped, error, preempt)) return false;
+  const auto waitLocation = impl_->inputWaitLocation;
+  const bool recoverInputStep = impl_->inputWaitActive && impl_->inputWaitFrame > 0 &&
+      (stepKind == "over" || stepKind == "into" || stepKind == "out");
+  if (recoverInputStep) {
+    MiRecord selected;
+    // `finish` from the immediate callee completes the pending extraction.
+    // GDB owns its momentary return breakpoint and honors intervening user
+    // breakpoints, signals, another input wait and cancellation. Step-out
+    // instead finishes the visible user frame as explicitly requested.
+    const int frame = stepKind == "out" ? impl_->inputWaitFrame : impl_->inputWaitFrame - 1;
+    if (!impl_->command("-stack-select-frame " + std::to_string(frame), false, selected, error)) return false;
+    cmd = "-exec-finish";
+  }
+  impl_->inputWaitActive = false;
+  if (!impl_->command(cmd, true, stopped, error, preempt)) {
+    // An unsupported finish (for example an inline frame) rejects before
+    // running. Keep the waiting context usable for retry or Continue.
+    if (recoverInputStep && impl_->live.load()) impl_->inputWaitActive = true;
+    return false;
+  }
+  if (recoverInputStep && stepKind != "out" && error.code.empty()) {
+    const auto reason = valText(field(stopped.fields, "reason"));
+    const auto* frame = field(stopped.fields, "frame");
+    int line = 0;
+    if (frame) { try { line = std::stoi(valText(field(*frame, "line"))); } catch (...) {} }
+    const auto location = frame ? impl_->sourceLocation(valText(field(*frame, "fullname")), line) : nlohmann::json(nullptr);
+    // Some compilers attribute the return instruction to the cin line. Once
+    // GDB has finished that call, perform the requested source step normally.
+    // Never step over a user breakpoint or a signal encountered on the way.
+    if ((reason.empty() || reason == "function-finished") && location == waitLocation && !location.is_null()) {
+      if (!impl_->command(stepKind == "into" ? "-exec-step" : "-exec-next", true, stopped, error)) return false;
+    }
+  }
   const bool incompleteStep = error.code == "STEP_TIMEOUT";
+  const bool inputCandidate = error.code == "INPUT_CHECK" || incompleteStep;
+  const bool inputWait = inputCandidate && valText(field(stopped.fields, "signal-name")) == "SIGINT" &&
+      impl_->interruptedInputRead();
+  if (error.code == "INPUT_CHECK" && !inputWait) error = {};
   GdbError snapshotError;
   if (!impl_->makeStop(stopped, result, snapshotError)) { error = std::move(snapshotError); return false; }
   if (impl_->process) result.processInstanceId = impl_->inferiorPid.empty() ? std::to_string(impl_->process->pid()) : impl_->inferiorPid;
+  if (inputWait && result.stopped && !result.exited) {
+    impl_->inputWaitActive = true;
+    impl_->inputWaitFrame = -1;
+    impl_->inputWaitLocation = nullptr;
+    result.reason = "input-wait";
+    result.signalName.clear(); // SIGINT is debugger bookkeeping, not a program failure.
+    for (const auto& frame : result.stack) {
+      const auto location = frame.value("location", nlohmann::json(nullptr));
+      if (location.is_null()) continue;
+      const auto id = frame.value("id", std::string{});
+      const auto colon = id.find(':');
+      if (colon == std::string::npos) continue;
+      try { impl_->inputWaitFrame = std::stoi(id.substr(colon + 1)); } catch (...) { continue; }
+      impl_->inputWaitLocation = location;
+      if (result.location.is_null()) result.location = location;
+      break;
+    }
+    error = {"INPUT_WAIT", "program is waiting for stdin; provide input to continue", true};
+    return false;
+  }
   if (incompleteStep) return false;
   return true;
 }

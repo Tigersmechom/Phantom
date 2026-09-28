@@ -104,6 +104,10 @@ if(BUILD_TESTING)
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/io_integration.py"
       "$<TARGET_FILE:phantom-backend>")
   set_tests_properties(io-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  add_test(NAME interactive-input-integration
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/interactive_input_integration.py"
+      "$<TARGET_FILE:phantom-backend>")
+  set_tests_properties(interactive-input-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   add_test(NAME lifecycle-integration
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle_integration.py"
       "$<TARGET_FILE:phantom-backend>")

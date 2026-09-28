@@ -3,16 +3,18 @@ import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
-const ids = ['source', 'argv', 'input', 'environment', 'input-eof', 'theoretical-cout',
+const ids = ['source', 'argv', 'input', 'environment', 'input-eof', 'sample-program',
   'stdin-live', 'input-newline', 'input-status', 'build-status', 'state-status',
   'state', 'observation', 'variables', 'buffered-cout', 'buffer-status',
-  'stdout', 'stdout-check', 'stderr', 'history', 'log', 'status', 'connection', 'reset'];
+  'buffer-metrics', 'stdout', 'stdout-check', 'stderr', 'history', 'log', 'status', 'connection', 'reset',
+  'input-badge', 'input-ranges', 'input-locked', 'input-mode', 'input-meter-exposed', 'input-meter-consumed', 'commit-token', 'commit-line', 'close-input'];
 const elements = new Map(ids.map(id => [id, {
   id,
   value: id === 'source' ? '#include <iostream>\nint main() { std::cout << "ready\\n"; return 0; }' : id === 'buffered-cout' ? 'Ожидание runtime остановки процесса.' : '',
   textContent: '',
   checked: id === 'input-newline',
   disabled: false,
+  style: {},
   dataset: {},
   classList: {add() {}, remove() {}},
   addEventListener(type, callback) { this[`on${type}`] = callback; },
@@ -54,8 +56,6 @@ await new Promise(resolve => setTimeout(resolve, 20));
 
 if (!actions.find(button => button.dataset.action === 'step').disabled)
   throw new Error('Step must be disabled before Launch');
-if (elements.get('theoretical-cout').value !== 'ready\n')
-  throw new Error(`Theoretical cout preview did not initialize from source: ${elements.get('theoretical-cout').value}`);
 if (!elements.get('buffered-cout').value.includes('runtime'))
   throw new Error('Runtime buffered cout field did not initialize honestly');
 await actions.find(button => button.dataset.action === 'build').onclick();

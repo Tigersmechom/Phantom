@@ -79,10 +79,16 @@ The current Linux GDB adapter gives the inferior fd 0/1/2 through a trusted
 through a bounded transport cursor; an open interactive session may append
 future text without closing the writer. The adapter reports
 `tracking:"transport-only"`: `deliveredBytes` is only a pipe-write count, not
-proof that `cin` or a raw read consumed it. The target contract classifies a
-blocked source step as `input-wait` when the stop is inside the inferior's stdin
-read path; the current native implementation still has the old
-`STEP_TIMEOUT` fallback until that classifier and resume path are implemented.
+proof that `cin` or a raw read consumed it. A Linux `/proc/<pid>/syscall`
+sample, matched against the owned stdin FIFO and the interrupted x86_64
+registers, classifies a blocked source step or continue as `input-wait` while
+preserving the user frame. The waiting request ends with `outcome:"waiting"`;
+the frontend can append an exact chunk and issue a new step/continue with the
+returned stop context. Source stepping finishes the immediate callee of the
+saved user frame before resuming normal line stepping. GDB owns the temporary
+return breakpoint; no next-line guess or inferior expression call is needed.
+A genuine source step timeout still uses `STEP_TIMEOUT` and keeps the session
+inspectable.
 NUL bytes, unterminated input and long lines
 are ordinary pipe data subject only to the DTO input budget. stdout and stderr
 are drained independently, each with its own bounded retained snapshot and
@@ -123,9 +129,14 @@ The optional `kind:"connect"` and `workspace` members belong to the NDJSON
 envelope only. Interactive stdin is now an implemented native capability, while
 semantic input ranges, operation/capture manifests, object identity, thread
 ordering, build feature manifests and performance evidence remain capability
-gated extensions. A client must inspect `capabilities.inputTracking` before
-using `revision`, `exposedRanges`, `consumedRanges` or `activeRange`; absent
-coverage is represented by `null`/`none`, never inferred from pipe counters.
+gated extensions. Native `transport-only` supplies immutable `revision` and
+`exposedRanges` in UTF-16 units. Clients must inspect `capabilities.inputTracking`
+before using semantic `consumedRanges` or `activeRange`; these fields are absent
+in the native profile and must never be inferred from pipe counters. An EOF
+request is reported immediately as `requested`, even if queued bytes still
+need to drain. This is not proof that a C++ extractor has observed EOF.
+`submitted` preserves the original launch input and close policy; subsequent
+chunks and EOF requests affect the current revision and EOF state only.
 New command kinds and mutation/audit records still require a versioned
 DTO/fixture change. Unsupported commands or fields fail closed with
 `UNSUPPORTED`/`INVALID_REQUEST`.
