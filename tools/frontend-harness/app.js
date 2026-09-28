@@ -75,11 +75,13 @@ function renderBuffer(snapshot) {
     return;
   }
   $('buffered-cout').textContent = buffered.text || '(буфер пуст)';
-  const capacity = buffered.capacityBytes;
-  const remaining = buffered.remainingCapacityBytes;
+  const capacity = buffered.writeWindowCapacityBytes ?? buffered.capacityBytes;
+  const remaining = buffered.writeWindowRemainingBytes ?? buffered.remainingCapacityBytes;
+  const storage = buffered.storageCapacityBytes;
   $('buffer-status').textContent = `${buffered.source || 'Runtime'}: в буфере ${buffered.pendingBytes ?? buffered.totalBytes ?? 0} байт` +
-    (capacity == null ? '; ёмкость неизвестна' : ` из ${capacity}`) +
+    (capacity == null ? '; активное окно неизвестно' : ` из активного окна ${capacity}`) +
     (remaining == null ? '' : `; свободно ${remaining} байт`) +
+    (storage == null ? '' : `; физическое хранилище ${storage} байт`) +
     (buffered.mode ? `; режим: ${buffered.mode}` : '') +
     (buffered.truncated ? '; текст показан частично.' : '.');
 }
@@ -90,7 +92,7 @@ function renderVariables(stack) {
     for (const variable of frame.variables || []) {
       const value = variable.value;
       const scalar = value?.value;
-      const text = value?.availability !== 'available' ? `NaN / недоступно: ${value?.reason || 'not-captured'}` :
+      const text = value?.availability !== 'available' ? `ND / недоступно: ${value?.reason || 'not-captured'}` :
         scalar?.decimal ?? scalar?.text ?? scalar?.addressHex ?? scalar?.summary ?? String(scalar?.value ?? '?');
       lines.push(`  ${variable.name}: ${variable.type} = ${text}`);
       lines.push(`    адрес: ${variable.addressHex || 'недоступен'}`);

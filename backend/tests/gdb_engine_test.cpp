@@ -183,6 +183,11 @@ void testBufferedMode(const GdbOptions& options, GdbLaunchRequest request,
   if (expectedRemaining) require(buffered.at("remainingCapacityBytes") == *expectedRemaining,
                                  "wrong remaining buffered capacity for " + mode + ": " + buffered.dump());
   else require(buffered.at("remainingCapacityBytes").is_null(), "line mode reported remaining capacity: " + buffered.dump());
+  require(buffered.at("writeWindowCapacityBytes") == buffered.at("capacityBytes") &&
+          buffered.at("writeWindowRemainingBytes") == buffered.at("remainingCapacityBytes"),
+          "write-window fields disagree with compatibility aliases for " + mode + ": " + buffered.dump());
+  require(buffered.contains("storageCapacityBytes"),
+          "buffer snapshot omitted physical storage capacity for " + mode + ": " + buffered.dump());
   (void)engine.stopAndSnapshot();
 }
 

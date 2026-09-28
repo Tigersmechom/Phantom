@@ -105,11 +105,11 @@ function measureValuePop(node: HTMLElement) {
 }
 
 export function formatDebugValue(value: number | string | null | undefined) {
-  // Missing/unavailable slots are NaN in the presentation layer. A known zero
-  // (including vector<int>(n, 0)) stays zero. Never invent memory contents.
-  return value == null || (typeof value === "number" && Number.isNaN(value))
-    ? "NaN"
-    : String(value);
+  // A missing slot is ND (not declared/not available); a real IEEE NaN keeps
+  // its own spelling. A known zero (including vector<int>(n, 0)) stays zero.
+  // Never invent memory contents.
+  if (value == null) return "ND";
+  return typeof value === "number" && Number.isNaN(value) ? "NaN" : String(value);
 }
 
 export function useChangeMotion<T extends HTMLElement = HTMLElement>(
@@ -248,7 +248,7 @@ export default function AnimatedValue({
   const motion = useChangeMotion(text, "value");
   return (
     <span
-      className={`motion-value ${text === "NaN" ? "is-unavailable" : ""}`}
+      className={`motion-value ${text === "ND" || text === "NaN" ? "is-unavailable" : ""}`}
       ref={motion}
       data-value={text}
     >

@@ -108,5 +108,5 @@ try {
       await page.locator('.motion-value').evaluateAll(nodes => nodes.forEach(node => { node.style.transform = ''; }));
     }
   }
-  console.log('Input/value UI verified: multiline/tabs/wrap, all fonts, active+consumed geometry, edit reset, scroll/EOF waiting cursor, dynamic pop bounds for small/long/negative/NaN values and font scales.');
+  console.log('Input/value UI verified: multiline/tabs/wrap, all fonts, active+consumed geometry, edit reset, scroll/EOF waiting cursor, dynamic pop bounds for small/long/negative/ND values and font scales.');
 } finally { await browser.close(); }

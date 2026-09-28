@@ -21,12 +21,15 @@ export const observation: StopObservationDTO = {
     { id: 'nan', name: 'nan', type: 'double', scopeId: 'main-body', activationId: 'main-1', locator: 'main-1:nan', value: ieeeNaN, writable: false },
   ] }],
   input: {
-    submitted: { id: 'input-v1', text: fixtureInput, encoding: 'utf-8', closeAfterWrite: true }, tracking: 'observed-extractions', deliveredBytes: 17,
+    submitted: { id: 'input-v1', text: fixtureInput, encoding: 'utf-8', closeAfterWrite: true }, tracking: 'semantic', deliveredBytes: 17,
+    revision: { id: 'input-revision-2', parentId: 'input-revision-1', text: fixtureInput },
+    exposedRanges: [{ start: 0, end: 3 }, { start: 7, end: 8 }],
+    consumedRanges: [{ start: 1, end: 3 }], activeRange: { start: 7, end: 8 }, status: 'reading', eof: 'open',
     trace: { revision: fixtureInput, consumedRanges: [{ start: 1, end: 3 }], activeRange: { start: 7, end: 8 }, status: 'reading' }, consumedThroughUtf16: 3,
     stream: { eof: false, fail: false, bad: false },
     lastRead: { id: 'read-a', kind: 'formatted', status: 'completed', targetLocator: 'main-1:a', consumedRanges: [{ start: 1, end: 3 }], value: { availability: 'available', value: { kind: 'integer', decimal: '-3', bits: 32, signed: true } } },
   },
-  stdout: { text: '', totalBytes: 0, retainedFromByte: 0, truncated: false }, stderr: { text: '', totalBytes: 0, retainedFromByte: 0, truncated: false },
+  stdout: { text: '', totalBytes: 0, retainedFromByte: 0, truncated: false, buffered: { available: true, source: 'glibc-_IO_FILE', stream: 'stdout', association: 'cout-if-synchronized', mode: 'full', flushPolicy: 'buffer-full-or-explicit', pendingBytes: 0, writeWindowCapacityBytes: 4096, writeWindowRemainingBytes: 4096, capacityBytes: 4096, remainingCapacityBytes: 4096, storageCapacityBytes: 4096, metadataAvailable: true, text: '', totalBytes: 0, retainedFromByte: 0, truncated: false } }, stderr: { text: '', totalBytes: 0, retainedFromByte: 0, truncated: false },
   expressions: [{
     id: 'expression-3', range: range('f() + g()'), evidence: 'instrumentation', complete: true, activeStageIds: ['sum'],
     groups: [

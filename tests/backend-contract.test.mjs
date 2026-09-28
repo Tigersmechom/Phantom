@@ -18,6 +18,12 @@ test('protocol fixtures round-trip through JSON without narrowing exact integers
 test('input ranges refer to exact UTF-16 text while delivered bytes remain transport metadata', () => {
   const input = observation.input, trace = input.trace;
   assert.equal(trace.revision, input.submitted.text);
+  assert.equal(input.revision.text, input.submitted.text);
+  assert.equal(input.revision.parentId, 'input-revision-1');
+  assert.deepEqual(input.exposedRanges, [{ start: 0, end: 3 }, { start: 7, end: 8 }]);
+  assert.deepEqual(input.consumedRanges, trace.consumedRanges);
+  assert.equal(input.status, 'reading');
+  assert.equal(input.eof, 'open');
   assert.equal(input.deliveredBytes, Buffer.byteLength(fixtureInput, 'utf8'));
   assert.notEqual(input.deliveredBytes, fixtureInput.length, 'Unicode byte counts are not renderer offsets');
   assert.deepEqual(trace.consumedRanges.map(span => fixtureInput.slice(span.start, span.end)), ['-3']);
@@ -25,6 +31,13 @@ test('input ranges refer to exact UTF-16 text while delivered bytes remain trans
   assert.equal(fixtureInput.slice(9, 11), '😀', 'Supplementary characters occupy two UTF-16 units');
   assert.notEqual(trace.revision, fixtureInput + ' ', 'An edited input must suppress old highlights');
   assert.equal(input.stream.eof, false, 'Closing the transport does not assert observed stream EOF');
+});
+
+test('buffer snapshot keeps active write window separate from physical storage', () => {
+  const buffered = observation.stdout.buffered;
+  assert.equal(buffered.writeWindowCapacityBytes, buffered.capacityBytes);
+  assert.equal(buffered.writeWindowRemainingBytes, buffered.remainingCapacityBytes);
+  assert.equal(buffered.storageCapacityBytes, 4096);
 });
 
 test('expression fixture preserves supplied call grouping and exact source spans', () => {

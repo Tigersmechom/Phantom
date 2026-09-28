@@ -5,10 +5,21 @@ export type ArchitectureDTO = 'arm64' | 'x86_64';
 
 /** Zero-based UTF-16 code-unit offsets, [start, end), in the exact referenced text. */
 export interface Utf16Range { start: number; end: number }
-/** Frontend compatibility view: revision is the EXACT submitted stdin TEXT, not an ID/hash. */
+/** Immutable input draft revision. The text is never normalized. */
+export interface InputRevisionDTO {
+  id: string;
+  parentId: string | null;
+  text: string;
+}
+/**
+ * Compatibility view used by the original InputPanel. New clients should use
+ * InputStateDTO.revision and its top-level ranges; the legacy string revision
+ * remains accepted so old fixtures do not silently lose their highlights.
+ */
 export interface InputTrace {
-  revision: string;
+  revision: string | InputRevisionDTO;
   consumedRanges: Utf16Range[];
+  exposedRanges?: Utf16Range[];
   activeRange?: Utf16Range;
   status: 'idle' | 'waiting' | 'reading' | 'complete' | 'error';
 }
@@ -143,9 +154,19 @@ export interface ExpressionTraceDTO {
 }
 export interface InputStateDTO {
   submitted: SubmittedInputDTO;
-  tracking: 'none' | 'transport-only' | 'observed-extractions';
+  /** `observed-extractions` is the pre-revision spelling kept for old fixtures. */
+  tracking: 'none' | 'transport-only' | 'semantic' | 'observed-extractions';
   /** Bytes written to the pipe are NOT proof that the C++ extraction consumed them. */
   deliveredBytes: number;
+  /** Current editable draft revision; absent in the legacy transport-only shape. */
+  revision?: InputRevisionDTO;
+  /** Ranges already exposed to the inferior, tied to revision.text. */
+  exposedRanges?: Utf16Range[];
+  /** Ranges confirmed as consumed by a semantic input profile. */
+  consumedRanges?: Utf16Range[];
+  activeRange?: Utf16Range;
+  status?: 'idle' | 'waiting' | 'reading' | 'complete' | 'error';
+  eof?: 'open' | 'requested' | 'observed';
   trace: InputTrace | null;
   consumedThroughUtf16?: number;
   /** null means stream flags were not observed. EOF is distinct from complete UI trace. */
@@ -175,6 +196,8 @@ export interface OutputSnapshotDTO {
     mode: 'full' | 'line' | 'unbuffered' | 'unknown';
     flushPolicy: 'buffer-full-or-explicit' | 'newline-or-explicit' | 'every-write' | 'unknown';
     pendingBytes: number;
+    writeWindowCapacityBytes: number | null;
+    writeWindowRemainingBytes: number | null;
     /** Null when line buffering/ABI metadata cannot define a byte threshold. */
     capacityBytes: number | null;
     remainingCapacityBytes: number | null;
@@ -199,7 +222,7 @@ export interface StopObservationDTO {
   processInstanceId: string;
   buildId: string;
   sourceBundleId: string;
-  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'step-timeout' | 'mutation' | 'exit';
+  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'input-wait' | 'step-timeout' | 'mutation' | 'exit';
   /** Actual PC location before the next instruction, not proof this statement has completed. */
   location: SourceSpanDTO | null;
   threadId: string | null;
@@ -212,7 +235,7 @@ export interface StopObservationDTO {
 }
 export interface DebugSessionStateDTO {
   session: SessionRefDTO;
-  phase: 'idle' | 'building' | 'launching' | 'stopped' | 'running' | 'pausing' | 'restoring' | 'terminated' | 'failed';
+  phase: 'idle' | 'building' | 'launching' | 'stopped' | 'waitingForInput' | 'running' | 'pausing' | 'restoring' | 'terminated' | 'failed';
   processInstanceId: string | null;
   buildId: string | null;
   /** Authoritative live process position; a history read must never change this. */

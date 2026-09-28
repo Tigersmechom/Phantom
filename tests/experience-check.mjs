@@ -6,7 +6,7 @@ try {
  await page.goto('http://127.0.0.1:5173/',{waitUntil:'networkidle'});
  assert.equal(await page.title(),'phantom');
  assert.equal(await page.locator('.session-label,.palette-status,.design-dock').count(),0);
- assert.equal(await page.locator('.prefix-cells .motion-value[data-value="NaN"]').count(),7);
+ assert.equal(await page.locator('.prefix-cells .motion-value[data-value="ND"]').count(),7);
  const n=page.locator('[data-variable="n"]').locator('.motion-value');
  assert.equal(await n.getAttribute('data-change-count'),null,'No pop on initial render');
  await page.getByRole('button',{name:'Кадр 2',exact:true}).click();
@@ -35,5 +35,5 @@ try {
  await page.getByRole('button',{name:'Кадр 23',exact:true}).click();await page.waitForTimeout(90);await page.screenshot({path:'previews/phantom-value-motion.png'});
  await page.emulateMedia({reducedMotion:'reduce'});await page.getByRole('button',{name:'Кадр 29',exact:true}).click();
  assert.equal(await page.locator('.motion-value').evaluateAll(els=>els.flatMap(el=>el.getAnimations()).some(a=>a.effect.getKeyframes().some(k=>k.transform))),false,'Reduced motion removes value transforms');
- assert.deepEqual(errors,[]);console.log('PASS: value-change impulses, stable numbers, NaN/zero semantics, declarations/input/output trace, speed, typography and minimal settings.');
+ assert.deepEqual(errors,[]);console.log('PASS: value-change impulses, stable numbers, ND/zero semantics, declarations/input/output trace, speed, typography and minimal settings.');
 } finally {await browser.close()}

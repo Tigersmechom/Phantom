@@ -112,16 +112,40 @@ Capabilities объявляют реальные архитектуры, вид�
 
 `observation.stdout.text` содержит только байты, уже сброшенные inferior в
 транспортный pipe. На Linux/glibc остановленный процесс дополнительно может
-получить необязательное `stdout.buffered`: это bounded read окна
-`_IO_write_base.._IO_write_ptr`, подтверждённый GDB в момент остановки. Поле
-отсутствует для неподдерживаемой ABI, несинхронизированного `iostream` или
-невалидного диапазона; статический разбор исходника не подменяет этот факт.
+получить необязательное `stdout.buffered`: это bounded snapshot текущего
+`FILE`-буфера, подтверждённый GDB в момент остановки. В нём различаются:
 
-Source-level `step` имеет отдельный короткий deadline. Если GDB не может достичь
-другой source location, например в бесконечном `while (true) { continue; }`,
-backend прерывает inferior на реальном остановленном PC, сохраняет live session и
-публикует `observation.reason = "step-timeout"` вместе с
-`commandFinished.outcome = "failed"`, `error.code = "STEP_TIMEOUT"`. Это
+```text
+pendingBytes                 _IO_write_ptr - _IO_write_base
+writeWindowCapacityBytes     _IO_write_end - _IO_write_base
+writeWindowRemainingBytes    _IO_write_end - _IO_write_ptr
+storageCapacityBytes         _IO_buf_end - _IO_buf_base
+```
+
+`capacityBytes` и `remainingCapacityBytes` остаются совместимыми именами для
+активного write-window. `storageCapacityBytes` не означает, что столько байт
+можно записать до flush. Для line-buffered и unbuffered режимов окно может
+быть `null` или равно нулю, а `flushPolicy` сообщает известную политику.
+Свободное окно не является обещанием момента flush: `endl`, `flush`, `unitbuf`,
+связанный `cin`, перевод строки и крупная запись могут сбросить вывод раньше.
+Поле отсутствует для неподдерживаемой ABI, несинхронизированного `iostream`
+или невалидного диапазона; статический разбор исходника не подменяет этот
+факт.
+
+Source-level `step` имеет отдельный короткий deadline. В целевом контракте,
+если GDB прерывает inferior внутри блокирующего чтения stdin, это не
+`STEP_TIMEOUT`: backend классифицирует остановку как
+`observation.reason = "input-wait"`, сохраняет
+последний пользовательский frame и публикует `input.status = "waiting"`.
+Внутренние frames libc могут остаться в raw/native диагностике, но не должны
+заменять пользовательский stack. После новой порции ввода тот же незавершённый
+step/continue возобновляется с актуальным stop context; EOF и parse failure
+передаются отдельными состояниями.
+
+Если другой source location действительно не достигнут, например в бесконечном
+`while (true) { continue; }`, backend сохраняет live session и публикует
+`observation.reason = "step-timeout"` вместе с
+`commandFinished.outcome = "failed", error.code = "STEP_TIMEOUT"`. Это
 неуспешный переход source-step, а не завершение процесса и не доказательство
 перехода на новую строку; `continue`, `pause`, `stop` и instruction-step остаются
 доступны.
@@ -146,7 +170,7 @@ backend прерывает inferior на реальном остановленн
 
 Native GDB дополнительно может прикрепить к `VariableDTO` физический `addressHex` и bounded `storage`: `state:'observed'` означает только успешное чтение байтов текущего frame, а `lifetime:'unknown'` намеренно сохраняет неизвестность времени жизни C++-объекта. Это не адрес pointee для указателя. `rawBytesHex` не преобразуется в `RuntimeValueDTO` и может содержать padding или старый мусор. Если DWARF не даёт доказуемую location/size, storage остаётся `unknown` с причиной; source line сама по себе не используется как доказательство выделения/инициализации. Точное `not-declared` для top-level locals требует lifecycle metadata от compiler/instrumentation: обычный `-O0 -g` часто оставляет весь function frame одним `DW_OP_fbreg`.
 
-Целые передаются десятичными строками с разрядностью/знаком. `18446744073709551615` нельзя пропускать через `Number`, `parseInt` или JSON-number. IEEE float NaN/±Infinity/−0 имеют отдельную classification и строковое представление; они не являются unavailable. Текущий inspector для `null` рисует «NaN» как визуальную заглушку demo, но новый presenter обязан сохранять различие причин и настоящего IEEE NaN. Известные нули в `vector<int>(n)` и `vector<int>(n + 1, 0)` остаются нулями.
+Целые передаются десятичными строками с разрядностью/знаком. `18446744073709551615` нельзя пропускать через `Number`, `parseInt` или JSON-number. IEEE float NaN/±Infinity/−0 имеют отдельную classification и строковое представление; они не являются unavailable. `notDeclared` отображается как `ND` и не смешивается с настоящим IEEE NaN, `uninitialized` или `not-captured`. Известные нули в `vector<int>(n)` и `vector<int>(n + 1, 0)` остаются нулями.
 
 Существующий `ExpressionStage` из `execution-types.ts` уже принимает `number|string|null`, чтобы renderer мог показать точные строки. Это presentation-модель: будущий presenter преобразует структурированное значение в строку/подпись, **не вычисляет выражение** и не сужает число. `RuntimeValueDTO` и `ExpressionTraceDTO` пока не подключены к native bridge автоматически.
 
@@ -162,11 +186,36 @@ Trace ID отличает конкретное выполнение, включ�
 
 ## 7. STDIN: отображение не равно разбору C++
 
-`SubmittedInputDTO` содержит **ID и точный text**, encoding UTF-8 и `closeAfterWrite`. При `true` backend закрывает stdin после доставки начального текста и получает EOF; при `false` pipe остаётся открытым. Capability `interactiveInput:true` включает команды `appendInput{id,text}` и `closeInput`: они требуют актуальный `expectedStop`, повторная отправка того же ID с тем же текстом идемпотентна, конфликтующий повтор отклоняется. Во время живого `continue` эти команды получают ответ через transport control path, поэтому не стоят в очереди за долгим ожиданием `cin`; `closeInput` явно передаёт EOF. Ограничены суммарные bytes и число chunks, а `deliveredBytes` по-прежнему означает запись в pipe, а не подтверждённое извлечение `std::cin`.
+`SubmittedInputDTO` содержит **ID и точный text**, encoding UTF-8 и `closeAfterWrite`. При `true` backend закрывает stdin после доставки начального текста и получает EOF; при `false` pipe остаётся открытым. Capability `interactiveInput:true` включает команды `appendInput{id,text}` и `closeInput`: они требуют актуальный `expectedStop`, повторная отправка того же ID с тем же текстом идемпотентна, конфликтующий повтор отклоняется. Во время живого `continue` эти команды получают ответ через transport control path, поэтому не стоят в очереди за долгим ожиданием `cin`; `closeInput` явно передаёт EOF. Ограничены суммарные bytes и число chunks.
 
-`InputTrace.revision` для совместимости с текущим `InputPanel` означает **саму точную строку text, не ID и не hash**. Это намеренно названное исключение; настоящий ID — `submitted.id`. `InputPanel` отображает диапазоны только если editable value дословно равен trace.revision. Изменение поля не меняет уже отправленный input/историю.
+Для интерактивного режима backend хранит draft ввода отдельно от уже разрешённых процессу байтов. В Observation поле `input` имеет следующие независимые факты:
 
-`consumedRanges`/`activeRange` — нулевые UTF-16 `[start,end)` в этой строке. Диапазоны могут охватывать известные прочитанные токены, не утверждая, что всё остальное прочитано. `consumedThroughUtf16` — отдельный подтверждённый курсор, если backend его знает. Диапазоны валидируются, не выходят за строку и не режут surrogate pairs. Пишущий в pipe backend знает `deliveredBytes`; это **не** число байтов, фактически извлечённых `std::cin`, и не основание красить токены.
+```text
+submitted                 исходный immutable input объекта launch
+revision                  текущая ревизия draft: {id, parentId, text}
+exposedRanges             диапазоны, уже разрешённые процессу
+consumedRanges            только подтверждённые диапазоны извлечения
+activeRange               ожидаемый диапазон, если его можно доказать
+consumedThroughUtf16      монотонная граница только при доказанном prefix
+status                    idle / waiting / reading / complete / error
+eof                       open / requested / observed
+deliveredBytes            transport-счётчик записи в pipe
+tracking                  none / transport-only / semantic
+```
+
+`revision.id` меняется при редактировании будущего суффикса и ссылается на
+`parentId`; уже `exposedRanges` не переписываются. Все диапазоны — нулевые
+UTF-16 `[start,end)` внутри указанного `revision.text`; они не режут surrogate
+pairs. `deliveredBytes` означает только запись в pipe и никогда не объявляется
+числом извлечённых значений. При `tracking = transport-only` `trace` остаётся
+`null`, а `exposedRanges` может быть известен лишь как транспортная граница.
+Точные `consumedRanges` и `activeRange` появляются только в semantic-профиле.
+
+Переходы ввода: `idle → waiting → reading → complete|error`, а EOF является
+отдельным состоянием и не выводится из пустого поля редактора. Если программа
+ждёт `cin`, Observation получает `reason = "input-wait"`, `status = "waiting"`
+и сохраняет пользовательский stack. Это не ошибка шага и не доказательство,
+что libc прочитала весь доступный pipe.
 
 | Ситуация | Честное состояние |
 | --- | --- |

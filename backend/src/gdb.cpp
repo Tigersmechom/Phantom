@@ -486,11 +486,14 @@ struct GdbEngine::Impl {
       return unavailable("stdout-layout-unsupported");
     const auto base = member("_IO_write_base");
     const auto pointer = member("_IO_write_ptr");
+    const auto writeEnd = member("_IO_write_end");
     const auto bufferBase = member("_IO_buf_base");
     const auto bufferEnd = member("_IO_buf_end");
-    if (!base || !pointer || !bufferBase || !bufferEnd || *pointer < *base || *bufferEnd < *bufferBase ||
-        (*bufferBase == 0 && (*base != 0 || *pointer != 0 || *bufferEnd != 0)) ||
-        (*bufferBase != 0 && (*base < *bufferBase || *base > *bufferEnd || *pointer > *bufferEnd)))
+    if (!base || !pointer || !writeEnd || !bufferBase || !bufferEnd || *pointer < *base || *writeEnd < *base ||
+        *bufferEnd < *bufferBase ||
+        (*bufferBase == 0 && (*base != 0 || *pointer != 0 || *writeEnd != 0 || *bufferEnd != 0)) ||
+        (*bufferBase != 0 && (*base < *bufferBase || *base > *bufferEnd || *writeEnd > *bufferEnd ||
+                              *pointer > *bufferEnd)))
       return unavailable("stdout-buffer-range-unavailable");
     const auto count = *pointer - *base;
     // _IO_UNBUFFERED and _IO_LINE_BUF are private glibc constants. Keep the
@@ -503,8 +506,12 @@ struct GdbEngine::Impl {
     std::optional<std::uint64_t> capacity;
     std::optional<std::uint64_t> remaining;
     if (!unbuffered && !lineBuffered && *bufferBase != 0) {
-      capacity = *bufferEnd - *base;
-      remaining = *bufferEnd - *pointer;
+      // _IO_buf_* describes physical storage.  The active write window is
+      // _IO_write_base.._IO_write_end; line-buffered and unbuffered modes may
+      // deliberately have no writable window despite owning storage.
+      if (*pointer > *writeEnd) return unavailable("stdout-buffer-range-unavailable");
+      capacity = *writeEnd - *base;
+      remaining = *writeEnd - *pointer;
     } else if (unbuffered) {
       capacity = 0;
       remaining = 0;
@@ -517,7 +524,10 @@ struct GdbEngine::Impl {
     // Counters cross into JavaScript as numbers; reject corrupt spans which
     // could no longer be represented exactly, before doing any memory read.
     constexpr std::uint64_t maxSafeInteger = 9007199254740991ULL;
-    if (count > maxSafeInteger || (storageCapacity && *storageCapacity > maxSafeInteger))
+    if (count > maxSafeInteger ||
+        (capacity && *capacity > maxSafeInteger) ||
+        (remaining && *remaining > maxSafeInteger) ||
+        (storageCapacity && *storageCapacity > maxSafeInteger))
       return unavailable("stdout-buffer-range-unavailable");
     nlohmann::json result = {
         {"available", true},
@@ -527,6 +537,8 @@ struct GdbEngine::Impl {
         {"mode", mode},
         {"flushPolicy", flushPolicy},
         {"pendingBytes", count},
+        {"writeWindowCapacityBytes", capacity ? nlohmann::json(*capacity) : nlohmann::json(nullptr)},
+        {"writeWindowRemainingBytes", remaining ? nlohmann::json(*remaining) : nlohmann::json(nullptr)},
         {"capacityBytes", capacity ? nlohmann::json(*capacity) : nlohmann::json(nullptr)},
         {"remainingCapacityBytes", remaining ? nlohmann::json(*remaining) : nlohmann::json(nullptr)},
         {"storageCapacityBytes", storageCapacity ? nlohmann::json(*storageCapacity) : nlohmann::json(nullptr)},

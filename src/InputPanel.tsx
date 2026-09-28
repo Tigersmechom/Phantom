@@ -29,6 +29,9 @@ const fontFamilies = {
   xcode: '"SFMono-Regular", Menlo, monospace',
 };
 
+const traceText = (trace: InputTrace | null) =>
+  typeof trace?.revision === "string" ? trace.revision : trace?.revision.text;
+
 /** InputTrace is supplied by the backend/demo adapter; this view never parses or infers cin reads. */
 export default function InputPanel({
   value,
@@ -43,7 +46,7 @@ export default function InputPanel({
   const latest = useRef({ value, trace });
   latest.current = { value, trace };
   const [rectangles, setRectangles] = useState<InputRect[]>([]);
-  const matchingTrace = trace?.revision === value ? trace : null;
+  const matchingTrace = traceText(trace) === value ? trace : null;
 
   const measure = useCallback(() => {
     const textarea = input.current,
@@ -55,7 +58,7 @@ export default function InputPanel({
     pre.style.transform = `translate(${-textarea.scrollLeft}px, ${-textarea.scrollTop}px)`;
     const current = latest.current;
     const validTrace =
-      current.trace?.revision === current.value ? current.trace : null;
+      traceText(current.trace) === current.value ? current.trace : null;
     const bounds = plane.getBoundingClientRect();
     const next: InputRect[] = [];
     const ranges = validTrace

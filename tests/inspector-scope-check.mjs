@@ -36,12 +36,12 @@ try {
   }
   async function assertAllocationHistory() {
     for (const [name, before, allocated, count] of [['values', 2, 3, 6], ['prefix', 16, 17, 7]]) {
-      for (const [number, expected] of [[before, 'NaN'], [allocated, '0'], [before, 'NaN'], [allocated, '0']]) {
+      for (const [number, expected] of [[before, 'ND'], [allocated, '0'], [before, 'ND'], [allocated, '0']]) {
         await frame(number);
         const cells = scope.locator(`[data-variable="${name}"] .array-cell .motion-value`);
         assert.deepEqual(await cells.evaluateAll(nodes => nodes.map(node => node.dataset.value)), Array(count).fill(expected), `${name} at frame ${number} restores every ${expected} slot`);
         assert.deepEqual(await cells.allTextContents(), Array(count).fill(expected), 'Rendered glyphs agree with the restored snapshot');
-        assert.equal(await scope.locator(`[data-variable="${name}"] .array-cell .is-unavailable`).count(), expected === 'NaN' ? count : 0);
+        assert.equal(await scope.locator(`[data-variable="${name}"] .array-cell .is-unavailable`).count(), expected === 'ND' ? count : 0);
       }
     }
   }
@@ -94,7 +94,7 @@ try {
   await page.getByRole('button', { name: 'Basic', exact: true }).click();
   assert.equal(await scope.count(), 0, 'No local values appear without the demo debug session');
   assert.deepEqual(errors, []);
-  console.log('PASS: current-frame-only inspector, all six add calls forward/backward, immediate caller removal, argument values, main restoration, loop scopes, NaN/zero DOM allocation roundtrips and unchanged stdin/output/history.');
+  console.log('PASS: current-frame-only inspector, all six add calls forward/backward, immediate caller removal, argument values, main restoration, loop scopes, ND/zero DOM allocation roundtrips and unchanged stdin/output/history.');
 } finally {
   await browser.close();
 }

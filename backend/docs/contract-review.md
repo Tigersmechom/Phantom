@@ -61,9 +61,13 @@ quotes and newlines in environment values are preserved literally.
 
 Source ranges use zero-based UTF-16 code-unit offsets and one-based UTF-16 line
 and column coordinates. Conversion helpers reject byte offsets inside a UTF-8
-code point and UTF-16 offsets inside a supplementary pair. `InputTrace.revision`
-must equal the submitted input text byte-for-byte; delivered pipe bytes are not
-treated as observed C++ extractions.
+code point and UTF-16 offsets inside a supplementary pair. Input revisions keep
+the exact text and an explicit parent revision; `exposedRanges` and
+`consumedRanges` are always tied to one revision and never move when a future
+suffix is edited. Delivered pipe bytes are not treated as observed C++
+extractions. The native transport-only profile may return `trace:null`; a
+semantic profile may return `status`, `activeRange`, and confirmed consumed
+ranges.
 
 Expression traces reject duplicate stage/group IDs, dangling dependencies,
 duplicate active IDs and dependency cycles. A range/document revision mismatch
@@ -72,13 +76,26 @@ debugger observations or source locations.
 
 The current Linux GDB adapter gives the inferior fd 0/1/2 through a trusted
 `phantom-io-wrapper` and private one-shot FIFOs. Submitted input is written
-once and the backend closes the write side after the exact bytes are delivered;
-it is reported as `transport-only`, and the byte count is not presented as proof
-that `cin` or a raw read consumed it. NUL bytes, unterminated input and long
-lines are ordinary pipe data subject only to the DTO input budget. stdout and
-stderr are drained independently, each with its own bounded retained snapshot
-and truncation metadata. If the helper is unavailable, launch fails closed
-instead of silently falling back to a merged PTY profile.
+through a bounded transport cursor; an open interactive session may append
+future text without closing the writer. The adapter reports
+`tracking:"transport-only"`: `deliveredBytes` is only a pipe-write count, not
+proof that `cin` or a raw read consumed it. The target contract classifies a
+blocked source step as `input-wait` when the stop is inside the inferior's stdin
+read path; the current native implementation still has the old
+`STEP_TIMEOUT` fallback until that classifier and resume path are implemented.
+NUL bytes, unterminated input and long lines
+are ordinary pipe data subject only to the DTO input budget. stdout and stderr
+are drained independently, each with its own bounded retained snapshot and
+truncation metadata. If the helper is unavailable, launch fails closed instead
+of silently falling back to a merged PTY profile.
+
+The optional `stdout.buffered` snapshot separates `pendingBytes`, the active
+write-window capacity/remaining fields, and physical `storageCapacityBytes`.
+The active write window is based on glibc `_IO_write_base.._IO_write_end`; the
+physical storage is `_IO_buf_base.._IO_buf_end`. `capacityBytes` and
+`remainingCapacityBytes` are compatibility aliases for the write-window fields.
+The snapshot is an instantaneous ABI-specific observation and does not promise
+that the same number of bytes will be written before the next flush.
 
 The ready handshake keeps the parent stdin writer open until the wrapper has
 opened its reader, including for empty input. It then removes the bootstrap
@@ -100,11 +117,15 @@ GDB requires shell quoting of the wrapper paths; the helper executes the target
 directly after redirecting descriptors. This follows the documented
 [GDB exec-wrapper lifecycle](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
 
-## Compatibility extensions kept out of v1
+## Compatibility extensions and capability gating
 
 The optional `kind:"connect"` and `workspace` members belong to the NDJSON
-envelope only. They are not added to the frontend DTO. Future interactive stdin,
-new command kinds, mutation/audit records, operation/capture manifests, object
-identity, thread ordering, build feature manifests and performance evidence
-require a versioned DTO/fixture change. Until then, corresponding commands or
-fields fail closed with `UNSUPPORTED`/`INVALID_REQUEST`.
+envelope only. Interactive stdin is now an implemented native capability, while
+semantic input ranges, operation/capture manifests, object identity, thread
+ordering, build feature manifests and performance evidence remain capability
+gated extensions. A client must inspect `capabilities.inputTracking` before
+using `revision`, `exposedRanges`, `consumedRanges` or `activeRange`; absent
+coverage is represented by `null`/`none`, never inferred from pipe counters.
+New command kinds and mutation/audit records still require a versioned
+DTO/fixture change. Unsupported commands or fields fail closed with
+`UNSUPPORTED`/`INVALID_REQUEST`.
