@@ -163,7 +163,7 @@ mapping snapshot and a unified output harness are the current implementation
 slice. The contracts below describe subsequent integration boundaries, **not
 new accepted request kinds**. Names are provisional until DTOs, runtime
 validation, capability checks and fixtures land together. See the complete
-acceptance matrix and order in [handoff §18](../../docs/BACKEND_HANDOFF.md#18-дополнение-04102026-память-вывод-и-расширенный-gdb).
+acceptance matrix and order in [handoff §20](../../docs/BACKEND_HANDOFF.md#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
 The native mapping entry point is `capabilities.memoryMap:'linux-proc-maps'`
 and `StopObservationDTO.memoryMap:MemoryMapSnapshotDTO`, carrying availability,
