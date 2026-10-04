@@ -89,6 +89,9 @@ struct GdbStop {
   // unavailable status rather than guessing.
   nlohmann::json stdoutBufferedSnapshot = nlohmann::json::object();
   nlohmann::json stderrSnapshot = nlohmann::json::object();
+  // All mapped virtual regions, captured while the inferior is stopped.
+  // Contents remain separately bounded readMemory requests at this stop.
+  nlohmann::json memoryMap = nullptr;
   // The complete stop record is retained for the owning service to attach a
   // stopId/stateRevision and to create an immutable history point.
   nlohmann::json raw = nlohmann::json::object();

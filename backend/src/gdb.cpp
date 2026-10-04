@@ -1,4 +1,5 @@
 #include "phantom/gdb.hpp"
+#include "phantom/memory_map.hpp"
 
 #include "phantom/mi.hpp"
 #include "phantom/process.hpp"
@@ -546,6 +547,59 @@ struct GdbEngine::Impl {
     feedInput();
   }
 
+  // Read a bounded pending window, never execute a streambuf method in the
+  // inferior. Metadata can remain useful even if bytes are unavailable.
+  nlohmann::json captureBufferText(nlohmann::json result, std::uint64_t base,
+                                    std::uint64_t count, std::string_view prefix) {
+    if (count == 0) return result;
+    const auto maxProbeBytes = std::min<std::size_t>(options.maxOutputBytes, 64u * 1024u);
+    const auto failText = [&](std::string_view reason) {
+      result["retainedFromByte"] = count;
+      result["truncated"] = true;
+      result["textStatus"] = "unavailable";
+      result["textReason"] = std::string(prefix) + std::string(reason);
+      return result;
+    };
+    if (count > maxProbeBytes || base > std::numeric_limits<std::uint64_t>::max() - count)
+      return failText("-buffer-too-large");
+    std::ostringstream address;
+    address << "0x" << std::hex << base;
+    MiRecord record;
+    GdbError error;
+    if (!command("-data-read-memory-bytes " + address.str() + " " + std::to_string(count), false, record, error))
+      return failText("-buffer-read-failed");
+    std::string bytes;
+    if (const auto* memory = field(record.fields, "memory")) {
+      const auto appendCell = [&](const MiValue* cell) {
+        return cell && appendHexBytes(valText(field(*cell, "contents")), bytes);
+      };
+      if (!memory->values.empty()) {
+        for (const auto& cell : memory->values)
+          if (!appendCell(cell.get())) return failText("-buffer-malformed");
+      } else {
+        for (const auto& [key, cell] : memory->fields)
+          if (!appendCell(cell.get())) return failText("-buffer-malformed");
+      }
+    }
+    if (bytes.size() != count) return failText("-buffer-read-incomplete");
+    result["text"] = displayUtf8(bytes);
+    return result;
+  }
+
+  bool stdoutFeedsOwnedTransport() const {
+    int pid = 0;
+    const auto parsed = std::from_chars(inferiorPid.data(), inferiorPid.data() + inferiorPid.size(), pid);
+    if (stdoutFd < 0 || parsed.ec != std::errc{} ||
+        parsed.ptr != inferiorPid.data() + inferiorPid.size() || pid <= 0) return false;
+    struct stat expected{}, actual{};
+    const auto path = "/proc/" + std::to_string(pid) + "/fd/1";
+    // FILE* identity and _fileno alone survive freopen/dup2. Pending bytes
+    // belong in captured stdout only if the descriptor still targets our FIFO.
+    return ::fstat(stdoutFd, &expected) == 0 && S_ISFIFO(expected.st_mode) &&
+        ::stat(path.c_str(), &actual) == 0 && S_ISFIFO(actual.st_mode) &&
+        actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino;
+  }
+
   // glibc keeps bytes written through the C stdout stream (and through a
   // synchronised std::cout) in stdout's _IO_FILE write window until a flush.
   // GDB can inspect that window while the inferior is stopped. This is
@@ -558,6 +612,7 @@ struct GdbEngine::Impl {
       return nlohmann::json{{"available", false}, {"reason", std::move(reason)}};
     };
     if (!process || !live) return unavailable("no-live-inferior");
+    if (!stdoutFeedsOwnedTransport()) return unavailable("stdout-sink-unavailable");
     const auto evaluate = [&](std::string_view expression, std::string& value) {
       MiRecord record;
       GdbError error;
@@ -649,59 +704,129 @@ struct GdbEngine::Impl {
         {"retainedFromByte", 0},
         {"truncated", false}};
     if (!metadataAvailable) result["metadataReason"] = "stdout-buffer-not-initialized";
-    // No pending bytes is useful information too: direct write(2), flushed
-    // cout, and unbuffered/line-buffered streams should not make the field
-    // disappear.  Keep the runtime status in the snapshot even in this case.
-    if (count == 0) return result;
-    // GDB/MI returns the memory contents in one result record. Keep the
-    // optional probe well below the 1 MiB MI record limit even when the
-    // retained stdout budget is larger; a huge buffered write is reported as
-    // unavailable rather than risking a fatal parser overflow.
-    const auto maxProbeBytes = std::min<std::size_t>(options.maxOutputBytes, 64u * 1024u);
-    if (count > maxProbeBytes || *base > std::numeric_limits<std::uint64_t>::max() - count) {
-      result["retainedFromByte"] = count;
-      result["truncated"] = true;
-      result["textStatus"] = "unavailable";
-      result["textReason"] = "stdout-buffer-too-large";
-      result["available"] = true;
+    return captureBufferText(std::move(result), *base, count, "stdout");
+  }
+
+  // The libstdc++ Linux LP64 ABI is usable even when the installed library
+  // has no DWARF (std::cout is commonly an incomplete type in GDB). This
+  // profile uses its stable object layout, guarded by target pointer sizes,
+  // ostream vtable/virtual-base geometry and the ACTUAL rdbuf RTTI. Hidden
+  // stdio_filebuf vtables are identified through their exported typeinfo.
+  // A custom/redirected rdbuf must never be mislabeled as pending stdout.
+  // Layout references: libstdc++ basic_ios.h, streambuf, fstream,
+  // config/io/basic_file_stdio.h and ext/stdio_sync_filebuf.h; RTTI uses the
+  // Itanium C++ ABI. No user expressions or inferior function calls occur.
+  nlohmann::json captureBufferedCout(const nlohmann::json& cStdout) {
+    const auto unavailable = [](std::string reason) {
+      return nlohmann::json{{"available", false}, {"reason", std::move(reason)}};
+    };
+    const auto number = [&](const std::string& expression) -> std::optional<std::uint64_t> {
+      MiRecord record;
+      GdbError error;
+      if (!command("-data-evaluate-expression " + miQuote("(unsigned long)(" + expression + ")"),
+                   false, record, error)) return std::nullopt;
+      return parseUnsigned(valText(field(record.fields, "value")));
+    };
+    if (!process || !live) return unavailable("no-live-inferior");
+    if (!stdoutFeedsOwnedTransport()) return unavailable("cout-stdout-sink-unavailable");
+    const auto supported = number("sizeof(void*) == 8 && sizeof(long) == 8 && sizeof(int) == 4");
+    const auto coutAddress = number("&'_ZSt4cout'");
+    const auto ostreamVtable = number("&'_ZTVSo'");
+    constexpr auto maxAddress = std::numeric_limits<std::uint64_t>::max();
+    if (!supported || *supported != 1 || !coutAddress || !ostreamVtable ||
+        *coutAddress > maxAddress - 264 || *ostreamVtable > maxAddress - 64)
+      return unavailable("cout-runtime-unavailable");
+    const auto word = [&](std::uint64_t address, std::size_t offset = 0) -> std::optional<std::uint64_t> {
+      if (address == 0 || address > std::numeric_limits<std::uint64_t>::max() - offset)
+        return std::nullopt;
+      return number("*(unsigned long*)" + std::to_string(address + offset));
+    };
+    const auto primaryVptr = word(*coutAddress);
+    const auto virtualBaseVptr = word(*coutAddress, 8);
+    // basic_ostream has one virtual basic_ios base, at offset 8 in this ABI.
+    // Its vtable address points 24 bytes past the vbase/offset/RTTI prefix.
+    if (!primaryVptr || !virtualBaseVptr || *primaryVptr != *ostreamVtable + 24 ||
+        *virtualBaseVptr != *ostreamVtable + 64 ||
+        word(*ostreamVtable) != std::optional<std::uint64_t>(8))
+      return unavailable("cout-layout-unsupported");
+    const auto streambuf = word(*coutAddress, 240);  // basic_ios::_M_streambuf
+    if (!streambuf || *streambuf == 0) return unavailable("cout-streambuf-unavailable");
+    if ((*streambuf & 7u) != 0 || *streambuf > maxAddress - 208)
+      return unavailable("cout-streambuf-layout-unsupported");
+    const auto vptr = word(*streambuf);
+    if (!vptr || *vptr < 16 || (*vptr & 7u) != 0) return unavailable("cout-streambuf-layout-unsupported");
+    const auto typeinfo = word(*vptr - 8);
+    if (!typeinfo || word(*vptr - 16) != std::optional<std::uint64_t>(0))
+      return unavailable("cout-streambuf-layout-unsupported");
+    const auto syncTypeinfo = number("&'_ZTIN9__gnu_cxx18stdio_sync_filebufIcSt11char_traitsIcEEE'");
+    const auto fileTypeinfo = number("&'_ZTIN9__gnu_cxx13stdio_filebufIcSt11char_traitsIcEEE'");
+    const bool synchronized = syncTypeinfo && *typeinfo == *syncTypeinfo;
+    if (!synchronized && (!fileTypeinfo || *typeinfo != *fileTypeinfo))
+      return unavailable("cout-custom-streambuf-unsupported");
+    const auto stdoutAddress = number("&'_IO_2_1_stdout_'");
+    const auto file = word(*streambuf, synchronized ? 64 : 104);
+    if (!stdoutAddress || !file || *file != *stdoutAddress)
+      return unavailable("cout-streambuf-not-stdout");
+    const auto flags = number("*(unsigned int*)" + std::to_string(*coutAddress + 32));
+    if (!flags) return unavailable("cout-layout-unsupported");
+    const bool unitbuf = (*flags & 0x2000u) != 0;
+    if (synchronized) {
+      if (!cStdout.value("available", false)) return unavailable("cout-stdout-buffer-unavailable");
+      auto result = cStdout;
+      result["stream"] = "cout";
+      // This is an explicit identity relationship, not a text comparison.
+      result["association"] = "cout-synchronized";
+      if (unitbuf) result["flushPolicy"] = "every-write";
       return result;
     }
-    std::ostringstream address;
-    address << "0x" << std::hex << *base;
-    MiRecord record;
-    GdbError error;
-    if (!command("-data-read-memory-bytes " + address.str() + " " + std::to_string(count), false, record, error)) {
-      result["textStatus"] = "unavailable";
-      result["textReason"] = "stdout-buffer-read-failed";
-      return result;
-    }
-    std::string bytes;
-    if (const auto* memory = field(record.fields, "memory")) {
-      auto appendCell = [&](const MiValue* cell) {
-        if (!cell) return true;
-        return appendHexBytes(valText(field(*cell, "contents")), bytes);
-      };
-      if (!memory->values.empty()) {
-        for (const auto& cell : memory->values) if (!appendCell(cell.get())) {
-          result["textStatus"] = "unavailable";
-          result["textReason"] = "stdout-buffer-malformed";
-          return result;
-        }
-      } else {
-        for (const auto& [key, cell] : memory->fields) if (!appendCell(cell.get())) {
-          result["textStatus"] = "unavailable";
-          result["textReason"] = "stdout-buffer-malformed";
-          return result;
-        }
-      }
-    }
-    if (bytes.size() != count) {
-      result["textStatus"] = "unavailable";
-      result["textReason"] = "stdout-buffer-read-incomplete";
-      return result;
-    }
-    result["text"] = displayUtf8(bytes);
-    return result;
+    // basic_filebuf's put area contains INTERNAL characters. A user codecvt
+    // can transform/expand them during flush, so they are not confirmed
+    // pending stdout bytes. Only the exact standard char no-conversion facet
+    // is supported; inspecting its vtable/RTTI avoids a virtual inferior call.
+    const auto codecvt = word(*streambuf, 200);
+    const auto codecvtVtable = number("&'_ZTVSt7codecvtIcc11__mbstate_tE'");
+    const auto codecvtTypeinfo = number("&'_ZTISt7codecvtIcc11__mbstate_tE'");
+    if (!codecvt || *codecvt == 0 || !codecvtVtable || !codecvtTypeinfo ||
+        *codecvtVtable > maxAddress - 16 ||
+        word(*codecvt) != std::optional<std::uint64_t>(*codecvtVtable + 16) ||
+        word(*codecvtVtable) != std::optional<std::uint64_t>(0) ||
+        word(*codecvtVtable, 8) != codecvtTypeinfo)
+      return unavailable("cout-codecvt-unsupported");
+    // glibc's FILE layout is inspected by name when its debug type exists;
+    // stdout identity, narrow orientation and fd 1 must still be proven.
+    const auto fileValid = number("((struct _IO_FILE*)&'_IO_2_1_stdout_')->_fileno == 1 && "
+        "((struct _IO_FILE*)&'_IO_2_1_stdout_')->_mode <= 0 && "
+        "(((struct _IO_FILE*)&'_IO_2_1_stdout_')->_flags & 0xffff0000u) == 0xfbad0000u");
+    const auto mode = number("*(unsigned int*)" + std::to_string(*streambuf + 120));
+    const auto base = word(*streambuf, 32);      // basic_streambuf::_M_out_beg
+    const auto pointer = word(*streambuf, 40);   // basic_streambuf::_M_out_cur
+    const auto end = word(*streambuf, 48);       // basic_streambuf::_M_out_end
+    const auto storage = word(*streambuf, 152); // basic_filebuf::_M_buf
+    const auto capacity = word(*streambuf, 160);// basic_filebuf::_M_buf_size
+    constexpr std::uint64_t maxSafeInteger = 9007199254740991ULL;
+    if (!fileValid || *fileValid != 1 || !mode || (*mode & 16) == 0 || (*mode & 8) != 0 ||
+        !base || !pointer || !end || !storage || !capacity || *capacity > maxSafeInteger ||
+        *pointer < *base || *end < *pointer ||
+        (*base == 0 && (*pointer != 0 || *end != 0)) ||
+        (*storage == 0 && *base != 0) ||
+        (*storage != 0 && *capacity > std::numeric_limits<std::uint64_t>::max() - *storage) ||
+        (*base != 0 && (*base < *storage || *end > *storage + *capacity)))
+      return unavailable("cout-buffer-range-unavailable");
+    const auto count = *pointer - *base;
+    const auto window = *end - *base;
+    const auto remaining = *end - *pointer;
+    // unitbuf flushes after ostream operations, but the streambuf can still
+    // have a put area. Keep physical capacity separate from flush policy.
+    nlohmann::json result = {{"available", true}, {"source", "libstdc++-stdio_filebuf"},
+        {"stream", "cout"}, {"association", "cout-unsynchronized"},
+        {"mode", "full"}, {"flushPolicy", unitbuf ? "every-write" : "buffer-full-or-explicit"},
+        {"pendingBytes", count}, {"writeWindowCapacityBytes", window},
+        {"writeWindowRemainingBytes", remaining}, {"capacityBytes", window},
+        {"remainingCapacityBytes", remaining},
+        {"storageCapacityBytes", *storage != 0 ? nlohmann::json(*capacity) : nlohmann::json(nullptr)},
+        {"metadataAvailable", true}, {"text", ""}, {"totalBytes", count},
+        {"retainedFromByte", 0}, {"truncated", false}};
+    return captureBufferText(std::move(result), *base, count, "cout");
   }
 
   void captureIo(GdbStop& result) {
@@ -728,17 +853,30 @@ struct GdbEngine::Impl {
     };
     result.stdoutSnapshot = snapshot(stdoutOutput, stdoutTotalBytes);
     result.stderrSnapshot = snapshot(stderrOutput, stderrTotalBytes);
-    if (!result.exited) {
+    if (!result.exited && result.location.is_null()) {
+      // An interrupt inside a flush can observe bytes already written into
+      // the FIFO while the native put pointers still include them. Until
+      // execution returns to submitted source, do not claim those windows
+      // are disjoint from transported output. The caller location may later
+      // be promoted for an input wait, but this decision uses the actual PC.
+      const nlohmann::json unavailable = {{"available", false},
+          {"reason", "output-state-unconfirmed-at-runtime-stop"}};
+      result.stdoutBufferedSnapshot = unavailable;
+      result.stdoutSnapshot["buffered"] = unavailable;
+      result.stdoutSnapshot["coutBuffered"] = unavailable;
+    } else if (!result.exited) {
       const auto buffered = captureBufferedStdout();
       // Keep the optional extension absent for a stop where stdout's runtime
       // buffer has not even been initialized. This preserves the v1 output
       // shape for ordinary programs while still reporting a confirmed empty
       // buffer after a real cout interaction (metadataAvailable=true).
       if (buffered.is_object() && buffered.contains("available") &&
-          (buffered.value("pendingBytes", 0ULL) != 0 || buffered.value("metadataAvailable", false))) {
+          (!buffered.value("available", false) || buffered.value("pendingBytes", 0ULL) != 0 ||
+           buffered.value("metadataAvailable", false))) {
         result.stdoutBufferedSnapshot = buffered;
         result.stdoutSnapshot["buffered"] = buffered;
       }
+      result.stdoutSnapshot["coutBuffered"] = captureBufferedCout(buffered);
     }
     {
       std::lock_guard inputLock(inputMutex);
@@ -1358,6 +1496,16 @@ struct GdbEngine::Impl {
     // for a stack here can yield a misleading stale frame or a secondary
     // READ_FAILED error.
     if (!result.exited && !snapshotStack(result, e)) return false;
+    if (result.exited) {
+      result.memoryMap = {{"available", false}, {"source", "linux-proc-maps"},
+                          {"coverage", "none"}, {"regions", nlohmann::json::array()},
+                          {"reason", "process-exited"}};
+    } else {
+      int pid = 0;
+      const auto parsed = std::from_chars(inferiorPid.data(), inferiorPid.data() + inferiorPid.size(), pid);
+      result.memoryMap = readLinuxMemoryMap(parsed.ec == std::errc{} &&
+          parsed.ptr == inferiorPid.data() + inferiorPid.size() ? pid : 0);
+    }
     // At an inferior stop its completed writes are already queued in the
     // kernel. Capture that backlog without a sleep or EOF heuristic.
     captureIo(result);

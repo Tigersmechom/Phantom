@@ -69,7 +69,9 @@ class Client:
         if frame.get("payload", {}).get("kind") == "observation":
             self.observation = frame["payload"]["observation"]
             for stream in ("stdout", "stderr"):
-                assert set(self.observation[stream]) == {"text", "totalBytes", "retainedFromByte", "truncated"}, self.observation
+                required = {"text", "totalBytes", "retainedFromByte", "truncated"}
+                optional = {"buffered", "coutBuffered"} if stream == "stdout" else set()
+                assert required <= set(self.observation[stream]) <= required | optional, self.observation
         return frame
 
     def query(self, command: dict) -> dict:

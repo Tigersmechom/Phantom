@@ -98,7 +98,7 @@ def main() -> int:
                 {
                     "protocolVersion", "backendName", "backendVersion", "architectures", "stepKinds",
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
-                    "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead",
+                    "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits",
                 },
                 "BackendCapabilitiesDTO",
@@ -187,7 +187,7 @@ def main() -> int:
             observation = event_frames[0]["payload"]["observation"]
             require_keys(
                 observation,
-                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage"},
+                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage", "memoryMap"},
                 "StopObservationDTO",
             )
             require_keys(event_frames[1]["payload"]["state"], {"session", "phase", "processInstanceId", "buildId", "live", "exit"}, "DebugSessionStateDTO")

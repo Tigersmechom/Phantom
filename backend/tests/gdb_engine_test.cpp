@@ -217,6 +217,174 @@ void testBufferedStdout(const GdbOptions& options, GdbLaunchRequest request) {
   testBufferedMode(options, request, "cout-full", std::string(4096, 'x'), "x", "full", 4096, 4095);
 }
 
+void testCoutStreambuf(GdbOptions options, GdbLaunchRequest request,
+                      const std::string& mode, bool textLimited = false) {
+  if (textLimited) options.maxOutputBytes = 8;
+  request.argv = {mode};
+  GdbEngine engine(options);
+  GdbStop stop;
+  launch(engine, request, stop);
+  const auto& source = request.sourceBundle.documents.front().text;
+  const auto marker = source.find("  asm volatile(\"\" : : \"r\"(phase)");
+  require(marker != std::string::npos, "streambuf checkpoint is missing");
+  const auto line = 1 + std::count(source.begin(), source.begin() + marker, '\n');
+  Json breakpoints;
+  GdbError error;
+  require(engine.setBreakpoints({{"documentId", "fixture"}, {"breakpoints", Json::array({
+    {{"id", "streambuf"}, {"documentId", "fixture"}, {"enabled", true},
+     {"range", {{"start", {{"line", line}, {"column", 1}}},
+                {"end", {{"line", line}, {"column", 1}}}}}}
+  })}}, breakpoints, error), "cannot set streambuf checkpoint: " + error.message);
+  const auto checkpoint = [&] {
+    require(engine.resume("continue", stop, error) && stop.stopped && !stop.exited,
+            "cannot reach streambuf checkpoint: " + error.message);
+    require(stop.stdoutSnapshot.contains("coutBuffered"),
+            "missing cout runtime status: " + stop.stdoutSnapshot.dump());
+  };
+  checkpoint();
+  if (mode == "streambuf-library-stop") {
+    require(stop.signalName == "SIGSTOP" && stop.location.is_null(),
+            "library-stop fixture did not stop at a real runtime PC");
+    const auto requireUnconfirmed = [&] {
+      for (const auto* field : {"buffered", "coutBuffered"}) {
+        const auto& buffer = stop.stdoutSnapshot.at(field);
+        require(buffer.at("available") == false &&
+                buffer.at("reason") == "output-state-unconfirmed-at-runtime-stop" &&
+                !buffer.contains("pendingBytes") && !buffer.contains("text"),
+                "runtime stop fabricated pending bytes: " + buffer.dump());
+      }
+      require(stop.stdoutSnapshot.at("text") == "", "runtime buffer inspection flushed the target");
+    };
+    requireUnconfirmed();
+    checkpoint();
+    // GDB can expose both the SIGSTOP delivery stop and the resulting Linux
+    // group stop. Both are genuine runtime stops; the next resume reaches
+    // our user-source checkpoint without suppressing the inferior's signal.
+    if (stop.signalName == "SIGSTOP" && stop.location.is_null()) {
+      requireUnconfirmed();
+      checkpoint();
+    }
+    require(!stop.location.is_null() &&
+            stop.stdoutSnapshot.at("coutBuffered").at("available") == true &&
+            stop.stdoutSnapshot.at("coutBuffered").at("text") == "pending-cout" &&
+            stop.stdoutSnapshot.at("buffered").at("text") == "pending-C" &&
+            stop.stdoutSnapshot.at("text") == "", "source stop did not restore confirmed output windows: " +
+                stop.signalName + " " + stop.location.dump() + " " + stop.stdoutSnapshot.dump());
+    require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0 &&
+            stop.stdoutSnapshot.at("text") == "pending-coutpending-C", "runtime stop changed flush results");
+    return;
+  }
+  const auto& pending = stop.stdoutSnapshot.at("coutBuffered");
+  if (mode == "streambuf-codecvt") {
+    require(pending.at("available") == false && pending.at("reason") == "cout-codecvt-unsupported" &&
+            stop.stdoutSnapshot.at("text") == "" && stop.stdoutSnapshot.at("buffered").at("text") == "C-only",
+            "custom codecvt internal characters were mislabeled as stdout bytes: " + stop.stdoutSnapshot.dump());
+    checkpoint();
+    require(stop.stdoutSnapshot.at("coutBuffered").at("available") == false &&
+            stop.stdoutSnapshot.at("coutBuffered").at("reason") == "cout-codecvt-unsupported" &&
+            stop.stdoutSnapshot.at("text") == "aabb",
+            "custom codecvt was called by inspection or its real expansion was lost");
+    checkpoint();
+    require(stop.stdoutSnapshot.at("coutBuffered").at("available") == true &&
+            stop.stdoutSnapshot.at("coutBuffered").at("pendingBytes") == 0 &&
+            stop.stdoutSnapshot.at("text") == "aabb", "restoring the standard codecvt was not detected");
+    require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0 &&
+            stop.stdoutSnapshot.at("text") == "aabbC-only", "custom codecvt probe changed program behavior");
+    return;
+  }
+  if (mode == "streambuf-sink-sync" || mode == "streambuf-sink-unsync") {
+    require(pending.at("available") == false && pending.at("reason") == "cout-stdout-sink-unavailable" &&
+            stop.stdoutSnapshot.at("buffered").at("available") == false &&
+            stop.stdoutSnapshot.at("buffered").at("reason") == "stdout-sink-unavailable" &&
+            stop.stdoutSnapshot.at("text") == "",
+            "redirected fd 1 was incorrectly attributed to captured stdout: " + stop.stdoutSnapshot.dump());
+    checkpoint();
+    require(stop.stdoutSnapshot.at("buffered").at("available") == true &&
+            stop.stdoutSnapshot.at("coutBuffered").at("available") == true &&
+            stop.stdoutSnapshot.at("buffered").at("pendingBytes") == 0 &&
+            stop.stdoutSnapshot.at("coutBuffered").at("pendingBytes") == 0 &&
+            stop.stdoutSnapshot.at("text") == "",
+            "restored transport kept stale unsupported/pending data: " + stop.stdoutSnapshot.dump());
+    checkpoint();
+    require(stop.stdoutSnapshot.at("text") == "restored", "redirected private output leaked into captured stdout");
+    require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+            "sink validation disturbed descriptor restoration");
+    return;
+  }
+  if (mode == "streambuf-custom" || mode == "streambuf-null" || mode == "streambuf-redirected") {
+    const auto reason = mode == "streambuf-custom" ? "cout-custom-streambuf-unsupported" :
+        mode == "streambuf-null" ? "cout-streambuf-unavailable" : "cout-streambuf-not-stdout";
+    require(pending.at("available") == false && pending.at("reason") == reason && !pending.contains("text"),
+            "custom/redirected cout was incorrectly reported as stdout: " + pending.dump());
+    if (mode == "streambuf-custom")
+      require(stop.stdoutSnapshot.at("buffered").at("text") == "C-only",
+              "custom cout prevented independent C stdout inspection");
+    // Restoring rdbuf and reaching normal exit must remain safe after probing.
+    require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+            "streambuf inspection disturbed replacement/restoration");
+    return;
+  }
+  require(pending.at("available") == true && pending.at("stream") == "cout",
+          "cout buffer unavailable for " + mode + ": " + pending.dump());
+  const bool synchronized = mode == "streambuf-sync" || mode == "streambuf-sync-unitbuf";
+  const bool unitbuf = mode == "streambuf-unitbuf" || mode == "streambuf-sync-unitbuf";
+  const auto payload = mode == "streambuf-large" ? std::string(7000, 'x') :
+      std::string("C++\xf0\x9f\x98\x80\xd0\x96\n");
+  const auto expected = (mode == "streambuf-empty" || unitbuf ? std::string{} : payload) +
+      (synchronized ? "C-only" : "");
+  require(pending.at("source") == (synchronized ? "glibc-_IO_FILE" : "libstdc++-stdio_filebuf") &&
+          pending.at("association") == (synchronized ? "cout-synchronized" : "cout-unsynchronized") &&
+          pending.at("pendingBytes") == expected.size() && pending.at("totalBytes") == expected.size(),
+          "incorrect cout identity/byte metadata for " + mode + ": " + pending.dump());
+  if (textLimited) {
+    require(pending.at("textStatus") == "unavailable" && pending.at("truncated") == true &&
+            pending.at("retainedFromByte") == expected.size() && pending.at("text") == "",
+            "large pending window was silently truncated or exposed beyond budget");
+    (void)engine.stopAndSnapshot();
+    return;
+  }
+  require(pending.at("text") == expected, "pending cout text/UTF-8 mismatch for " + mode + ": " + pending.dump());
+  require(pending.at("pendingBytes").get<std::uint64_t>() +
+              pending.at("writeWindowRemainingBytes").get<std::uint64_t>() ==
+          pending.at("writeWindowCapacityBytes").get<std::uint64_t>() &&
+          pending.at("storageCapacityBytes").get<std::uint64_t>() >=
+              pending.at("writeWindowCapacityBytes").get<std::uint64_t>(),
+          "cout write window/storage invariants failed: " + pending.dump());
+  if (synchronized) {
+    auto shared = pending;
+    shared["stream"] = "stdout";
+    shared["association"] = "cout-if-synchronized";
+    // Shared pending bytes/storage identity does not equate per-ostream
+    // sentry flush policy: unitbuf flushes cout after each output operation.
+    shared["flushPolicy"] = stop.stdoutSnapshot.at("buffered").at("flushPolicy");
+    require(shared == stop.stdoutSnapshot.at("buffered"), "synchronized alias disagrees with C stdout");
+  } else if (mode != "streambuf-empty") {
+    require(stop.stdoutSnapshot.at("buffered").at("text") == "C-only",
+            "independent C pending bytes leaked into cout");
+  }
+  if (mode == "streambuf-empty") {
+    require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+            "empty cout buffer inspection disturbed exit");
+    return;
+  }
+  require(stop.stdoutSnapshot.at("text") == (unitbuf ? payload : ""),
+          "probe flushed the inferior, or unitbuf policy was ignored");
+  if (unitbuf) require(pending.at("flushPolicy") == "every-write", "unitbuf policy missing");
+  checkpoint();
+  require(stop.stdoutSnapshot.at("coutBuffered").at("pendingBytes") == 0 &&
+          stop.stdoutSnapshot.at("coutBuffered").at("text") == "" &&
+          stop.stdoutSnapshot.at("text") == payload + (synchronized ? "C-only" : ""),
+          "cout flush was not reflected atomically: " + stop.stdoutSnapshot.dump());
+  require(stop.stdoutSnapshot.at("buffered").at("text") == (synchronized ? "" : "C-only"),
+          "cout flush incorrectly flushed the independent C buffer");
+  checkpoint();
+  require(stop.stdoutSnapshot.at("buffered").at("pendingBytes") == 0 &&
+          stop.stdoutSnapshot.at("coutBuffered").at("pendingBytes") == 0 &&
+          stop.stdoutSnapshot.at("text") == payload + "C-only", "final independent flush order incorrect");
+  require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+          "streambuf probes disturbed exit");
+}
+
 void testTimeoutAndReuse(const GdbOptions& options, const GdbLaunchRequest& request) {
   GdbEngine engine(options);
   GdbStop stopped;
@@ -247,7 +415,12 @@ void testTimeoutAndReuse(const GdbOptions& options, const GdbLaunchRequest& requ
   require(final.exited && !final.stopped && final.reason == "stop", "invalid explicit-stop status");
   require(final.processInstanceId == std::to_string(replacementPid), "stop lost inferior identity");
   require(final.stack.empty() && final.location.is_null(), "stop returned stale stack/location");
-  require(final.stdoutSnapshot == stopped.stdoutSnapshot && final.stderrSnapshot == stopped.stderrSnapshot,
+  auto transmittedStdout = stopped.stdoutSnapshot;
+  transmittedStdout.erase("buffered");
+  transmittedStdout.erase("coutBuffered");
+  // Killing a process does not flush its userspace buffers; only transported
+  // bytes survive. There must be no stale live-buffer claim after exit.
+  require(final.stdoutSnapshot == transmittedStdout && final.stderrSnapshot == stopped.stderrSnapshot,
           "explicit stop discarded the last stream snapshot");
   require(final.input.at("tracking") == "transport-only" && final.input.at("deliveredBytes") == 0,
           "explicit stop returned invalid input tracking");
@@ -426,6 +599,13 @@ int main(int argc, char** argv) {
     request.sourceBundle = {"fixture-bundle", {{"fixture", "fixture-revision", source, readFile(source)}}};
     testMissingWrapper(options, request);
     testBufferedStdout(options, request);
+    for (const auto* mode : {"streambuf-sync", "streambuf-unsync", "streambuf-resync",
+                             "streambuf-empty", "streambuf-unitbuf", "streambuf-large",
+                             "streambuf-custom", "streambuf-null", "streambuf-redirected", "streambuf-codecvt",
+                             "streambuf-library-stop",
+                             "streambuf-sync-unitbuf", "streambuf-sink-sync", "streambuf-sink-unsync"})
+      testCoutStreambuf(options, request, mode);
+    testCoutStreambuf(options, request, "streambuf-large", true);
     testTimeoutAndReuse(options, request);
     testUtf8Tail(options, request);
     testFinalPipeBacklog(options, request);

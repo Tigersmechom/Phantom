@@ -11,6 +11,7 @@ find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
   src/gdb.cpp
+  src/memory_map.cpp
   src/mi.cpp
   src/process.cpp
   src/service.cpp
@@ -66,6 +67,17 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(phantom-memory-map-test tests/memory_map_test.cpp)
+  target_link_libraries(phantom-memory-map-test PRIVATE phantom-core)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(phantom-memory-map-test PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME memory-map COMMAND "$<TARGET_FILE:phantom-memory-map-test>")
+  set_tests_properties(memory-map PROPERTIES TIMEOUT 15)
+  add_test(NAME memory-gateway-integration
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/memory_gateway_integration.py"
+      "$<TARGET_FILE:phantom-backend>")
+  set_tests_properties(memory-gateway-integration PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   add_executable(phantom-gdb-test-fixture fixtures/gdb-test.cpp)
   target_compile_options(phantom-gdb-test-fixture PRIVATE -g -O0 -fno-omit-frame-pointer)
   # This target is the inferior, not the code under test. LeakSanitizer cannot

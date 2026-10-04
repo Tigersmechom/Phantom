@@ -182,18 +182,13 @@ export interface InputStateDTO {
     value?: RuntimeValueDTO;
   };
 }
-export interface OutputSnapshotDTO {
-  text: string;
-  totalBytes: number;
-  retainedFromByte: number;
-  truncated: boolean;
-  /** Optional bytes still held by a runtime buffer at this stop. */
-  buffered?: {
+/** ABI-qualified runtime storage at one stop; inspecting it never calls flush. */
+export type RuntimeBufferSnapshotDTO = {
     available: true;
-    /** This is the glibc C stdout stream; cout uses it only while synchronized. */
-    source: 'glibc-_IO_FILE';
-    stream: 'stdout';
-    association: 'cout-if-synchronized';
+    source: 'glibc-_IO_FILE' | 'libstdc++-stdio_filebuf';
+    stream: 'stdout' | 'cout';
+    /** cout-synchronized aliases the C buffer: never concatenate it twice. */
+    association: 'cout-if-synchronized' | 'cout-synchronized' | 'cout-unsynchronized';
     mode: 'full' | 'line' | 'unbuffered' | 'unknown';
     flushPolicy: 'buffer-full-or-explicit' | 'newline-or-explicit' | 'every-write' | 'unknown';
     pendingBytes: number;
@@ -215,7 +210,45 @@ export interface OutputSnapshotDTO {
     available: false;
     reason: string;
   };
+export interface OutputSnapshotDTO {
+  /** Already emitted bytes; immutable per historical snapshot. */
+  text: string;
+  totalBytes: number;
+  retainedFromByte: number;
+  truncated: boolean;
+  /** C stdout buffer. Separate pending domains have no implied total order. */
+  buffered?: RuntimeBufferSnapshotDTO;
+  /** Actual std::cout buffer, or an explicit unsupported/custom-rdbuf reason. */
+  coutBuffered?: RuntimeBufferSnapshotDTO;
 }
+export interface MemoryRegionDTO {
+  /** Virtual interval [start,end); strings retain the full native address. */
+  startAddressHex: string;
+  endAddressHex: string;
+  permissions: string;
+  offsetHex: string;
+  device: string;
+  inodeDecimal: string;
+  /** Exact kernel pathname spelling, including its escapes and deleted suffix. */
+  path: string | null;
+  pathBytesHex?: string;
+  kind: 'file' | 'heap' | 'stack' | 'anonymous' | 'special';
+}
+export type MemoryMapSnapshotDTO = {
+  available: true;
+  source: 'linux-proc-maps';
+  coverage: 'complete' | 'truncated';
+  regions: MemoryRegionDTO[];
+  reason?: 'byte-limit' | 'region-limit';
+} | {
+  available: false;
+  source: 'linux-proc-maps';
+  coverage: 'none';
+  regions: [];
+  reason: string;
+  detail?: string;
+  lineNumber?: number;
+};
 export interface StopObservationDTO {
   id: string;
   point: HistoryPointDTO;
@@ -231,6 +264,8 @@ export interface StopObservationDTO {
   input: InputStateDTO;
   stdout: OutputSnapshotDTO;
   stderr: OutputSnapshotDTO;
+  /** VMA metadata at this stop, not resident bytes or C++ allocation identity. */
+  memoryMap?: MemoryMapSnapshotDTO;
   expressions: ExpressionTraceDTO[];
   coverage: { variables: 'complete' | 'partial'; expressions: 'none' | 'partial' | 'observed'; memory: 'none' | 'partial' };
 }
@@ -273,6 +308,7 @@ export interface BackendCapabilitiesDTO {
   restore: 'none' | 'verified-replay';
   asm: { currentPc: boolean; sourceRange: boolean };
   memoryRead: boolean;
+  memoryMap?: 'linux-proc-maps' | 'none';
   eventReplay: boolean;
   limits: ResourceLimitsDTO;
 }

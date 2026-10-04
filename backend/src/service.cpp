@@ -105,7 +105,7 @@ Json BackendService::capabilities() const {
       {"hitCountBreakpoints", false}, {"variableWrite", false},
       {"inputTracking", "transport-only"}, {"interactiveInput", true}, {"expressionGroups", false}, {"history", true},
       {"restore", "none"}, {"asm", {{"currentPc", true}, {"sourceRange", false}}},
-      {"memoryRead", true}, {"eventReplay", true},
+      {"memoryRead", true}, {"memoryMap", "linux-proc-maps"}, {"eventReplay", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
                    {"maxResidentSnapshots", 4096},
@@ -177,6 +177,7 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   observation["location"] = stop.location;
   observation["threadId"] = stop.threadId.empty() ? Json(nullptr) : Json(stop.threadId);
   observation["stack"] = stop.stack.is_array() ? stop.stack : Json::array();
+  if (stop.memoryMap.is_object()) observation["memoryMap"] = stop.memoryMap;
   if (!observation.contains("input")) {
     auto input = defaultInput();
     if (stop.input.is_object()) for (auto it = stop.input.begin(); it != stop.input.end(); ++it) input[it.key()] = it.value();
