@@ -103,6 +103,20 @@ physical storage is `_IO_buf_base.._IO_buf_end`. `capacityBytes` and
 The snapshot is an instantaneous ABI-specific observation and does not promise
 that the same number of bytes will be written before the next flush.
 
+The October extension adds `stdout.coutBuffered` using the shared
+`RuntimeBufferSnapshotDTO`: source is `glibc-_IO_FILE` or
+`libstdc++-stdio_filebuf`, stream is `stdout` or `cout`, and association is
+`cout-if-synchronized`, `cout-synchronized` or `cout-unsynchronized`.
+Confirmed synchronized aliases are displayed once. Independent C and C++
+pending buffers do not establish a total emission order.
+The LP64 libstdc++ probe checks the actual rdbuf RTTI/layout, the standard
+no-conversion codecvt, and fd 1 against the owned transport FIFO. Redirected
+descriptors and custom conversion facets return explicit unavailable reasons.
+When the actual top PC is outside the submitted source, both pending snapshots
+are unavailable: a runtime stop can interrupt a flush after bytes were written
+but before its put pointers were reset. Promoting an input caller for display
+does not relax this guard. The profile was tested against libstdc++13.
+
 The ready handshake keeps the parent stdin writer open until the wrapper has
 opened its reader, including for empty input. It then removes the bootstrap
 reader so a target `close(0)` produces EPIPE. The owning command loop pumps at
@@ -140,3 +154,115 @@ chunks and EOF requests affect the current revision and EOF state only.
 New command kinds and mutation/audit records still require a versioned
 DTO/fixture change. Unsupported commands or fields fail closed with
 `UNSUPPORTED`/`INVALID_REQUEST`.
+
+## Frontend gateway roadmap (2026-10-04)
+
+The new requirements extend P1/P4/P5/P6; they do not replace the existing
+operation/lifetime and input plans. Unsynchronized `cout` inspection, a native
+mapping snapshot and a unified output harness are the current implementation
+slice. The contracts below describe subsequent integration boundaries, **not
+new accepted request kinds**. Names are provisional until DTOs, runtime
+validation, capability checks and fixtures land together. See the complete
+acceptance matrix and order in [handoff §18](../../docs/BACKEND_HANDOFF.md#18-дополнение-04102026-память-вывод-и-расширенный-gdb).
+
+The native mapping entry point is `capabilities.memoryMap:'linux-proc-maps'`
+and `StopObservationDTO.memoryMap:MemoryMapSnapshotDTO`, carrying availability,
+`source:'linux-proc-maps'`, `coverage:'complete'|'truncated'` and region
+metadata. This does not change `observation.coverage.memory` to captured:
+mapping metadata contains no memory bytes. The existing bounded `readMemory`
+command retains its `expectedStop` requirement. ELF/vtable overlays, richer
+diagnostics and the journal/profile/trace/intervention gateways remain future
+work as described below.
+
+| Gateway | Proposed data and invariants | Dependencies |
+| --- | --- | --- |
+| Virtual address space | `MemoryMapSnapshot`: process/stop/point, source, coverage, ordered regions with hex `[start,end)`, permissions/sharing, hex file offset, device/inode/path. A bounded region listing is separate from captured bytes. `MemoryReadPage` carries address/length and per-range availability; historical reads require captured data. | Native procfs snapshot first; paging and immutable history storage next. |
+| Modules and C++ layout | `ModuleImage`: build-id, artifact hash, ELF kind/load bias/segments/sections. `MemoryOverlay`: region/module/object generation, extent, symbol/type/ABI, evidence; vtable address points, vptr, RTTI/VTT and inheritance relationships are optional typed overlays. | ELF/DWARF plus ABI adapters; P2 required for confirmed lifetime. A VMA is not an allocation or C++ object. |
+| OS diagnostics | `RuntimeEnvironment`: kernel/architecture, debugger/library identities, procfs/ptrace/ASLR probes with status/reason/evidence. `smaps`, fd and status views have separate cost/capability/permissions. | Actual runner probes; absent permissions degrade only affected features, with no global sysctl edits. |
+| Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ buffer probes first; journal persists separately from history eviction. Recorder effects need a replay policy before reverse execution is enabled. |
+| Execution layout | `ExecutionProfile`: requested ASLR/PIE/allocator configuration; `ExecutionManifest`: actual ELF/toolchain/runtime/environment identities, measured layout evidence, warnings and reproducibility coverage. | Build identity change, prelaunch probes and verified rerun checks; equal addresses alone never authorize restore. |
+| Changes inside a step | `ChangeIntervalPage`: capture/profile, from/to points, instruction or operation occurrence, thread/activation, changed registers/ranges with before/after availability, ordering, gaps and continuation cursor. | Recorder or instrumentation enabled before the interval. Captured stores, snapshot differences and semantic assignments remain distinct kinds. |
+| Runtime intervention | `InterventionRecord`: request/branch/expected stop, mechanism, requested edits, actual effects, cleanup status and resulting context. Execution requires an explicitly selected supported intervention profile. | P5 audit/branch foundations, ABI implementation, recorder compatibility and rollback/partial-failure tests. |
+
+All memory addresses and offsets retain exact string representations; no
+JavaScript-number conversion. Ranges use explicit units: memory/output ranges
+are bytes, input/source ranges are UTF-16. Current-process identity includes
+session/generation and the owning inferior, not a bare PID. Reused addresses
+never imply reused object/module identity. New read commands require the same
+stop check as `readMemory`; new historical commands accept an immutable point
+and never silently inspect live state.
+
+### Output ordering and reversibility
+
+Synchronized C++ output can share C `stdout` buffering; after disabling sync,
+separate C and C++ pending buffers do not reveal their relative emission order.
+The frontend may present one output area with red pending regions, but must
+label unordered sources instead of inventing a concatenation. Unknown/custom
+`streambuf` remains unavailable. Reads must not execute inferior functions or
+force a flush. [libstdc++ mixing C and C++ I/O](https://gcc.gnu.org/onlinedocs/libstdc++/manual/io_and_c.html).
+
+Committed bytes mean bytes observed at the backend transport, not necessarily
+durable storage or a rendered terminal. A historical cursor may change pending
+snapshots and the visible committed-through marker; it cannot erase physical
+effects already emitted. Keep the journal immutable, mark committed output
+after the selected cursor as future relative to that point, and do not append
+duplicate journal entries when reading history or replaying an already recorded
+effect. No total order is promised across independent stdout/stderr transports.
+Finite retention must show an explicit gap rather than an apparently complete
+journal. Separate branches preserve each original run's effects and provenance.
+
+### Address stability and recorder choice
+
+Plan a named non-PIE profile with matching compile/link flags, validate `ET_EXEC`
+in the artifact, and request ASLR disable only for the owned inferior. Record
+requested versus verified settings and refusal evidence. Do not change global
+kernel policy. GDB exposes the per-launch setting, but its configuration value
+is not proof that the host permitted it. [GDB launch settings](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
+Allocator state, environment, input and external nondeterminism still belong to
+replay validation. Neither fixed heap placement nor equal module addresses
+prove replay equivalence; object identity continues to use logical generations.
+
+An endpoint-snapshot diff cannot recover overwritten intermediate values.
+Python `memory_changed` events report debugger-user memory modifications;
+they are not an inferior write trace. [GDB Python events](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Events-In-Python.html).
+Evaluate rr and a bounded `record full` profile independently. `btrace` lacks
+data history, and `record full` requires a compatible execution mode rather
+than being enabled inside the existing asynchronous control loop. Instruction
+coverage, recorder eviction and unsupported operations must reach the client.
+[GDB recording](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html).
+
+### Observation versus intervention
+
+Backend-owned syscalls and procfs reads belong to observation/resource control.
+Calling `mprotect` in the backend does not alter the inferior's mappings.
+Inferior syscall/call/code injection is a separate auditable mutation: validate
+the stop, maintain branch identity, record partial effects, bound execution,
+restore saved machine state and clean up owned mappings or report failure.
+Choose compile-time hooks/preloaded helpers where suitable; an injected code
+page uses RW then RX, with page/ABI/icache handling, never a permanent RWX
+shortcut. [Linux mprotect](https://man7.org/linux/man-pages/man2/mprotect.2.html).
+The current read-only buffer and mapping work does not enable injection.
+
+### Acceptance before capability promotion
+
+Each gateway needs parser/limit fixtures, real headless integration and frontend
+contract fixtures. Cross-cutting cases are stale stop/session, process exit and
+PID reuse, cancellation, permission denial, missing symbols/ABI, truncation,
+repeated historical reads and immutable branch provenance. Specific priorities:
+
+- Output: sync on/off, mixed C/C++, flush transitions, custom/null buffers,
+  oversized writes, NUL/invalid UTF-8, exit/crash and deduplication during seek.
+- Memory: large sparse maps, unmapped/guard pages, split/reused mappings,
+  shared pages, deleted/whitespace paths, PIE/RELRO, dynamic libraries and
+  multiple/virtual inheritance. Nonresident is not synonymous with unmapped.
+- Layout: denied personality, repeated malloc/free/realloc/mmap, changed
+  environment, custom allocator and sanitizer profiles; mismatch is explicit.
+- Trace: repeated stores with identical final values, register-only changes,
+  overlapping writes, syscalls/signals, unsupported instructions and log gaps.
+- Intervention: denied/partial syscall, timeout/cancel/signal, restored
+  bytes/protections/registers, cleanup on stop and consistent replay audit.
+
+Deliver native output/maps first, then the verified layout profile, recorder
+prototype, richer ELF/vtable overlays and finally runtime interventions. Probe
+Ubuntu versions through OS/ABI/capability evidence; a distro label alone does
+not establish support.

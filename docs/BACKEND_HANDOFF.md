@@ -1,6 +1,6 @@
 # phantom: передача backend-разработчику
 
-Дата актуализации: **27 сентября 2026**. Этот документ — основной вход для отдельного backend-агента и полный реестр согласованных направлений phantom. Приоритет — необычный, глубокий **однопоточный** учебный debugger: история исполнения, вычисления, время жизни объектов, запросы к прошлому, replay/what-if и память. CF/stress-инфраструктура, специальные графовые представления, широкая многопоточность и обучение модели русского языка остаются в программе, но выполняются позже.
+Дата актуализации: **4 октября 2026**. Этот документ — основной вход для отдельного backend-агента и полный реестр согласованных направлений phantom. Приоритет — необычный, глубокий **однопоточный** учебный debugger: история исполнения, вычисления, время жизни объектов, запросы к прошлому, replay/what-if и память. CF/stress-инфраструктура, специальные графовые представления, широкая многопоточность и обучение модели русского языка остаются в программе, но выполняются позже.
 
 Основной backend: **отдельный процесс на Linux, C++20**, Clang/clangd, адаптер rr/GDB; нативный LLDB — дополнительный адаптер macOS. Существующие React/TypeScript, Electron и Three.js можно использовать выборочно: backend не зависит от текущей реализации интерфейса. Разработка интерфейса на Mac не требует переезда всей рабочей системы на Linux. Развёртывание описывает [`docs/LINUX_BACKEND.md` в ветке `backend/linux`](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md), состояние service и команды сборки — [`backend/README.md` в той же ветке](https://github.com/Tigersmechom/Phantom/blob/backend/linux/backend/README.md). Эти файлы доступны локально после checkout `backend/linux`; в `main` их может не быть. Текущий GDB engine не означает готовность recorder rr или подключение UI.
 
@@ -25,6 +25,11 @@
 | P10 — позже | Многопоточность и перевод русского языка в DSL |
 
 Сохранить все направления из реестра идей. Сначала получить проверяемое ядро исследования исполнения; обычная IDE-инфраструктура служит этому ядру и не должна вытеснять его на неопределённый срок.
+
+Уточнение **04.10.2026**: реализованы собственный буфер `cout` после
+`sync_with_stdio(false)` в проверенном libstdc++ профиле, единый вывод и шлюз
+карты виртуальной памяти. Далее — проверяемый профиль адресов, запись изменений внутри шага и расширенные
+вмешательства. Подробный порядок, зависимости и приёмка — [§18](#18-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
 ## 1. Что уже работает
 
@@ -64,7 +69,9 @@ Frontend целиком переносить не требуется; адапт
 будущий ввод локально, передаёт подтверждённые токены/строки по запросу процесса,
 показывает неизменяемые ревизии, exposed-диапазоны и отдельный запрос EOF.
 Буфер C stdout доступен с метриками pending/window/free/storage; собственный
-несинхронизированный C++ буфер и semantic consumed-диапазоны ещё не реализованы.
+несинхронизированный C++ буфер и semantic consumed-диапазоны в этом checkpoint
+ещё не реализованы. Расширение от 04.10 описано в §18; semantic consumed
+по-прежнему требует отдельного capture-профиля.
 
 Сохраняем бренд **phantom**, но не переименовываем совместимые внутренние `window.frameNative`, `FRAME_*` и `.frame/build.json`. Старый профиль FRAME переносится в phantom без перезаписи имеющихся настроек. Не ломать защиту close/reload, сохранение флагов перед сборкой и изоляцию IPC.
 
@@ -137,9 +144,12 @@ storageCapacityBytes         _IO_buf_end - _IO_buf_base
 Свободное окно не является обещанием момента flush: `endl`, `flush`, `unitbuf`,
 связанный `cin`, перевод строки и крупная запись могут сбросить вывод раньше.
 Это снимок C `stdout`, относящийся к `cout` только при сохранённой
-синхронизации. Собственный C++ буфер после `sync_with_stdio(false)` этим
-профилем не захватывается. Для неподдерживаемой ABI или невалидного диапазона
-метрики недоступны; статический разбор исходника не подменяет этот факт.
+синхронизации. Срез от 04.10 добавляет отдельное `stdout.coutBuffered` для
+`cout`: glibc alias при подтверждённой синхронизации либо собственный
+libstdc++ `stdio_filebuf` после `sync_with_stdio(false)`. Alias показывается
+один раз; независимые pending-буферы не задают общего порядка. Для
+неподдерживаемой ABI/custom streambuf или невалидного диапазона метрики
+недоступны; статический разбор исходника не подменяет этот факт.
 
 Source-level `step` имеет отдельный короткий deadline. В native профиле,
 если GDB прерывает inferior внутри блокирующего чтения stdin, это не
@@ -487,6 +497,11 @@ instrumented assertion hook или replay/branch с известной точк�
 | Русский запрос → DSL, небольшая модель | P10; позднее, без обхода validation |
 | Stack sectors/layout, hover values | P6; только фактически доступные bytes/location mappings |
 | Вся карта regions/sections, live/freed/reused, 3D Unreal, physical addresses | P6/P9 + §15; virtual/guest physical/host physical явно различны |
+| Вся виртуальная память, включая vtable/RTTI/rodata, `/proc` и Ubuntu diagnostics | §18.2; regions раньше object overlays, bytes по запросу; backend без привязки к 3D renderer |
+| `cout` после отключения sync; единый вывод с красным несброшенным хвостом | §18.1; отдельные физические буферы, journal и исторический pending без придуманного порядка |
+| ASLR off, ET_EXEC и стабильные адреса кучи при rollback | §18.3; отдельный per-inferior профиль, проверка ELF/среды; адресная стабильность не заменяет recorder |
+| Все изменения внутри одного шага, глубокие GDB/Python возможности | §18.4; запись до начала интервала, инструкции/данные/coverage различаются |
+| Syscalls и runtime-код с executable permissions | §18.5; наблюдение отдельно от вмешательства, W^X, audit/cleanup и branch identity |
 | Replay/checkpoints/delta/memoization, качество малых программ | P4; declared retention/budgets, context-keyed cache |
 | O0/O3/fast-math, цена строки, cycles, push_back actual/amortized | P7; разные artifacts, measured/estimated и assumptions |
 | Несколько окон reference/buggy, первое расхождение | P5/P7; semantic alignment с пробелами/неоднозначностью |
@@ -648,3 +663,161 @@ v1 не меняй молча. Feature DAG делит compile/capture/index/view
 относительно общего commit baseline; старый BACKEND_BASELINE.json не переписывай,
 node_modules/готовые app/Unreal/recordings с пользовательскими данными не коммить.
 ```
+
+## 18. Дополнение 04.10.2026: память, вывод и расширенный GDB
+
+Это дополнение сохраняет P0–P10 и уточняет backend-шлюзы для frontend-агента.
+Все перечисленные ниже будущие DTO — предложения до синхронного изменения
+контракта, валидаторов, fixtures и capability. Статус текущего среза:
+несинхронизированный `cout` (Linux x86_64 / libstdc++), карта mappings и единый вывод **реализованы**;
+профиль адресов, recorder изменений и runtime injection **запланированы**.
+Assertions по согласованию с пользователем остаются на будущее.
+
+Проверки этого среза: 13/13 CTest Debug и 13/13 ASan; проверки frontend
+digest/controls, input races, output rendering, live HTTP→GDB и smoke lifecycle.
+Memory gateway проходит реальную цепочку object→vptr→read-only vtable→code,
+`mmap`/`mprotect`/`munmap` и проверку неизменности истории. Это подтверждает
+чтение сырых таблиц; их автоматическая классификация остаётся следующим слоем.
+ABI подтверждён на установленной libstdc++13, не объявлен универсальным.
+
+### 18.1. `cout` и единое поле вывода — первый срез
+
+- Чтение остановленного процесса без вызова `flush`, `rdbuf()` или других
+  функций inferior. Для известных libstdc++ ABI читать собственный put-area
+  `cout`; для glibc сохранять отдельное наблюдение C `stdout`. При неизвестной
+  библиотеке, custom `streambuf`, смене буфера, невалидных указателях — явная
+  недоступность, без угадывания layout по версии Ubuntu.
+  Проверяются также actual fd 1 и стандартный no-conversion codecvt. Если
+  реальный верхний PC находится вне исходников проекта, оба pending-снимка
+  временно unavailable: остановка внутри flush может предшествовать сбросу
+  указателей буфера после уже состоявшейся записи. Caller location этого не отменяет.
+- Шлюз хранит источник/идентичность каждого буфера, pending bytes/text,
+  active window/free/storage и причины неизвестных метрик. Единый вывод
+  отображает уже доставленный stdout и красные pending-сегменты. После
+  отключения sync C и C++ буферы независимы: одновременные pending-сегменты
+  нельзя склеивать в якобы известный хронологический порядок. Основание:
+  [libstdc++ I/O](https://gcc.gnu.org/onlinedocs/libstdc++/manual/io_and_c.html).
+- Сохраняемый журнал flushed-байтов неизменяем в пределах run/ветви; история
+  pending привязана к выбранному observation и может уменьшаться при шаге
+  назад. Физическую запись в терминал/файл rollback не отменяет. Для будущего
+  replay хранить отдельно journal реальных внешних эффектов и stream-prefix
+  выбранной точки; повторный показ истории не дописывает вывод повторно.
+  Уже сброшенный текст, находящийся позже курсора, остаётся в журнале с явной
+  отметкой, что он принадлежит будущему относительно выбранной точки.
+- **Приёмка:** sync on/off, смешанные `printf`/`cout`, `endl`/`flush`/`unitbuf`,
+  `cin.tie(nullptr)`, пустой/полный/большой put-area, custom/null `rdbuf`, exit
+  и crash до flush, NUL/невалидный UTF-8, лимит retained tail. Проверить
+  отсутствие повторов при flush, исторический round trip и отсутствие
+  side effects у чтения; неопределённый порядок обозначается явно.
+
+### 18.2. Вся виртуальная память, включая vtable — шлюз для P6/P9
+
+- Основа — снимок **всех mappings** `/proc/<pid>/maps` у принадлежащего сессии
+  inferior: stack, heap, anonymous/file/shared mappings, executable/library
+  code, writable/readonly data, guard ranges, vDSO/vvar. Это карта виртуального
+  адресного пространства процесса, а не вся физическая память компьютера и
+  не обещание прочитать каждый байт. Карта содержит границы `[start,end)`,
+  permissions, sharing, offset, device/inode, pathname; не выводить object
+  lifetime или residency из наличия VMA. [Linux procfs](https://www.kernel.org/doc/html/latest/filesystems/proc.html).
+- Текущий gateway: `capabilities.memoryMap = 'linux-proc-maps'` и
+  `observation.memoryMap` (`MemoryMapSnapshotDTO`) с `available`, `source`,
+  `coverage: complete|truncated` и `regions`. Это metadata: общий
+  `coverage.memory` остаётся `none`, пока bytes не захвачены отдельно.
+- Снимок maps привязан к process/stop/point; большие карты имеют лимиты,
+  pagination/явное truncation. `readMemory` остаётся отдельным bounded шлюзом.
+  Исторические bytes выдавать только из capture: нынешняя память не заполняет
+  пробелы прошлого. Shared mappings могут меняться внешним процессом даже
+  при остановленном inferior — покрытие согласованности должно это отражать.
+- Следующий слой связывает VMA с ELF load segments/sections, module build-id,
+  load bias, symbols/DWARF, затем с allocations/objects. Vtable/RTTI/VTT и
+  vptr — отдельные ABI-aware overlays; vtable не обязана лежать в `.rodata`
+  (возможна relocatable/RELRO data). Указатель объекта может указывать на
+  address point внутри таблицы, а multiple/virtual inheritance требует
+  нескольких таблиц и смещений. [Itanium C++ ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vtable).
+- Ubuntu/Linux doctor проверяет kernel/arch, фактическую доступность procfs,
+  pid namespace, ptrace/Yama, seccomp и библиотеки; не меняет системные
+  настройки. Недоступность maps не отменяет уже доступные stepping/locals.
+  `smaps`/fd/status — отдельные on-demand диагностики; pagemap/physical addresses
+  не требуются для базовой визуализации. [Yama](https://docs.kernel.org/admin-guide/LSM/Yama.html).
+- **Приёмка:** anonymous/file/shared mappings, `mmap`/`munmap`/`mprotect`,
+  mapping split/reuse, guard/unreadable страницы, пустые/пробельные/удалённые
+  пути, `dlopen`/`dlclose`, PIE/non-PIE, stripped symbols, virtual inheritance,
+  адреса за пределами JS safe integer, huge sparse regions, stale stop,
+  process exit/PID reuse, permission denied/отсутствующий procfs. 3D renderer
+  получает те же DTO, что и 2D/JSON inspector, без собственного чтения ОС.
+
+### 18.3. Проверяемый профиль адресов — следующий после наблюдения
+
+- Добавить явно выбранный build/run profile: `-fno-pie` при компиляции,
+  `-no-pie` при линковке, проверка итогового ELF `ET_EXEC`, per-inferior
+  `set disable-randomization on`. Флаги, ELF kind, compiler/linker identity,
+  ABI и профиль входят в build/run manifest; смена профиля создаёт другой
+  artifact. Не менять глобальный `kernel.randomize_va_space`.
+  [GCC link options](https://gcc.gnu.org/onlinedocs/gcc/Link-Options.html),
+  [GDB launch settings](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
+- Разделить requested/effective/evidence: GDB setting сам по себе не доказывает,
+  что kernel разрешил отключение. Отказ personality/seccomp и warning GDB
+  публикуются; проверяется расположение text/stack/brk/mmap/shared libraries.
+  ET_EXEC фиксирует размещение основного ELF, но не всех остальных regions.
+- Heap ASLR и работа allocator — разные вещи. Фиксированный brk/mmap base
+  не фиксирует последовательность allocation/free, tcache/arenas, внешние
+  inputs и schedule. Контролировать allocator/version/tunables в manifest,
+  не объявлять rerun детерминированным только по равным адресам. Kernel
+  отдельно описывает randomization brk/heap. [Linux ASLR](https://docs.kernel.org/admin-guide/sysctl/kernel.html#randomize-va-space).
+- **Приёмка:** повторные запуски одного artifact/input/env, изменённые argv/env,
+  malloc/free/reuse/realloc и большие mmap allocations, запрет personality,
+  PIE versus ET_EXEC, sanitizer/custom allocator profiles. При несовпадении
+  fingerprint/состояния — объяснённый отказ verified rollback, без remap чужих
+  объектов по совпавшему числовому адресу. Настоящее восстановление P4
+  опирается на recorder и проверенные checkpoints.
+
+### 18.4. Изменения внутри одного шага и глубокие возможности GDB
+
+- Два снимка показывают только разность границ: `x=1; x=2; x=0;` может вообще
+  не изменить итоговый `x`. Полная история требует записи **до** этого
+  интервала: rr replay с instruction/watchpoint queries, ограниченный
+  `record full` либо semantic/write instrumentation P2. Выбор делается
+  минимальными experiments, с измерением overhead/coverage.
+- Python API нужен для typed reads, frames/symbols, recorder automation,
+  breakpoints/watchpoints и событий; `events.memory_changed` сообщает
+  debugger-user writes и не является callback всех store inferior.
+  [GDB Python events](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Events-In-Python.html).
+  `btrace` сохраняет control flow, не данные. `record full` имеет ограничения
+  инструкций/ресурсов и не поддерживает asynchronous/non-stop режимы; нужен
+  отдельный execution profile, а не скрытое включение в нынешнем MI loop.
+  [GDB process recording](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html).
+- Шлюз изменений: interval от/до point, captureId/profile, instruction/operation
+  identity, thread/activation, before/after bytes и coverage/gaps, paging и
+  cancellation. Отсутствие записи не означает «изменений не было». rr остаётся
+  основным кандидатом P4; проверить поддержку конкретного runner.
+  [rr](https://rr-project.org/).
+- **Приёмка:** repeated/same-value stores, aliasing/overlap/memcpy, register-only
+  изменения, vector instructions, syscall writes, signals, exception/unwind,
+  запись начата в середине интервала, log eviction, unsupported instruction,
+  budget/cancel и восстановление исходной live/replay позиции после query.
+  Memory-write trace и семантическая история значений имеют разное coverage.
+
+### 18.5. Syscalls и код внутри inferior — отдельный этап P5
+
+- Backend вправе использовать обычные OS APIs для принадлежащих ему файлов,
+  процессов и диагностики. `mprotect` в backend меняет **его** address space;
+  изменение защиты inferior требует отдельного вмешательства в inferior.
+  Для runtime hooks сначала сравнить compile-time instrumentation, заранее
+  загруженный helper и debugger injection; выбирать по проверяемой задаче.
+  [Linux mprotect](https://man7.org/linux/man-pages/man2/mprotect.2.html).
+- Для выбранного injection profile: остановка и проверка stop/process identity,
+  audit intent/actual result, отдельная ветвь, сохранение registers/stack/errno/
+  signal state, bounded timeout, cleanup или явный degraded state. Собственные
+  code pages проходят RW → RX, без постоянного RWX; учитывать page alignment,
+  ABI/calling convention, icache, seccomp/CET и совместимость recorder.
+  Наблюдающие команды никогда не запускают такой код скрыто.
+- **Приёмка:** stale stop, inferior signal/exit, denied syscall, частичный
+  patch/protection failure, timeout/cancel, возврат original bytes/protections,
+  cleanup при detach/stop и повторное воспроизведение audit. Непроверенная
+  комбинация OS/ABI/recorder возвращает unsupported, а не частичный успех.
+
+Порядок поставки: **18.1 + базовые maps из 18.2 → профиль 18.3 → recorder
+prototype 18.4 → ELF/vtable/object overlays 18.2 → вмешательства 18.5**.
+Каждый срез завершается обновлением DTO/fixtures, headless интеграционными
+тестами и описанием для frontend; продвинутые experiments не блокируют
+текущие cin/stepping/history. Этот порядок не объявляет P2/P4/P6 завершёнными.
