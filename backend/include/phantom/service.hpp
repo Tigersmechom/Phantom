@@ -75,6 +75,7 @@ class BackendService final {
   std::vector<Json> handleModuleSymbols(const Json& request);
   std::vector<Json> handleVariableLayout(const Json& request);
   std::vector<Json> handleVtable(const Json& request);
+  std::vector<Json> handleMemoryIntervention(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
   Json handleInput(const Json& request);
@@ -121,6 +122,14 @@ class BackendService final {
   std::uint64_t sequence_ = 0;
   std::uint64_t ordinal_ = 0;
   std::uint64_t stateRevision_ = 0;
+  std::string currentBranchId_ = "main";
+  Json branches_ = Json::array({{{"id", "main"}, {"parent", nullptr}, {"interventionId", nullptr}}});
+  // Session ledger: never silently evicted. Capacity is reserved before writes;
+  // a retry returns its original response without repeating events or effects.
+  struct InterventionEntry { Json request; Json response; };
+  std::vector<InterventionEntry> interventions_;
+  static constexpr std::size_t maxInterventions = 128;
+  static constexpr std::size_t interventionReservation = 32768;
   Json executionLayout_ = nullptr;
   OutputJournal stdoutJournal_, stderrJournal_;
   bool outputJournalConsistent_ = true;

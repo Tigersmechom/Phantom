@@ -69,3 +69,9 @@ node tools/frontend-harness/smoke.mjs backend/out/linux-debug/phantom-backend
 после `N`, `nextCursor` и признак `gap`. Это предотвращает потерю событий при
 параллельных запросах одного клиента; при `gap:true` нужно заново запросить
 state и не считать пропущенную команду успешно завершённой.
+
+Для следующей интеграции frontend доступен `writeMemory`: проверяемая запись
+до 256 raw bytes в native-процессе, audit результата и ветви истории. Кнопки
+редактирования в этот стенд пока не добавлены; типизированная запись переменных
+остаётся выключена. Формы запросов, получение audit и ограничения приведены в
+[INSPECTION_GATEWAYS.md](../../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).

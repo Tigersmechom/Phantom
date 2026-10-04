@@ -151,6 +151,19 @@ class GdbEngine {
                              GdbError& error);
   bool readMemory(std::string_view addressHex, std::size_t byteCount,
                   nlohmann::json& result, GdbError& error);
+  // Raw memory intervention primitives. The service owns current mapping
+  // permissions, compare-before-write, readback and the immutable audit.
+  // These reject every recording profile other than native and require
+  // exactly one confirmed stopped thread. None delivers queued stdin/EOF.
+  bool prepareMemoryWrite(GdbError& error);
+  // Only 1..256 literal bytes, with a strict uint64 address. attempted is
+  // reset on entry and set immediately before sending the mutating MI
+  // command; false return with attempted=true can mean a partial write.
+  bool writeMemoryBytes(std::string_view addressHex, std::string_view bytesHex,
+                        bool& attempted, GdbError& error);
+  // Independently re-check the stop, capture without target execution or
+  // input delivery, and replace issued variable handles for this new state.
+  bool refreshStoppedSnapshot(GdbStop& result, GdbError& error);
   bool disassemble(std::string_view addressHex, std::size_t maxInstructions,
                    nlohmann::json& result, GdbError& error);
   // Empty selection returns general registers. Names are resolved through MI

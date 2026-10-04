@@ -30,6 +30,8 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readVariableLayout` | No | Read a retained variable layout. |
 | `inspectVtable` | Required | Decode a selected vptr slot under an explicitly requested ABI profile. |
 | `readVtableSnapshot` | No | Read a retained vptr/header/word capture. |
+| `writeMemory` | Required | Compare, write and verify bounded native storage bytes; retain intervention provenance. |
+| `readMemoryIntervention` / `listMemoryInterventions` / `listBranches` | No | Read session intervention audits and branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 
@@ -421,3 +423,97 @@ Historical reads use saved JSON only and survive object destruction or process
 exit until retention eviction or a new session. They do not reread a pointer
 that may now refer to a different allocation. The shared inspection store and
 its existing byte/record limits apply. No new graphical renderer is included.
+
+## Checked native memory interventions
+
+`capabilities.memoryWrite = "native-private-memory-v1"` enables explicit raw
+storage edits. `variableWrite` remains false: a storage address does not prove
+C++ object lifetime, initialization, type correctness or mutability.
+
+```json
+{
+  "kind": "writeMemory",
+  "profile": "native-private-memory-v1",
+  "addressHex": "0x7fffffffdabc",
+  "expectedBytesHex": "07000000",
+  "replacementBytesHex": "2a000000"
+}
+```
+
+Supply the current session and `expectedStop`. This example replaces four
+little-endian bytes representing 7 with 42; the command itself has no integer
+or endianness semantics. Obtain actual addresses/bytes from the current stop,
+then read the report rather than assuming success from the response envelope.
+
+The first profile requires native execution, phase `stopped`, exactly one
+confirmed stopped thread, and one complete current `rw-p` mapping covering the
+entire range. Current procfs maps must match the observation. Shared,
+executable, read-only, unmapped, cross-VMA and overflowing ranges are rejected.
+Both byte strings must contain the same nonzero number of literal hex bytes,
+up to `maxMemoryWriteBytes` (256 by default). Expressions are never evaluated.
+`waitingForInput` and every `gdb-record-full` launch are rejected, including
+when recording has become inactive. Ordinary native execution stays available.
+
+The backend reads the whole range and compares it with `expectedBytesHex`.
+A mismatch (`conflict`) or equal replacement (`unchanged`) does not send a
+write or advance the stop. Otherwise it sends one GDB/MI memory write, without
+the optional repeat count, then reads again even if GDB reported an error.
+There is no automatic retry or rollback. This is **not atomic compare-and-swap**:
+external interference, same-value writes and ABA changes are not excluded.
+A private mapping also does not establish ownership of a live C++ object.
+
+The synchronous result is `{kind:"memoryIntervention", intervention,
+throughSequence}`. `report.outcome` distinguishes `verified`,
+`readback-mismatch`, `unverified`, `write-rejected`, `read-before-failed`,
+`conflict` and `unchanged`. Read `writeAttempted`, `writeAcknowledged`, exact
+before/after bytes and phase-tagged errors independently: a verified final
+value can coexist with a failed GDB acknowledgement. Partial reads contain
+only their proven prefix; missing evidence is null.
+
+Every potentially submitted write creates a lineage branch from the current
+live point, even if final bytes equal the original bytes. The response is
+followed by `branchCreated`, `observation` (`reason:"mutation"`) and `state`.
+The PC does not advance, but stop identity and state revision do. If a fresh
+stopped snapshot cannot be confirmed, the debugger is closed and the events
+are `branchCreated`, then failed `state` with `live:null`; the current
+observation is null. The audit still records the attempted effect, its
+`contextStatus` and `refreshError`. A failure before submitting a write can
+also close the debugger, without creating a branch. Inspection/write/refresh
+operations in this path do not feed pending stdin or EOF.
+
+`readMemoryIntervention{interventionId}` returns the immutable audit;
+`listMemoryInterventions{start,count}` pages it. `listBranches` returns the
+current branch and each branch's parent point/intervention ID. History lookup
+uses the full `(branchId,eventOrdinal)` pair; `listHistory` includes only that
+branch's own observations. Follow parent links to display ancestry. Ordinals,
+state revisions and event sequences stay monotonic across branches.
+
+Branches record interventions in this one process. They do not clone the
+process, restore the old state or preserve an executable alternate future.
+Old observations, captures and traces remain unchanged subject to their
+existing retention limits. Physical output is one process journal across
+branches; its `branchId` describes the selected point (or current branch),
+not separate output ownership. Selecting an old point does not remove later
+physical output. The launch fingerprint remains a launch fingerprint; use
+branch/audit provenance when comparing altered runs.
+
+Retries are session-scoped: an identical `requestId` **and entire request**
+returns the original response with no additional writes or events, even after
+the stop changed or the process exited. A different request with that ID is
+rejected. Event subscribers use sequence/replay as usual; a duplicate reply's
+`throughSequence` does not promise a second event delivery. No guarantee
+survives backend restart or a new session.
+
+The ledger is separate from evictable inspections: at most 128 records, with
+32 KiB reserved per record and `maxInterventionStoreBytes` (4 MiB default).
+Encoded write requests are limited to 4096 bytes. A full ledger rejects new
+operations before writing; IDs are never silently evicted. Comparison
+conflicts/no-ops also occupy records. A successful new launch or workspace
+change clears the ledger and branches. Export needed audits before that.
+
+Typed scalar writes, multi-range transactions, register writes, runtime code
+injection and branching inside recorded execution remain separate work.
+The MI write command and recorder side effects are described in the official
+[GDB data manipulation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
+and [record/replay](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html)
+manuals.

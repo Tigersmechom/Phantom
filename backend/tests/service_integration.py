@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "recorderProbe", "recordingProfiles", "recordingCursor",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "interventionBranches", "recorderProbe", "recordingProfiles", "recordingCursor",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -112,7 +112,7 @@ def main() -> int:
                 caps["limits"],
                 {"maxOutputBytes", "maxHistoryBytes", "maxResidentSnapshots", "maxVariablesPerPage",
                  "maxStringBytes", "maxMemoryReadBytes", "maxInstructionsPerRequest", "maxTraceInstructions",
-                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions",
+                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions", "maxMemoryWriteBytes", "maxMemoryInterventions", "maxInterventionStoreBytes",
                  "commandTimeoutMs", "replayTimeoutMs"},
                 "ResourceLimitsDTO",
             )

@@ -78,7 +78,7 @@ std::vector<Json> BackendService::handleInspection(const Json& request) {
     auto result = (stream == "stdout" ? stdoutJournal_ : stderrJournal_).read(
         command.at("fromByte").get<std::uint64_t>(),command.at("byteCount").get<std::size_t>());
     result["kind"] = "outputJournal"; result["stream"] = stream;
-    result["processInstanceId"] = processInstanceId_; result["branchId"] = "main";
+    result["processInstanceId"] = processInstanceId_; result["branchId"] = currentBranchId_;
     result["consistent"] = outputJournalConsistent_;
     result["selectedPoint"] = nullptr; result["selectedThroughByte"] = nullptr;
     if (command.contains("point")) {
@@ -88,6 +88,7 @@ std::vector<Json> BackendService::handleInspection(const Json& request) {
       }
       if (!observation) return {errorResponse(request,"HISTORY_EVICTED","selected output observation is unavailable or evicted")};
       result["selectedPoint"] = command.at("point");
+      result["branchId"] = command.at("point").at("branchId");
       result["selectedThroughByte"] = observation->at("outputCursor").at(stream == "stdout" ? "stdoutThroughByte" : "stderrThroughByte");
     }
     return {okResponse(request,std::move(result))};

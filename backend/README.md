@@ -96,6 +96,11 @@ protocol capabilities.
 - MI обрабатывается потоково: потреблённые ответы GDB не накапливаются за всё
   время сессии. Лимит отдельной записи и ограниченные порции чтения сохраняют
   границы памяти и возможность вовремя обработать timeout/cancel.
+- `writeMemory` с явным native-профилем меняет до 256 storage bytes после
+  проверки ожидаемых bytes и `rw-p` VMA. Результат повторно читается;
+  immutable audit, lineage branches и повтор запроса без повторной записи
+  доступны через протокол. Только один остановленный поток, без record-full.
+  [Контракт и границы](../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
   expression traces, source disassembly и verified restore выключены и отвечают
   `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес

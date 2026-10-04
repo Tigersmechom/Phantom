@@ -120,6 +120,7 @@ Json BackendService::capabilities() const {
       {"moduleInspection", "linux-proc-maps-elf"},
       {"moduleSymbols", "elf-section-symbol-tables"}, {"variableLayout", "gdb-python-dwarf"}, {"recorderProbe", true},
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
+      {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
@@ -134,6 +135,8 @@ Json BackendService::capabilities() const {
                    {"maxInspectionStoreBytes", options_.limits.maxWireBytes},
                    {"maxOutputJournalBytesPerStream", std::min<std::size_t>(4 * 1024 * 1024,options_.limits.maxWireBytes/4)},
                    {"maxOutputJournalReadBytes", 65536}, {"maxRecordedInstructions", 1000000},
+                   {"maxMemoryWriteBytes", std::min<std::size_t>(256, options_.limits.maxMemoryReadBytes)}, {"maxMemoryInterventions", maxInterventions},
+                   {"maxInterventionStoreBytes", std::min<std::size_t>(4 * 1024 * 1024, options_.limits.maxWireBytes)},
                    {"commandTimeoutMs", 30000}, {"replayTimeoutMs", 30000}}},
   };
 }
@@ -188,7 +191,7 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   // explicitly supported fields below instead.
   Json observation = Json::object();
   observation["id"] = make_id("observation", ordinal_ + 1);
-  observation["point"] = {{"branchId", "main"}, {"eventOrdinal", ordinal_ + 1}};
+  observation["point"] = {{"branchId", currentBranchId_}, {"eventOrdinal", ordinal_ + 1}};
   observation["stop"] = {{"stopId", make_id("stop", stateRevision_ + 1)}, {"stateRevision", stateRevision_ + 1}};
   observation["processInstanceId"] = process;
   observation["buildId"] = artifact_ ? string_at(artifact_->dto, "id") : "";
@@ -521,6 +524,8 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   // launch must not replay frames or expose points from the previous run.
   sequence_ = ordinal_ = stateRevision_ = 0;
   inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+  interventions_.clear(); currentBranchId_ = "main";
+  branches_ = Json::array({{{"id", "main"}, {"parent", nullptr}, {"interventionId", nullptr}}});
   stdoutJournal_.clear(); stderrJournal_.clear(); outputJournalConsistent_ = true; recordingOutputMarkers_.clear();
   executionLayout_ = std::move(layout);
   history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0; liveObservation_ = nullptr; liveState_ = nullptr;
@@ -656,12 +661,12 @@ Json BackendService::handleInput(const Json& request) {
 
 Json BackendService::handleHistory(const Json& request) {
   const auto& command = request.at("command"); const auto kind = command.at("kind").get<std::string>();
-  if ((kind == "listHistory" && command.at("branchId") != "main") ||
-      (kind == "readHistory" && command.at("point").at("branchId") != "main"))
-    return errorResponse(request, "STALE_CONTEXT", "only the live main branch exists", false);
+  const auto branch = kind == "listHistory" ? command.at("branchId") : command.at("point").at("branchId");
+  if (std::none_of(branches_.begin(), branches_.end(), [&](const auto& b) { return b.at("id") == branch; }))
+    return errorResponse(request, "STALE_CONTEXT", "history branch does not exist", false);
   if (kind == "readHistory") {
-    const auto point = command.at("point"); const auto ordinal = point.at("eventOrdinal").get<std::uint64_t>();
-    auto it = std::find_if(history_.begin(), history_.end(), [ordinal](const auto& e) { return e.observation.value("point", Json::object()).value("eventOrdinal", 0ULL) == ordinal; });
+    const auto point = command.at("point");
+    auto it = std::find_if(history_.begin(), history_.end(), [&](const auto& e) { return e.observation.at("point") == point; });
     if (it == history_.end()) return errorResponse(request, "HISTORY_EVICTED", "history point is unavailable", false);
     return okResponse(request, {{"kind", "observation"}, {"observation", it->observation}});
   }
@@ -669,7 +674,7 @@ Json BackendService::handleHistory(const Json& request) {
   bool hasMore = false;
   for (const auto& entry : history_) {
     const auto p = entry.observation.at("point"); const auto ord = p.at("eventOrdinal").get<std::uint64_t>();
-    if (ord <= after) continue;
+    if (p.at("branchId") != branch || ord <= after) continue;
     if (items.size() >= limit) { hasMore = true; break; }
     items.push_back({{"point", p}, {"stop", entry.observation.at("stop")}, {"label", entry.observation.value("reason", "stop")}, {"retained", true}});
   }
@@ -691,6 +696,8 @@ std::vector<Json> BackendService::connect(const Json& request) {
     liveState_ = nullptr; liveObservation_ = nullptr; history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0;
     sequence_ = ordinal_ = stateRevision_ = 0;
     inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+    interventions_.clear(); currentBranchId_ = "main";
+    branches_ = Json::array({{{"id", "main"}, {"parent", nullptr}, {"interventionId", nullptr}}});
     stdoutJournal_.clear(); stderrJournal_.clear(); outputJournalConsistent_ = true; recordingOutputMarkers_.clear();
     executionLayout_ = nullptr;
     workspace_ = request.at("workspace");
@@ -709,7 +716,16 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         (sessionId_.empty() || request.at("session").at("id").get<std::string>() != sessionId_ ||
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
-    if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
+    // Resolve a committed intervention before the live-stop gate: the response
+    // may have been lost after it advanced the stop or closed the debugger.
+    if (!request.at("session").is_null()) {
+      for (const auto& saved : interventions_) if (saved.request.at("requestId") == request.at("requestId")) {
+        if (saved.request != request)
+          return {errorResponse(request, "INVALID_REQUEST", "intervention requestId was already used with a different request")};
+        return {saved.response};
+      }
+    }
+    if ((kind == "listBranches" || kind == "listMemoryInterventions" || kind == "readMemoryIntervention" || kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
          kind == "readModuleSymbols" || kind == "readVariableLayout" || kind == "readVtableSnapshot" ||
          kind == "readModuleSnapshot" || kind == "readOutputJournal" || kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
         !sessionId_.empty() && request.at("session").is_null())
@@ -736,14 +752,14 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     }
     if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
-                                 kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
+                                 kind == "writeMemory" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
                              kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" ||
                              kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" ||
                              kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
-                             kind == "setBreakpoints" || kind == "writeVariable";
+                             kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
     if (liveCommand && !engine_->live())
@@ -802,6 +818,8 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "inspectModuleSymbols" || kind == "readModuleSymbols") return handleModuleSymbols(request);
     if (kind == "inspectVariableLayout" || kind == "readVariableLayout") return handleVariableLayout(request);
     if (kind == "inspectVtable" || kind == "readVtableSnapshot") return handleVtable(request);
+    if (kind == "writeMemory" || kind == "readMemoryIntervention" || kind == "listMemoryInterventions" || kind == "listBranches")
+      return handleMemoryIntervention(request);
     if (kind == "launch") return handleLaunch(request, publish);
     if (kind == "traceInstructions") return handleTrace(request, publish);
     if (kind == "seekRecording" || kind == "reverseInstruction") return handleRecordedExecution(request, publish);

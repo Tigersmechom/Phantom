@@ -409,3 +409,45 @@ export interface VtableSnapshotDTO {
   evidenceScope: 'debugger-memory-and-current-os-metadata';
   report: VtableReportDTO;
 }
+
+/** Lineage of live native interventions, not a cloned or replayable process. */
+export interface InterventionBranchDTO {
+  id: string;
+  parent: HistoryPointDTO | null;
+  interventionId: string | null;
+}
+/** An in-memory audit retained until the next successful launch/workspace change. */
+export interface MemoryInterventionDTO {
+  id: string;
+  requestId: string;
+  profile: 'native-private-memory-v1';
+  processInstanceId: string;
+  beforePoint: HistoryPointDTO;
+  beforeStop: StopRefDTO;
+  afterPoint: HistoryPointDTO | null;
+  afterStop: StopRefDTO | null;
+  branchId: string | null;
+  contextStatus: 'unchanged' | 'refreshed' | 'failed';
+  mapping: { startAddressHex: string; endAddressHex: string; permissions: 'rw-p' };
+  refreshError: { code: string; message: string } | null;
+  report: {
+    addressHex: string;
+    byteCount: number;
+    expectedBytesHex: string | null;
+    replacementBytesHex: string | null;
+    outcome: 'conflict' | 'unchanged' | 'verified' | 'readback-mismatch' | 'unverified' | 'read-before-failed' | 'write-rejected';
+    /** Full bytes or a proven contiguous prefix. Null means no byte evidence. */
+    beforeBytesHex: string | null;
+    afterBytesHex: string | null;
+    beforeMatchesExpected: boolean | null;
+    afterMatchesReplacement: boolean | null;
+    afterMatchesBefore: boolean | null;
+    writeAttempted: boolean;
+    writeAcknowledged: boolean;
+    /** Last callback liveness, not a promise the later snapshot succeeded. */
+    debuggerAlive: boolean;
+    atomic: false;
+    rollbackAttempted: false;
+    errors: { phase: 'read-before' | 'write' | 'read-after'; code: string; message: string }[];
+  };
+}

@@ -1,4 +1,4 @@
-import type { VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -569,6 +569,9 @@ export interface ResourceLimitsDTO {
   maxOutputJournalBytesPerStream: number;
   maxOutputJournalReadBytes: number;
   maxRecordedInstructions: number;
+  maxMemoryWriteBytes: number;
+  maxMemoryInterventions: number;
+  maxInterventionStoreBytes: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
 }
@@ -582,6 +585,8 @@ export interface BackendCapabilitiesDTO {
   conditionalBreakpoints: boolean;
   hitCountBreakpoints: boolean;
   variableWrite: boolean;
+  memoryWrite: 'native-private-memory-v1' | 'none';
+  interventionBranches: boolean;
   inputTracking: InputStateDTO['tracking'];
   interactiveInput: boolean;
   expressionGroups: boolean;
@@ -635,6 +640,11 @@ export type BackendCommandDTO =
   | { kind: 'readVariables'; reference: string; start: number; count: number }
   | { kind: 'writeVariable'; locator: string; expected: RuntimeValueDTO; value: ScalarValueDTO }
   | { kind: 'disassemble'; buildId: string; target: { kind: 'pc'; addressHex: string } | { kind: 'source'; range: SourceSpanDTO }; maxInstructions: number }
+  /** Compare and write raw storage, native/single-thread only. Events are emitted once. */
+  | { kind: 'writeMemory'; profile: 'native-private-memory-v1'; addressHex: string; expectedBytesHex: string; replacementBytesHex: string }
+  | { kind: 'readMemoryIntervention'; interventionId: string }
+  | { kind: 'listMemoryInterventions'; start: number; count: number }
+  | { kind: 'listBranches' }
   | { kind: 'readMemory'; addressHex: string; byteCount: number }
   | { kind: 'readOutputJournal'; stream: 'stdout' | 'stderr'; fromByte: number; byteCount: number; point?: HistoryPointDTO }
   | { kind: 'inspectProcess' }
@@ -671,6 +681,10 @@ export interface BackendRequestDTO {
   command: BackendCommandDTO;
 }
 export type BackendResultDTO =
+  /** Write response includes final event sequence; duplicate request returns this response without emitting events again. */
+  | { kind: 'memoryIntervention'; intervention: MemoryInterventionDTO; throughSequence?: number }
+  | { kind: 'memoryInterventions'; items: MemoryInterventionDTO[]; start: number; total: number; hasMore: boolean }
+  | { kind: 'branches'; currentBranchId: string; branches: InterventionBranchDTO[] }
   | OutputJournalDTO
   | { kind: 'moduleSnapshot'; snapshot: ModuleSnapshotDTO }
   | { kind: 'moduleSymbols'; snapshot: ModuleSymbolsSnapshotDTO; start: number; totalSymbols: number; hasMore: boolean }

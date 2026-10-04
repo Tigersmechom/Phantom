@@ -217,7 +217,8 @@ mapping metadata contains no memory bytes. The existing bounded `readMemory`
 command retains its `expectedStop` requirement. Runtime ELF indexing, a bounded
 session output journal and opt-in GDB recording are implemented in the extension
 below. Automatic vtable overlays, durable recorder storage, verified replay of
-arbitrary observations and intervention gateways remain future work.
+arbitrary observations and runtime code injection remain future work. Checked
+native storage edits and intervention lineage are implemented below (2026-10-05).
 
 | Gateway | Proposed data and invariants | Dependencies |
 | --- | --- | --- |
@@ -227,7 +228,7 @@ arbitrary observations and intervention gateways remain future work.
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | `InterventionRecord`: request/branch/expected stop, mechanism, requested edits, actual effects, cleanup status and resulting context. Execution requires an explicitly selected supported intervention profile. | P5 audit/branch foundations, ABI implementation, recorder compatibility and rollback/partial-failure tests. |
+| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Explicit native private-memory profile. | Typed scalar edits, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -392,3 +393,19 @@ word count, report retention and callback count are bounded; absent symbol
 evidence and partial reads are never synthesized from present memory on a
 historical request. GDB memory and current OS metadata have distinct scope
 during replay. The protocol regression joins the real TypeScript traffic test.
+
+## 2026-10-05: checked storage edits and intervention lineage
+
+`writeMemory` is an explicit native-only raw-byte operation, with expected
+bytes, single stopped thread, one private non-executable writable mapping and
+mandatory post-write readback. `variableWrite` remains false. New results are
+`memoryIntervention`, `memoryInterventions` and `branches`; retained reads use
+session identity without live handles. The full request is deduplicated before
+the current-stop gate, preserving the original response and once-only events.
+
+Every attempted write forks lineage and advances stop identity, or fails closed
+with an immutable audit and null live observation. Branches do not imply
+restoration of a previous process. History uses full point identity; the output
+journal remains process-wide. Counters stay monotonic across forks. The ledger
+has bounded non-evicting reservations separate from inspection caches. Details
+and error semantics: [inspection gateways](../../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).

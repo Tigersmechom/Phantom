@@ -28,6 +28,8 @@ import recording_integration
 import layout_integration
 import symbols_integration
 import vtable_integration
+import memory_edit_integration
+import memory_edit_failure_integration
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -112,6 +114,9 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         scenarios.append((symbols_integration, [str(executable.parent / "libphantom-module-symbols-library.so")]))
     if capabilities.get("variableLayout") == "gdb-python-dwarf":
         scenarios.append((layout_integration, []))
+    if capabilities.get("memoryWrite") == "native-private-memory-v1":
+        scenarios.append((memory_edit_integration, []))
+        scenarios.append((memory_edit_failure_integration, []))
     if capabilities.get("vtableInspection") == "itanium-x86_64-absolute-v1":
         scenarios.append((vtable_integration, []))
     if "gdb-record-full" in capabilities.get("recordingProfiles", []):

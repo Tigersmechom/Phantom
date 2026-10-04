@@ -220,6 +220,42 @@ int main() {
   assert(!validation_fails(gateway));
   gateway["command"]["snapshotId"] = "";
   assert(validation_fails(gateway));
+  gateway["expectedStop"] = {{"stopId","stop-1"},{"stateRevision",1}};
+  const Json editCommand = {{"kind","writeMemory"},{"profile","native-private-memory-v1"},
+    {"addressHex","0x0000ABCDEF"},{"expectedBytesHex","00fF"},{"replacementBytesHex","FE80"}};
+  gateway["command"] = editCommand;
+  assert(!validation_fails(gateway));
+  auto missingEditStop = gateway; missingEditStop.erase("expectedStop");
+  assert(validation_fails(missingEditStop,"INVALID_REQUEST"));
+  for (const auto& address : Json::array({"0x", "&x", "0x+1", "0x1\n-exec-continue", "0xffffffffffffffff", "0x10000000000000000", -1, nullptr})) {
+    gateway["command"] = editCommand; gateway["command"]["addressHex"] = address;
+    assert(validation_fails(gateway));
+  }
+  for (const auto& bytes : Json::array({"", "0", "xx", "00ff ", "00\nff", 1, false, nullptr})) {
+    for (const auto* key : {"expectedBytesHex","replacementBytesHex"}) {
+      gateway["command"] = editCommand; gateway["command"][key] = bytes;
+      assert(validation_fails(gateway));
+    }
+  }
+  gateway["command"] = editCommand; gateway["command"]["replacementBytesHex"] = "00";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  gateway["command"] = editCommand;
+  gateway["command"]["expectedBytesHex"] = std::string(512,'f');
+  gateway["command"]["replacementBytesHex"] = std::string(512,'0');
+  assert(!validation_fails(gateway));
+  gateway["command"]["replacementBytesHex"] = std::string(514,'0');
+  assert(validation_fails(gateway,"LIMIT_EXCEEDED"));
+  gateway["command"] = editCommand; gateway["command"]["profile"] = "auto";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  gateway["command"] = editCommand; gateway["command"]["pid"] = 1;
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  gateway.erase("expectedStop"); gateway["command"] = {{"kind","listBranches"}};
+  assert(!validation_fails(gateway));
+  gateway["command"] = {{"kind","listMemoryInterventions"},{"start",0},{"count",128}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["count"] = 129; assert(validation_fails(gateway));
+  gateway["command"] = {{"kind","readMemoryIntervention"},{"interventionId","intervention-1"}};
+  assert(!validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before
   // accepting an asynchronous trace, not discovered after acceptance.
   phantom::ValidationLimits small;

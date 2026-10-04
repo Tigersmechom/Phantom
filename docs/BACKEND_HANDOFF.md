@@ -1,6 +1,6 @@
 # phantom: передача backend-разработчику
 
-Дата актуализации: **4 октября 2026**. Этот документ — основной вход для отдельного backend-агента и полный реестр согласованных направлений phantom. Приоритет — необычный, глубокий **однопоточный** учебный debugger: история исполнения, вычисления, время жизни объектов, запросы к прошлому, replay/what-if и память. CF/stress-инфраструктура, специальные графовые представления, широкая многопоточность и обучение модели русского языка остаются в программе, но выполняются позже.
+Дата актуализации: **5 октября 2026**. Этот документ — основной вход для отдельного backend-агента и полный реестр согласованных направлений phantom. Приоритет — необычный, глубокий **однопоточный** учебный debugger: история исполнения, вычисления, время жизни объектов, запросы к прошлому, replay/what-if и память. CF/stress-инфраструктура, специальные графовые представления, широкая многопоточность и обучение модели русского языка остаются в программе, но выполняются позже.
 
 Основной backend: **отдельный процесс на Linux, C++20**, Clang/clangd, адаптер rr/GDB; нативный LLDB — дополнительный адаптер macOS. Существующие React/TypeScript, Electron и Three.js можно использовать выборочно: backend не зависит от текущей реализации интерфейса. Разработка интерфейса на Mac не требует переезда всей рабочей системы на Linux. Развёртывание описывает [`docs/LINUX_BACKEND.md` в ветке `backend/linux`](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md), состояние service и команды сборки — [`backend/README.md` в той же ветке](https://github.com/Tigersmechom/Phantom/blob/backend/linux/backend/README.md). Эти файлы доступны локально после checkout `backend/linux`; в `main` их может не быть. Текущий GDB engine не означает готовность recorder rr или подключение UI.
 
@@ -968,7 +968,7 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**вмешательства с аудитом 20.5**, параллельно — углубление object/lifetime
+**типизированные вмешательства поверх raw storage 20.9 и дальнейший 20.5**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1048,3 +1048,44 @@ construction/destruction vtables и реальным положительным 
 Прошли пять harness checks и четыре contract fixtures; прежние `cin/cout`,
 source/instruction stepping, recorder, memory/layout gateways и history
 сохранили работоспособность в своих регрессионных сценариях.
+
+### 20.9. Проверяемая запись storage и происхождение ветвей — 05.10.2026
+
+Первый срез P5: `writeMemory` с профилем `native-private-memory-v1`,
+обязательными session/expectedStop и ожидаемыми исходными байтами. До 256
+байт, один `rw-p` VMA, только native и один подтверждённо остановленный поток.
+Перед записью проверяются current proc maps и bytes; после единственной MI
+write — повторное чтение даже при `^error`. Автоматического rollback нет.
+Частичный результат, отказ и недоступное readback сохраняются раздельно от
+подтверждения команды GDB. Тип и lifetime объекта не утверждаются;
+`writeVariable`/`variableWrite` остаются выключены.
+
+После попытки записи создаются lineage branch и новый observation с reason
+`mutation`, без исполнения следующей инструкции. Если новое состояние нельзя
+подтвердить, inferior закрывается, state становится failed/live:null, текущий
+observation очищается; audit остаётся доступным. `listBranches`,
+`readMemoryIntervention` и `listMemoryInterventions` дают frontend сведения
+для визуализации. История различает полный branch+ordinal; старые snapshots,
+captures, traces и физический output journal не переписываются. Это
+происхождение вмешательств в одном процессе, ещё не restore/clone/what-if
+альтернативного будущего. Запись при `gdb-record-full` запрещена даже после
+остановки recorder; `waitingForInput` также не допускается.
+
+Повтор идентичного запроса с тем же requestId возвращает сохранённый ответ без
+повторного действия/событий; изменённый payload с этим ID отклоняется. Ledger
+сохраняет до 128 запросов с резервом 32 KiB на каждый (до 4 MiB), без silent
+ID eviction. Новый launch/workspace очищает ledger. Ограничение памяти
+проверяется до вмешательства. MI чтения в пути записи и свежего snapshot
+подавляют доставку stdin/EOF; обычный resume сохраняет прежнее поведение.
+
+Точный wire-контракт, порядок событий, ограничения и примеры:
+[INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
+Следующий срез — типизированные scalar edits с авторитетной DWARF metadata
+поверх проверяемых storage bytes; затем отдельные bounded register/runtime
+interventions и их ветвление. P5 целиком этим срезом не завершён.
+
+Проверки среза 20.9: **37/37 CTest Debug и 37/37 ASan/UBSan**, 3168 реальных
+протокольных кадров через TypeScript 5.9.3, пять проверок harness и четыре
+Node contract-теста. Отдельно проверены partial write, `^error` после реального
+изменения, отказ readback, смерть GDB при write/refresh, replay запроса после
+exit, старые captures/history, многопоточность, границы VMA и заполненный FIFO.

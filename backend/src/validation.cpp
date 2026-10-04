@@ -273,10 +273,10 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "writeMemory" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
-  if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
+  if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
   if (kind == "build") { only({"kind","source","configuration","architecture"}); source_bundle(req(c,"source","command"),l); config(req(c,"configuration","command"),l); enum_string(req(c,"architecture","command"),"command.architecture",{"arm64","x86_64"}); return; }
   if (kind == "launch") {
     only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy","recordingProfile","maxRecordedInstructions"});
@@ -313,6 +313,38 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "restoreExecution") { only({"kind","point","strategy"}); unsupported("command.strategy","verified replay is capability-gated"); }
   if (kind == "setBreakpoints") { only({"kind","documentId","revisionId","breakpoints"}); id(req(c,"documentId","command"),"command.documentId",l); id(req(c,"revisionId","command"),"command.revisionId",l); const auto& bs=req(c,"breakpoints","command"); array_limit(bs,"command.breakpoints",l.maxBreakpoints); for(const auto& b:bs) breakpoint(b,l); return; }
   if (kind == "readVariables") { only({"kind","reference","start","count"}); id(req(c,"reference","command"),"command.reference",l); safe_uint(req(c,"start","command"),"command.start"); positive_uint(req(c,"count","command"),"command.count",l.maxPageSize); return; }
+  if (kind == "writeMemory") {
+    only({"kind","profile","addressHex","expectedBytesHex","replacementBytesHex"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-private-memory-v1"});
+    const auto& address = req(c,"addressHex","command");
+    string_value(address,"command.addressHex",18);
+    const auto& text = address.get_ref<const std::string&>();
+    if (!text.starts_with("0x") || text.size() <= 2) invalid("command.addressHex","expected hexadecimal 0x address");
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data()+2,text.data()+text.size(),value,16);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size()) invalid("command.addressHex","invalid address");
+    for (const auto* key : {"expectedBytesHex", "replacementBytesHex"}) {
+      const auto& bytes = req(c,key,"command"); string_value(bytes,std::string("command.")+key,512);
+      const auto& hex = bytes.get_ref<const std::string&>();
+      if (hex.size() % 2 || !std::all_of(hex.begin(),hex.end(),[](unsigned char ch) {
+          return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'); }))
+        invalid(std::string("command.")+key,"expected nonempty even-length hex bytes");
+    }
+    const auto count = c.at("expectedBytesHex").get_ref<const std::string&>().size()/2;
+    if (c.at("replacementBytesHex").get_ref<const std::string&>().size() != count*2)
+      invalid("command.replacementBytesHex","replacement must have the same length as expected bytes");
+    if (value > std::numeric_limits<std::uint64_t>::max() - count)
+      invalid("command.addressHex","memory range overflows uint64");
+    if (count > l.maxMemoryReadBytes) limit("command.expectedBytesHex","exceeds configured memory read limit");
+    return;
+  }
+  if (kind == "readMemoryIntervention") {
+    only({"kind","interventionId"}); id(req(c,"interventionId","command"),"command.interventionId",l); return;
+  }
+  if (kind == "listMemoryInterventions") {
+    only({"kind","start","count"}); safe_uint(req(c,"start","command"),"command.start");
+    positive_uint(req(c,"count","command"),"command.count",std::min<std::size_t>(128,l.maxPageSize)); return;
+  }
   if (kind == "writeVariable") { only({"kind","locator","expected","value"}); id(req(c,"locator","command"),"command.locator",l); validate_runtime_value(req(c,"expected","command"),l); validate_scalar_value(req(c,"value","command"),l); return; }
   if (kind == "disassemble") { only({"kind","buildId","target","maxInstructions"}); id(req(c,"buildId","command"),"command.buildId",l); const auto& t=req(c,"target","command"); expect_object(t,"command.target"); const auto tk=t.value("kind",""); if(tk=="pc"){exact_keys(t,{"kind","addressHex"},"command.target");string_value(req(t,"addressHex","command.target"),"command.target.addressHex",l.maxIdBytes);} else if(tk=="source"){exact_keys(t,{"kind","range"},"command.target");span(req(t,"range","command.target"),l);} else invalid("command.target.kind","unknown target"); positive_uint(req(c,"maxInstructions","command"),"command.maxInstructions",l.maxInstructions); return; }
   if (kind == "readMemory") { only({"kind","addressHex","byteCount"}); string_value(req(c,"addressHex","command"),"command.addressHex",l.maxIdBytes); positive_uint(req(c,"byteCount","command"),"command.byteCount",l.maxMemoryReadBytes); return; }

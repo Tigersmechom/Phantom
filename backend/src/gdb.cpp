@@ -255,6 +255,23 @@ struct GdbEngine::Impl {
   std::size_t stdoutTotalBytes = 0;
   std::size_t stderrTotalBytes = 0;
   mutable std::mutex inputMutex;
+  // Read-only probes and memory interventions may pump MI/output, but must
+  // not expose queued input or EOF. Protect this nested scope count with the
+  // same lock as concurrent appendInput/closeInput transport mutations.
+  unsigned inputDeliverySuspensions = 0;
+  struct CaptureOnlyIo {
+    Impl& owner;
+    explicit CaptureOnlyIo(Impl& value) : owner(value) {
+      std::lock_guard lock(owner.inputMutex);
+      ++owner.inputDeliverySuspensions;
+    }
+    ~CaptureOnlyIo() {
+      std::lock_guard lock(owner.inputMutex);
+      --owner.inputDeliverySuspensions;
+    }
+    CaptureOnlyIo(const CaptureOnlyIo&) = delete;
+    CaptureOnlyIo& operator=(const CaptureOnlyIo&) = delete;
+  };
   std::size_t deliveredInputBytes = 0;
   std::string pendingInput;
   std::string inputId;
@@ -498,6 +515,7 @@ struct GdbEngine::Impl {
   }
 
   void feedInputLocked() {
+    if (inputDeliverySuspensions != 0) return;
     if (!wrapperReady && readyFd >= 0) {
       char marker = 0;
       if (::read(readyFd, &marker, 1) == 1 && marker == 1) {
@@ -1037,7 +1055,8 @@ struct GdbEngine::Impl {
   // record as well as the command acknowledgement. This keeps every returned
   // GdbStop tied to a real stop, rather than a guessed source line.
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
-               GdbError& e, int preempt = 0, bool collectConsole = false) {
+               GdbError& e, int preempt = 0, bool collectConsole = false,
+               bool* attempted = nullptr) {
     e = {};
     consoleOutput.clear();
     captureConsole = collectConsole || commandText == "-interpreter-exec console \"info record\"";
@@ -1052,7 +1071,9 @@ struct GdbEngine::Impl {
     const auto token = nextToken++;
     std::string tokenText = std::to_string(token);
     try {
-      process->write(tokenText + std::string(commandText) + "\n",
+      const auto wireCommand = tokenText + std::string(commandText) + "\n";
+      if (attempted) *attempted = true;
+      process->write(wireCommand,
                      std::chrono::steady_clock::now() + options.commandTimeout);
     } catch (const std::exception& ex) {
       failClosed(e, "INTERNAL", ex.what()); return false;
@@ -1730,6 +1751,50 @@ struct GdbEngine::Impl {
     stopped.fields = {{"reason", std::make_shared<MiValue>(MiValue::string_value(std::string(reason)))},
                       {"thread-id", std::make_shared<MiValue>(MiValue::string_value(thread))},
                       {"frame", std::make_shared<MiValue>(*value)}};
+    return true;
+  }
+
+  bool prepareMemoryWrite(GdbError& error) {
+    if (!live.load()) {
+      error = {"INVALID_REQUEST", "no live debugger", false};
+      return false;
+    }
+    // The selected launch profile remains authoritative even if GDB stopped
+    // recording after an unsupported instruction or a recorder failure.
+    if (recordingProfile != "native") {
+      error = {"UNSUPPORTED", "memory writes require the native recording profile", false};
+      return false;
+    }
+    MiRecord threads;
+    if (!command("-thread-info", false, threads, error)) return false;
+    const auto* entries = field(threads.fields, "threads");
+    const auto* current = field(threads.fields, "current-thread-id");
+    if (threads.klass != "done" || mi::find_all(threads.fields, "threads").size() != 1 ||
+        mi::find_all(threads.fields, "current-thread-id").size() > 1 ||
+        !entries || entries->kind != mi::ValueKind::value_list ||
+        !entries->fields.empty()) {
+      error = {"READ_FAILED", "cannot verify the inferior thread list for a memory write", false};
+      return false;
+    }
+    if (entries->values.size() != 1) {
+      error = {"UNSUPPORTED", "memory writes require exactly one stopped inferior thread", false};
+      return false;
+    }
+    const auto* thread = entries->values.front().get();
+    const auto* id = thread ? field(*thread, "id") : nullptr;
+    const auto* state = thread ? field(*thread, "state") : nullptr;
+    if (!thread || thread->kind != mi::ValueKind::tuple ||
+        mi::find_all(thread->fields, "id").size() != 1 ||
+        mi::find_all(thread->fields, "state").size() != 1 || !id || !state || !current ||
+        id->kind != mi::ValueKind::string || current->kind != mi::ValueKind::string ||
+        state->kind != mi::ValueKind::string || id->text.empty() || current->text != id->text) {
+      error = {"READ_FAILED", "cannot identify the selected inferior thread for a memory write", false};
+      return false;
+    }
+    if (state->text != "stopped") {
+      error = {"STALE_CONTEXT", "memory writes require a confirmed stopped inferior thread", false};
+      return false;
+    }
     return true;
   }
 
@@ -2429,6 +2494,7 @@ bool GdbEngine::readMemory(std::string_view addressHex, std::size_t byteCount,
   if (!address || *address > std::numeric_limits<std::uint64_t>::max() - byteCount) {
     error = {"INVALID_REQUEST", "invalid or overflowing memory address", false}; return false;
   }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   // Canonicalize parsed addresses: a bare hexadecimal input must never become
   // a GDB identifier/expression merely because it omits the 0x prefix.
   std::ostringstream canonical;
@@ -2484,6 +2550,54 @@ bool GdbEngine::readMemory(std::string_view addressHex, std::size_t byteCount,
   }
   result = {{"addressHex", canonical.str()}, {"bytesBase64", base64(bytes)},
             {"unreadableBytes", byteCount - bytes.size()}};
+  return true;
+}
+
+bool GdbEngine::prepareMemoryWrite(GdbError& error) {
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  return impl_->prepareMemoryWrite(error);
+}
+
+bool GdbEngine::writeMemoryBytes(std::string_view addressHex, std::string_view bytesHex,
+                                 bool& attempted, GdbError& error) {
+  attempted = false;
+  error = {};
+  if (bytesHex.size() > 512) {
+    error = {"LIMIT_EXCEEDED", "memory writes are limited to 256 bytes", false};
+    return false;
+  }
+  std::string bytes;
+  const auto address = addressHex.size() <= 18 ? parseAddress(addressHex) : std::nullopt;
+  if (!address || bytesHex.empty() || !appendHexBytes(bytesHex, bytes) ||
+      *address > std::numeric_limits<std::uint64_t>::max() - bytes.size()) {
+    error = {"INVALID_REQUEST", "memory write requires a uint64 address and 1..256 literal hexadecimal bytes without overflow", false};
+    return false;
+  }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  if (!impl_->prepareMemoryWrite(error)) return false;
+  std::ostringstream canonical;
+  canonical << "0x" << std::hex << *address;
+  std::string canonicalBytes(bytesHex);
+  for (auto& digit : canonicalBytes)
+    if (digit >= 'A' && digit <= 'F') digit = static_cast<char>(digit - 'A' + 'a');
+  MiRecord response;
+  if (!impl_->command("-data-write-memory-bytes " + canonical.str() + " " + canonicalBytes,
+                      false, response, error, 0, false, &attempted)) return false;
+  if (response.klass != "done") {
+    error = {"READ_FAILED", "GDB did not confirm completion of the memory write", false};
+    return false;
+  }
+  return true;
+}
+
+bool GdbEngine::refreshStoppedSnapshot(GdbStop& result, GdbError& error) {
+  result = {};
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  if (!impl_->prepareMemoryWrite(error)) return false;
+  MiRecord stopped;
+  if (!impl_->verifiedStoppedRecord(stopped, "intervention", error) ||
+      !impl_->makeStop(stopped, result, error)) return false;
+  result.processInstanceId = impl_->inferiorPid;
   return true;
 }
 
