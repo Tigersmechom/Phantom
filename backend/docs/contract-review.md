@@ -371,3 +371,24 @@ retained JSON. Both live commands require `expectedStop`.
 Schemas are in `backend-runtime-contract.ts`; main command/result unions and
 native runtime validators change together. Their protocol tests join the
 real-traffic TypeScript `satisfies` check.
+
+## 2026-10-04: explicitly selected absolute-vtable profile
+
+`inspectVtable{abi,vptrAddressHex,maxEntries}` requires an exact live stop and
+`abi:"itanium-x86_64-absolute-v1"`; the address denotes pointer storage, not
+the table. `readVtableSnapshot{snapshotId}` reads an immutable session capture.
+Reports contain exact raw bytes, signed decimal offset-to-top, checked top
+candidate, RTTI address and bounded words with optional ELF symbol labels.
+These are conditional interpretations under `abiEvidence:requested-profile`;
+`lifetime:unknown` and `tableEnd:unknown` remain explicit. Neither executable
+mapping permission nor `_ZTV` symbol membership proves a callable method or
+valid object. Relative vtables are outside this profile, without a promise of
+automatic detection of every incompatible layout.
+
+Complete maps are checked before/after; unreadable mappings cannot be bypassed
+through GDB's ptrace privileges. Slot/header rereads report sampled consistency,
+not atomicity. Symbol metadata uses at most four 1 MiB inspections. Memory reads,
+word count, report retention and callback count are bounded; absent symbol
+evidence and partial reads are never synthesized from present memory on a
+historical request. GDB memory and current OS metadata have distinct scope
+during replay. The protocol regression joins the real TypeScript traffic test.

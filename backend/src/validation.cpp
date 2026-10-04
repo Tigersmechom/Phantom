@@ -273,7 +273,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
@@ -316,6 +316,25 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "writeVariable") { only({"kind","locator","expected","value"}); id(req(c,"locator","command"),"command.locator",l); validate_runtime_value(req(c,"expected","command"),l); validate_scalar_value(req(c,"value","command"),l); return; }
   if (kind == "disassemble") { only({"kind","buildId","target","maxInstructions"}); id(req(c,"buildId","command"),"command.buildId",l); const auto& t=req(c,"target","command"); expect_object(t,"command.target"); const auto tk=t.value("kind",""); if(tk=="pc"){exact_keys(t,{"kind","addressHex"},"command.target");string_value(req(t,"addressHex","command.target"),"command.target.addressHex",l.maxIdBytes);} else if(tk=="source"){exact_keys(t,{"kind","range"},"command.target");span(req(t,"range","command.target"),l);} else invalid("command.target.kind","unknown target"); positive_uint(req(c,"maxInstructions","command"),"command.maxInstructions",l.maxInstructions); return; }
   if (kind == "readMemory") { only({"kind","addressHex","byteCount"}); string_value(req(c,"addressHex","command"),"command.addressHex",l.maxIdBytes); positive_uint(req(c,"byteCount","command"),"command.byteCount",l.maxMemoryReadBytes); return; }
+  if (kind == "inspectVtable") {
+    only({"kind","abi","vptrAddressHex","maxEntries"});
+    enum_string(req(c,"abi","command"),"command.abi",{"itanium-x86_64-absolute-v1"});
+    const auto& address = req(c,"vptrAddressHex","command");
+    string_value(address,"command.vptrAddressHex",18);
+    const auto& text = address.get_ref<const std::string&>();
+    if (!text.starts_with("0x") || text.size() <= 2)
+      invalid("command.vptrAddressHex","expected hexadecimal 0x address");
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data()+2,text.data()+text.size(),value,16);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size() ||
+        value > std::numeric_limits<std::uint64_t>::max() - 8)
+      invalid("command.vptrAddressHex","invalid or overflowing pointer slot address");
+    positive_uint(req(c,"maxEntries","command"),"command.maxEntries",64);
+    return;
+  }
+  if (kind == "readVtableSnapshot") {
+    only({"kind","snapshotId"}); id(req(c,"snapshotId","command"),"command.snapshotId",l); return;
+  }
   if (kind == "inspectModuleSymbols") {
     only({"kind","moduleId"}); id(req(c,"moduleId","command"),"command.moduleId",l); return;
   }

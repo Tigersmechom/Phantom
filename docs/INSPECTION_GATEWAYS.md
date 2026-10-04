@@ -28,6 +28,8 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readModuleSnapshot` / `readModuleSymbols` | No | Read retained module metadata or symbol pages. |
 | `inspectVariableLayout` | Required | Capture declared type/storage layout for an emitted root locator. |
 | `readVariableLayout` | No | Read a retained variable layout. |
+| `inspectVtable` | Required | Decode a selected vptr slot under an explicitly requested ABI profile. |
+| `readVtableSnapshot` | No | Read a retained vptr/header/word capture. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 
@@ -350,3 +352,72 @@ not expanded element by element. Limits are depth 8, 128 nodes, 128 fields,
 these are traversal/output limits, not a byte quota on GDB's own DWARF decoder.
 The normal debugger command deadline still applies. Metadata API reference:
 [GDB Types in Python](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Types-In-Python.html).
+
+## Vptr, table headers and raw table words
+
+```json
+{"kind":"inspectVtable","abi":"itanium-x86_64-absolute-v1","vptrAddressHex":"0x12345678","maxEntries":16}
+{"kind":"readVtableSnapshot","snapshotId":"vtable-3"}
+```
+
+`vptrAddressHex` is the address of the **storage containing the vptr**, such as
+the compiler-provided artificial field of a polymorphic object or a selected
+base subobject. It is not the vtable address itself. The frontend can obtain
+the storage address from layout metadata or an explicit memory selection.
+The backend does not assume that every object begins with a vptr, enumerate
+all base subobjects, or follow user expressions. The request requires the
+current session and `expectedStop`; it leaves execution and history position
+unchanged. Both commands return `kind:vtableSnapshot` with an immutable
+`snapshot.report`.
+
+This profile interprets 8-byte little-endian absolute pointers under the
+Linux x86-64 Itanium layout. `abiEvidence:requested-profile` records the caller's
+choice, not an automatically verified compiler ABI. Relative vtables are not
+supported; a wrong profile cannot always be detected from arbitrary bytes.
+ELF64, an x86-64 machine ID and a `_ZTV` name alone do not establish the encoding.
+LLVM can use 32-bit relative components in the same target environment; see
+[LLVM vtable generation](https://github.com/llvm/llvm-project/blob/main/clang/lib/CodeGen/CGVTables.cpp).
+
+The capture retains exact `bytesHex` for the vptr slot, the two-word header
+before its address point and up to 64 following words. Under the requested
+profile, the header contains signed `offsetToTopDecimal` and an RTTI pointer.
+`topAddressCandidateHex` is checked address arithmetic, not proof of allocation
+ownership or object lifetime. A positive offset can occur during construction;
+zero RTTI can occur without RTTI support. `lifetime:unknown` stays explicit.
+The profile follows [Itanium virtual tables and construction tables](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vtable).
+
+`tableSymbols` labels matching `_ZTV` and compiler `_ZTC` ranges;
+`rttiSymbols` labels exact `_ZTI` addresses. Metadata is collected from verified
+mapped files. `entries[].functions` labels exact `STT_FUNC` addresses, preserving
+aliases; an executable mapping alone is only `classification:executable-address`.
+No virtual function or typeinfo function is invoked. Missing symbols do not
+prove an invalid vptr. Prefixes, loaded mappings and raw memory remain separate
+evidence; symbol interposition and allocation/type identity are not inferred.
+Table/RTTI labels require ordinary address-bearing `STT_OBJECT` symbols;
+an IFUNC resolver or a function with a misleading `_ZTV` prefix is not table
+evidence. `coverage` describes this bounded window and its metadata evidence,
+not discovery of every virtual method or the class inheritance graph. An empty
+`functions` list means no matching exact function label was captured.
+
+Entries are **words, not methods**. A symbol can contain a primary table plus
+secondary tables and their headers; `tableEnd:unknown` prevents its size from
+becoming a fabricated method count. Null/non-executable words do not terminate
+the scan. A proven symbol extent or readable mapping can bound the captured
+window, and `scanStop` explains why it ended. An address point at the end of a
+symbol can legitimately yield no following words. The reader never interprets
+a partial word/header as a complete value.
+
+Memory reads require readable mappings, even where GDB could bypass page
+protection. The decoder performs at most five raw reads and 560 bytes, including
+vptr/header rereads; matching samples are `sampled-not-atomic`, not proof that
+shared memory remained unchanged. Up to four distinct module reports each have
+a 1 MiB metadata-read budget. Truncated/missing symbols and unavailable memory
+remain explicit. Complete current mappings are compared before and after the
+request. `evidenceScope:debugger-memory-and-current-os-metadata` matters during
+record-full replay: GDB memory can reflect the replay position while procfs and
+mapped-file metadata still describe the current OS.
+
+Historical reads use saved JSON only and survive object destruction or process
+exit until retention eviction or a new session. They do not reread a pointer
+that may now refer to a different allocation. The shared inspection store and
+its existing byte/record limits apply. No new graphical renderer is included.

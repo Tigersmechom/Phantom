@@ -33,8 +33,8 @@ memory captures/diff и ограниченная запись изменений
 Реализованы журнал фактического вывода, снимки runtime ELF modules
 и изолированная проверка recorder. Отдельный ограниченный `gdb-record-full`
 профиль подключён к публичному service. Добавлены секции/символы ELF с runtime
-адресами и declared variable layout по GDB/DWARF. Результаты общей приёмки
-и границы нового среза — в §20.7; предыдущий output/modules/recorder checkpoint
+адресами и declared variable layout по GDB/DWARF. Результаты их приёмки —
+в §20.7; текущий срез vptr/vtable описан в §20.8. Предыдущий output/modules/recorder checkpoint
 прошёл 26/26 CTest в Debug и ASan/UBSan и проверку 819 реальных DTO.
 Подробный порядок, зависимости и приёмка — [§20](#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
@@ -793,6 +793,12 @@ ABI подтверждён на установленной libstdc++13, не о�
   (возможна relocatable/RELRO data). Указатель объекта может указывать на
   address point внутри таблицы, а multiple/virtual inheritance требует
   нескольких таблиц и смещений. [Itanium C++ ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vtable).
+- `inspectVtable` / `readVtableSnapshot` предоставляют выбранный vptr slot,
+  заголовок и до 64 сырых слов в явно выбранном absolute-профиле Itanium x86-64.
+  Байты сопоставляются с ELF-символами `_ZTV`/`_ZTC`/`_ZTI` и адресами функций.
+  Это условная ABI-интерпретация, не доказательство lifetime, динамического
+  типа или полного числа методов. Автоматическое обнаружение всех vptr/base
+  subobjects и relative vtables остаётся отдельным расширением. См. §20.8.
 - Ubuntu/Linux doctor проверяет kernel/arch, фактическую доступность procfs,
   pid namespace, ptrace/Yama, seccomp и библиотеки; не меняет системные
   настройки. Недоступность maps не отменяет уже доступные stepping/locals.
@@ -935,6 +941,8 @@ observation history, сохраняет границы eviction и не обещ
 - `inspectVariableLayout` / `readVariableLayout`: declared type, storage
   address и ограниченная структура полей/массивов по GDB/DWARF; отдельный
   immutable snapshot без pointer traversal и доказательства lifetime.
+- `inspectVtable` / `readVtableSnapshot`: явно выбранный vptr slot → байты
+  header/word window и ELF-подписи; ABI задаёт клиент, lifetime не выводится.
 - `probeRecorders`: проверка служебного fixture до launch или рядом с живой
   сессией; настоящее доказательство записи/повтора или явная причина отказа.
 - `inspectProcess`: ограниченные `stat`/`status`/`personality`, exe/fd targets,
@@ -958,8 +966,10 @@ observation history, сохраняет границы eviction и не обещ
 [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
 
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
-секции/символы ELF и статическое устройство переменных. Следующий порядок: **ABI-подтверждённые
-vtable/object связи 20.2 → вмешательства с аудитом 20.5**. Ограниченный
+секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
+явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
+**вмешательства с аудитом 20.5**, параллельно — углубление object/lifetime
+и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
 Каждый срез завершается обновлением DTO/fixtures, headless интеграционными
@@ -1004,3 +1014,37 @@ bitfields/union/arrays, optimized-out storage, глубину/число пол�
 переключение frames, устаревшие/невыданные locators, имена длиной 256/257 байт
 и попытки передать выражение вместо имени. Обнаруженные при ревью ошибки
 удержания locator и несогласованных лимитов исправлены до приёмки.
+
+### 20.8. Vptr и ABI-декодирование таблиц — 04.10.2026
+
+Две команды: `inspectVtable` и `readVtableSnapshot`. Live-запрос содержит
+`vptrAddressHex` (адрес storage указателя), `maxEntries:1..64` и явный
+`abi:"itanium-x86_64-absolute-v1"`. Снимок содержит raw slot/header/words,
+signed offset-to-top, top address candidate, RTTI address, ELF-подписи
+таблиц/RTTI/функций. Нулевые/неисполняемые слова не объявляются концом таблицы;
+диапазон `_ZTV` может включать заголовки secondary tables. `tableEnd:unknown`
+не позволяет выдать размер ELF-символа за число методов.
+
+`abiEvidence:requested-profile` и `lifetime:unknown` обязательны: ELF64 и
+имя символа не доказывают используемую ABI-модель или существование объекта.
+Relative vtables не поддерживаются; универсальное автоматическое обнаружение
+неподходящего профиля не обещается. Декодер не вызывает inferior functions
+и не делает произвольный обход указателей. Чтения ограничены readable maps,
+лимитами metadata/words и повторной проверкой slot/header; совпавшие выборки
+не считаются атомарным snapshot shared memory. При record-full GDB bytes
+и текущие OS mappings/ELF metadata остаются разными видами свидетельств.
+
+Формы DTO и ограничения: [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
+Новый fixture проверяет 47 остановок с ordinary/multiple/virtual inheritance,
+construction/destruction vtables и реальным положительным offset-to-top `+8`.
+Проверены `-fno-rtti`, stripped ELF, выбранный неподходящий relative ABI,
+неизменность регистров/state/recording cursor, исторические снимки после exit,
+неправильные адреса, PROT_NONE, границы страниц и скопированный vptr в обычном
+числе. Unit-проверки дополняют их signed overflow/INT64_MIN, частичными и
+изменившимися чтениями, лимитами maps/symbols/labels и 129 алиасами таблицы.
+Лимит выдаваемых подписей не ослабляет минимальную известную границу чтения.
+Приёмка: **33/33 CTest Debug и 33/33 ASan/UBSan** после последнего исправления.
+**2443 реальных protocol frames** проверены по TypeScript DTO (5.9.3).
+Прошли пять harness checks и четыре contract fixtures; прежние `cin/cout`,
+source/instruction stepping, recorder, memory/layout gateways и history
+сохранили работоспособность в своих регрессионных сценариях.

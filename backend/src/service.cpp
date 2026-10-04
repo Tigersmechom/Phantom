@@ -119,6 +119,7 @@ Json BackendService::capabilities() const {
       {"instructionTrace", "instruction-boundaries"}, {"memoryCapture", true}, {"memoryMapDiff", true}, {"outputJournal", true},
       {"moduleInspection", "linux-proc-maps-elf"},
       {"moduleSymbols", "elf-section-symbol-tables"}, {"variableLayout", "gdb-python-dwarf"}, {"recorderProbe", true},
+      {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
@@ -709,7 +710,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
     if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
-         kind == "readModuleSymbols" || kind == "readVariableLayout" ||
+         kind == "readModuleSymbols" || kind == "readVariableLayout" || kind == "readVtableSnapshot" ||
          kind == "readModuleSnapshot" || kind == "readOutputJournal" || kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
         !sessionId_.empty() && request.at("session").is_null())
       return {errorResponse(request, "STALE_CONTEXT", "history belongs to the current debugging session", false)};
@@ -740,7 +741,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
                              kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" ||
-                             kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" ||
+                             kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" ||
                              kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
                              kind == "setBreakpoints" || kind == "writeVariable";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
@@ -800,6 +801,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "inspectModules" || kind == "readModuleSnapshot") return handleModules(request);
     if (kind == "inspectModuleSymbols" || kind == "readModuleSymbols") return handleModuleSymbols(request);
     if (kind == "inspectVariableLayout" || kind == "readVariableLayout") return handleVariableLayout(request);
+    if (kind == "inspectVtable" || kind == "readVtableSnapshot") return handleVtable(request);
     if (kind == "launch") return handleLaunch(request, publish);
     if (kind == "traceInstructions") return handleTrace(request, publish);
     if (kind == "seekRecording" || kind == "reverseInstruction") return handleRecordedExecution(request, publish);

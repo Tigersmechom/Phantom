@@ -165,11 +165,16 @@ Clang/LLVM toolchain, immutable event schema и coverage gaps — эти фун�
 
 `inspectModuleSymbols` / `readModuleSymbols` добавляют секции и символы ELF
 с проверенными runtime-диапазонами и сохранённой пагинацией. Имена vtable/RTTI
-пока дают только классификацию символов; связи конкретных объектов с таблицами
-требуют отдельного ABI-декодера. `inspectVariableLayout` / `readVariableLayout`
+дают классификацию символов. `inspectVariableLayout` / `readVariableLayout`
 сохраняют declared type, размер, адрес storage и структуру полей/массивов из
 GDB/DWARF. Указатели не разыменовываются, inferior functions не вызываются,
 наличие адреса не считается доказательством начала lifetime переменной.
+
+`inspectVtable` / `readVtableSnapshot` сохраняют связь выбранного vptr slot
+с адресом таблицы, её заголовок, смещение к предполагаемому началу объекта,
+RTTI pointer и ограниченное окно сырых слов с ELF-подписями. Клиент явно выбирает
+профиль `itanium-x86_64-absolute-v1`; ABI/lifetime не устанавливаются автоматически.
+Слова таблицы не выдаются за число методов; чтения не вызывают inferior functions.
 
 Контракты и примеры: [RECORDING.md](../docs/RECORDING.md) и
 [INSPECTION_GATEWAYS.md](../docs/INSPECTION_GATEWAYS.md).

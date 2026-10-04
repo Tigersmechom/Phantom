@@ -349,3 +349,63 @@ export interface VariableLayoutSnapshotDTO {
   processInstanceId: string;
   layout: VariableLayoutDTO;
 }
+
+/** Symbol evidence does not prove that a live C++ object owns this storage. */
+export interface VtableSymbolDTO {
+  moduleId: string;
+  tableSectionIndex: number;
+  index: number;
+  name: string | null;
+  nameBytesHex?: string;
+  type: string;
+  addressHex: string;
+  sizeHex: string;
+  kind: 'vtable' | 'construction-vtable' | 'rtti' | 'function';
+}
+export interface VtableEntryDTO {
+  /** Index within the captured word window, not a virtual method index. */
+  index: number;
+  addressHex: string;
+  bytesHex: string;
+  valueHex: string;
+  classification: 'null' | 'executable-address' | 'other';
+  functions: VtableSymbolDTO[];
+}
+/** Conditional decoding under an explicitly requested absolute-pointer ABI. */
+export interface VtableReportDTO {
+  available: boolean;
+  source: 'itanium-vtable-memory';
+  abi: 'itanium-x86_64-absolute-v1';
+  abiEvidence: 'requested-profile';
+  lifetime: 'unknown';
+  consistency: 'sampled-not-atomic';
+  sampleStatus: 'stable' | 'changed' | 'unconfirmed';
+  coverage: 'complete' | 'partial' | 'truncated' | 'none';
+  vptrAddressHex: string;
+  requestedEntries: number;
+  vptrSlot: { addressHex: string; bytesHex: string; valueHex: string } | null;
+  header: {
+    addressHex: string;
+    bytesHex: string;
+    offsetToTopDecimal: string;
+    topAddressCandidateHex: string | null;
+    rttiAddressHex: string;
+  } | null;
+  tableSymbols: VtableSymbolDTO[];
+  rttiSymbols: VtableSymbolDTO[];
+  /** The symbol extent can include secondary tables; it is not a method count. */
+  tableEnd: 'unknown';
+  scanStop: string;
+  entries: VtableEntryDTO[];
+  metadata: { requestedModules: number; truncated: boolean };
+  reason?: string;
+}
+export interface VtableSnapshotDTO {
+  type: 'vtableSnapshot';
+  id: string;
+  point: HistoryPointDTO;
+  stop: StopRefDTO;
+  processInstanceId: string;
+  evidenceScope: 'debugger-memory-and-current-os-metadata';
+  report: VtableReportDTO;
+}

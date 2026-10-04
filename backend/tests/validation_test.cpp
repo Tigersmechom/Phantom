@@ -186,6 +186,40 @@ int main() {
   assert(!validation_fails(gateway));
   gateway["command"]["snapshotId"] = "";
   assert(validation_fails(gateway));
+  // The ABI decoder accepts bounded exact addresses, never an expression.
+  gateway["expectedStop"] = {{"stopId", "stop-1"}, {"stateRevision", 1}};
+  const Json vtableCommand = {{"kind", "inspectVtable"}, {"abi", "itanium-x86_64-absolute-v1"},
+                              {"vptrAddressHex", "0x1234"}, {"maxEntries", 64}};
+  gateway["command"] = vtableCommand;
+  assert(!validation_fails(gateway));
+  auto missingVtableStop = gateway; missingVtableStop.erase("expectedStop");
+  assert(validation_fails(missingVtableStop, "INVALID_REQUEST"));
+  for (const auto& address : {"0x0", "0xffffffffff600000", "0xfffffffffffffff7", "0xABCDEF"}) {
+    gateway["command"]["vptrAddressHex"] = address;
+    assert(!validation_fails(gateway));
+  }
+  for (const auto& address : Json::array({"", "0x", "1234", "-0x1", "0x+1", "0x1\ncontinue",
+                                         "0x1\t", "&object", "0xfffffffffffffff8", "0x10000000000000000", 1, false, nullptr})) {
+    gateway["command"]["vptrAddressHex"] = address;
+    assert(validation_fails(gateway));
+  }
+  for (const auto& count : Json::array({0, -1, 65, 1.5, true, "1", nullptr})) {
+    gateway["command"] = vtableCommand; gateway["command"]["maxEntries"] = count;
+    assert(validation_fails(gateway));
+  }
+  for (const auto* extra : {"expression", "pid", "path", "script"}) {
+    gateway["command"] = vtableCommand; gateway["command"][extra] = "untrusted";
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  gateway["command"] = vtableCommand; gateway["command"].erase("abi");
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway["command"]["abi"] = "relative";
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway.erase("expectedStop");
+  gateway["command"] = {{"kind", "readVtableSnapshot"}, {"snapshotId", "vtable-1"}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["snapshotId"] = "";
+  assert(validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before
   // accepting an asynchronous trace, not discovered after acceptance.
   phantom::ValidationLimits small;

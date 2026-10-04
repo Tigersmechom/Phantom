@@ -1,4 +1,4 @@
-import type { ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -600,6 +600,7 @@ export interface BackendCapabilitiesDTO {
   outputJournal: boolean;
   moduleSymbols: 'elf-section-symbol-tables' | 'none';
   variableLayout: 'gdb-python-dwarf' | 'none';
+  vtableInspection: 'itanium-x86_64-absolute-v1' | 'none';
   moduleInspection: 'linux-proc-maps-elf' | 'none';
   recorderProbe: boolean;
   recordingProfiles: RecordingProfileDTO[];
@@ -642,6 +643,8 @@ export type BackendCommandDTO =
   | { kind: 'readModuleSymbols'; snapshotId: string; start: number; count: number }
   | { kind: 'inspectVariableLayout'; locator: string }
   | { kind: 'readVariableLayout'; snapshotId: string }
+  | { kind: 'inspectVtable'; abi: 'itanium-x86_64-absolute-v1'; vptrAddressHex: string; maxEntries: number }
+  | { kind: 'readVtableSnapshot'; snapshotId: string }
   | { kind: 'readModuleSnapshot'; snapshotId: string }
   | { kind: 'probeRecorders' }
   | { kind: 'readRecording' }
@@ -672,6 +675,7 @@ export type BackendResultDTO =
   | { kind: 'moduleSnapshot'; snapshot: ModuleSnapshotDTO }
   | { kind: 'moduleSymbols'; snapshot: ModuleSymbolsSnapshotDTO; start: number; totalSymbols: number; hasMore: boolean }
   | { kind: 'variableLayout'; snapshot: VariableLayoutSnapshotDTO }
+  | { kind: 'vtableSnapshot'; snapshot: VtableSnapshotDTO }
   | { kind: 'recorderProbe'; probe: RecorderProbeDTO }
   | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }

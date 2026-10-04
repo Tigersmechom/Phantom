@@ -10,6 +10,8 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/service_vtable.cpp
+  src/vtable.cpp
   src/service_symbols.cpp
   src/service_layout.cpp
   src/elf_symbols.cpp
@@ -94,7 +96,7 @@ if(BUILD_TESTING)
   add_library(phantom-module-map-library SHARED fixtures/module-map-library.cpp)
   target_compile_options(phantom-module-map-library PRIVATE -g -fno-sanitize=all)
   target_link_options(phantom-module-map-library PRIVATE -fno-sanitize=all)
-  foreach(module IN ITEMS elf elf-symbols module-symbols process-inspection output-journal recorder-probe module-map)
+  foreach(module IN ITEMS elf elf-symbols module-symbols vtable process-inspection output-journal recorder-probe module-map)
     string(REPLACE "-" "_" test_file "${module}")
     add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
     target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
@@ -118,7 +120,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure output_journal recorder_probe recording layout)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure output_journal recorder_probe recording layout vtable)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)

@@ -110,5 +110,13 @@ load instances и сохраняют страницы символов; втор
 structure конкретной переменной без inferior calls и pointer traversal.
 Снимки неизменяемы, root locators принадлежат остановке, а storage address
 не является свидетельством lifetime. Vtable/RTTI prefix classification
-служит подписью области; полный object/ABI overlay требует следующего слоя.
+служит подписью области.
 Примеры и точные поля — [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
+
+`inspectVtable` / `readVtableSnapshot` добавляют чтение выбранного vptr slot,
+header и ограниченного окна слов с сопоставлением ELF-символов. Адрес запроса —
+storage vptr, профиль ABI передаётся явно. `abiEvidence:requested-profile` и
+`lifetime:unknown` не позволяют принять декодирование произвольных байтов за
+доказательство живого C++ объекта. Snapshot сохраняет как байты GDB, так и
+пометку текущего OS-происхождения mappings/ELF metadata; повторное чтение
+исторического snapshot не обращается к процессу.
