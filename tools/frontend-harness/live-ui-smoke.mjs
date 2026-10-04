@@ -100,7 +100,26 @@ try {
   assert.equal(elements.get('stdout').textContent, '[exact  spaces]');
   assert.equal(requests.filter(x => x.command.kind === 'appendInput').at(-1).command.text, 'exact  spaces');
   assert.equal(requests.filter(x => x.command.kind === 'closeInput').length, 1);
-  console.log('PASS live browser app → HTTP → GDB: two cin waits, exact chunks, getline draft and EOF');
+  await buildLaunch('#include <iostream>\nint main() {\n std::ios::sync_with_stdio(false);\n std::cout << "pending";\n std::cout << std::flush;\n return 0;\n}\n', 'token');
+  let sawPending = false;
+  for (let i = 0; i < 6; ++i) {
+    const previous = debug.state().stop?.stateRevision;
+    await debug.action('step');
+    await until(() => debug.state().stop?.stateRevision !== previous || debug.state().phase === 'terminated', 'output step');
+    if (elements.get('output-pending').innerHTML?.includes('pending')) {
+      sawPending = true;
+      assert.equal(elements.get('stdout').textContent, '', 'pending cout has not reached stdout');
+      assert.match(elements.get('output-pending').innerHTML, /output-unflushed/);
+      assert.match(elements.get('memory-map').textContent, /r-xp/, 'real mapping permissions reach the panel');
+      break;
+    }
+  }
+  assert.ok(sawPending, 'unsynchronized cout is visible before flush');
+  await debug.action('continue');
+  await until(() => debug.state().phase === 'terminated', 'output flush and exit');
+  assert.equal(elements.get('stdout').textContent, 'pending');
+  assert.equal(elements.get('output-pending').innerHTML, '', 'flush clears the pending segment');
+  console.log('PASS live app → HTTP → GDB: cin/getline, unsynchronized cout→flush, memory map');
 } finally {
   if (server.exitCode === null) {
     server.kill('SIGTERM');

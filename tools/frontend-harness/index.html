@@ -31,7 +31,7 @@ int main() {
         <label>Аргументы<textarea id="argv"></textarea></label>
         <label>Начальный stdin<textarea id="input" placeholder="Точный текст, который доступен при Launch"></textarea></label>
         <label>Environment<textarea id="environment">PHANTOM_HARNESS=1</textarea></label>
-        <label>Пример программы<select id="sample-program" aria-label="Выбрать пример программы"><option value="custom">Мой исходник</option><option value="integer">cin: число и результат</option><option value="getline">getline: строка с пробелами</option><option value="flush">cout: буфер и flush</option></select></label>
+        <label>Пример программы<select id="sample-program" aria-label="Выбрать пример программы"><option value="custom">Мой исходник</option><option value="integer">cin: число и результат</option><option value="getline">getline: строка с пробелами</option><option value="flush">cout: буфер и flush</option><option value="unsynced">cout: sync_with_stdio(false)</option></select></label>
       </div>
       <label class="inline"><input id="input-eof" type="checkbox">Закрыть stdin после начального текста (конечный ввод)</label>
       <p class="hint">Текст сохраняется побайтно: пробелы и переводы строк не добавляются автоматически. При открытом stdin пустой начальный текст означает ожидание ввода.</p>
@@ -68,8 +68,8 @@ int main() {
       <article><h2>State</h2><p id="state-status" class="hint">—</p><pre id="state">—</pre></article>
       <article><h2>Observation</h2><pre id="observation">—</pre></article>
       <article><h2>Переменные текущей остановки</h2><pre id="variables">—</pre></article>
-      <article><h2>Буфер stdout / cout до flush</h2><pre id="buffered-cout">Ожидание остановки процесса.</pre><div id="buffer-metrics" class="metrics"></div><p id="buffer-status" class="hint">—</p><p class="hint">Показан буфер C stdout. Он отражает cout только при включённой синхронизации с C stdio; собственный буфер cout после sync_with_stdio(false) пока не захватывается.</p><p class="hint">Свободное место не является обратным отсчётом до flush: flush, endl, связанный cin или крупная запись могут сбросить вывод раньше.</p></article>
-      <article><h2>stdout (сброшенный)</h2><pre id="stdout">—</pre><p id="stdout-check" class="check">Буфер cout не проверен.</p></article>
+      <article class="wide"><h2>Вывод программы</h2><pre class="program-output"><span id="stdout"></span><span id="output-pending"></span></pre><p id="stdout-check" class="check">Красный фон — вывод ещё в буфере.</p><p id="output-note" class="hint"></p><details><summary>Буфер и ёмкость</summary><pre id="buffered-cout">Ожидание остановки процесса.</pre><div id="buffer-metrics" class="metrics"></div><p id="buffer-status" class="hint">—</p><p class="hint">Поддержаны стандартные буферы glibc / libstdc++, включая sync_with_stdio(false). Для неизвестного или заменённого rdbuf данные отмечаются как недоступные.</p><p class="hint">Свободное место не является обратным отсчётом до flush: flush, endl, связанный cin или крупная запись могут сбросить вывод раньше.</p></details></article>
+      <article class="wide"><h2>Карта виртуальной памяти</h2><pre id="memory-map">Ожидание остановки процесса.</pre><p class="hint">Все доступные отображённые области: код, библиотеки, стек, heap, read-only данные и guard pages. Типы объектов/vtable требуют отдельного сопоставления с символами. Содержимое читается через readMemory по адресу и актуальному stop.</p></article>
       <article><h2>stderr / errors</h2><pre id="stderr">—</pre></article>
       <article><h2>History (остановки)</h2><pre id="history">—</pre></article>
       <article class="wide"><h2>Wire and event log</h2><pre id="log"></pre></article>

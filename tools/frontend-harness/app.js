@@ -17,6 +17,7 @@ let appendFlight = null, appendQueue = null;
 let activeExecution = null, autoResumeInFlight = false, autoResumeBlocked = false;
 let eofRequested = false, eofClosing = false;
 const log = [], pendingRequests = new Map(), finishedRequests = new Map(), sending = new Set();
+let committedOutput = null;
 const sameSession = (a, b) => a && b && a.id === b.id && a.generation === b.generation;
 const sameStop = (a, b) => a && b && a.stopId === b.stopId && a.stateRevision === b.stateRevision;
 const executing = () => executionKinds.some(kind => sending.has(kind)) ||
@@ -57,7 +58,7 @@ function renderBuildStatus() {
     `Сборка соответствует редактору: ${artifact.id.slice(0, 12)}.`;
 }
 function renderBuffer(snapshot) {
-  const buffered = snapshot?.buffered;
+  const buffered = snapshot?.coutBuffered?.available ? snapshot.coutBuffered : snapshot?.buffered;
   if (!buffered?.available) {
     $('buffered-cout').textContent = 'Недоступно';
     if ($('buffer-metrics')) $('buffer-metrics').textContent = 'Метрики: ND (ABI/режим не подтверждён)';
@@ -84,6 +85,48 @@ function renderBuffer(snapshot) {
     (storage == null ? '' : `; физическое хранилище ${storage} байт`) +
     (buffered.mode ? `; режим: ${buffered.mode}` : '') +
     (buffered.truncated ? '; текст показан частично.' : '.');
+}
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function renderOutput(observation) {
+  const snapshot = observation.stdout || {text:'',totalBytes:0,retainedFromByte:0};
+  // A historical cursor can shrink pending bytes, but cannot undo bytes
+  // already emitted by this run. Keep this bounded terminal view separate
+  // from the immutable stdout snapshot stored in each Observation.
+  const key = JSON.stringify([sessionEpoch, session?.id, session?.generation,
+    observation.processInstanceId, observation.buildId, observation.point?.branchId]);
+  if (!committedOutput || committedOutput.key !== key || snapshot.totalBytes > committedOutput.snapshot.totalBytes ||
+      (snapshot.totalBytes === committedOutput.snapshot.totalBytes && snapshot.retainedFromByte < committedOutput.snapshot.retainedFromByte))
+    committedOutput = {key, snapshot};
+  const committed = committedOutput.snapshot;
+  $('stdout').textContent = committed.text || '';
+  const c = snapshot.buffered;
+  const cpp = snapshot.coutBuffered;
+  // Identity is established by the backend. Equal text is not buffer identity.
+  const buffers = cpp?.available && cpp.association === 'cout-synchronized' ? [cpp] : [c, cpp];
+  const pending = buffers.filter(buffer => buffer?.available && buffer.pendingBytes > 0);
+  if ($('output-pending')) $('output-pending').innerHTML = pending.map(buffer => {
+    const text = buffer.textStatus === 'unavailable' ? `[${buffer.pendingBytes} байт: текст недоступен]` : buffer.text;
+    const label = pending.length > 1 ? `<span class="output-domain">${escapeHtml(buffer.stream)}: </span>` : '';
+    return `<span class="output-unflushed">${label}${escapeHtml(text || '')}</span>`;
+  }).join(pending.length > 1 ? '\n' : '');
+  const notes = [];
+  if (pending.length > 1) notes.push('stdout и cout имеют независимые буферы; порядок их будущего вывода неизвестен.');
+  if (cpp && !cpp.available) notes.push(`Буфер cout недоступен: ${cpp.reason}.`);
+  if (snapshot.totalBytes < committed.totalBytes) notes.push('Сброшенный текст сохранён из более поздней остановки этого запуска.');
+  if (committed.retainedFromByte > 0) notes.push(`Начало вывода вытеснено: ${committed.retainedFromByte} байт.`);
+  if ($('output-note')) $('output-note').textContent = notes.join(' ');
+  $('stdout-check').textContent = `Сброшено: ${committed.totalBytes ?? 0} байт. Красный фон — ещё не сброшенные байты выбранной остановки.`;
+}
+function renderMemoryMap(snapshot) {
+  if (!$('memory-map')) return;
+  if (!snapshot?.available) {
+    $('memory-map').textContent = `Карта недоступна: ${snapshot?.reason || 'нет снимка'}.`;
+    return;
+  }
+  $('memory-map').textContent = `${snapshot.regions.length} областей; ${snapshot.coverage}${snapshot.reason ? ` (${snapshot.reason})` : ''}\n` +
+    snapshot.regions.map(region => `${region.startAddressHex}–${region.endAddressHex} ${region.permissions} ${region.kind} ${region.path || (region.pathBytesHex ? '[не UTF-8 путь]' : '')}`).join('\n');
 }
 function metric(label, value) { return `<span class="metric"><b>${label}</b><code>${String(value)}</code></span>`; }
 function renderVariables(stack) {
@@ -366,9 +409,8 @@ function applyObservation(observation, {allowAuto = true} = {}) {
   stop = observation.stop;
   branchId = observation.point.branchId;
   $('observation').textContent = pretty(observation);
-  $('stdout').textContent = observation.stdout?.text || '(empty)';
+  renderOutput(observation);
   $('stderr').textContent = observation.stderr?.text || '(empty)';
-  $('stdout-check').textContent = `Получено из stdout: ${observation.stdout?.totalBytes ?? 0} байт.`;
   // The wait reason belongs to Observation rather than the transport input
   // object in the native profile. Copy it into the UI view so an idle pipe is
   // not mistaken for a program that is not blocked in cin.
@@ -387,6 +429,7 @@ function applyObservation(observation, {allowAuto = true} = {}) {
   if (allowAuto) maybeCommitAndResume();
   renderBuffer(observation.stdout);
   renderVariables(observation.stack);
+  renderMemoryMap(observation.memoryMap);
 }
 function finishPending(payload) {
   const kind = pendingRequests.get(payload.requestId);
@@ -653,6 +696,7 @@ const samples = {
   integer: '#include <iostream>\nint main() {\n  int value = 0;\n  std::cin >> value;\n  std::cout << "value=" << value << "\\n";\n  return 0;\n}\n',
   getline: '#include <iostream>\n#include <string>\nint main() {\n  std::string text;\n  std::getline(std::cin, text);\n  std::cout << "line=[" << text << "]\\n";\n}\n',
   flush: '#include <iostream>\nint main() {\n  std::cout << "before";\n  std::cout << std::flush;\n  std::cout << " after\\n";\n}\n',
+  unsynced: '#include <iostream>\n#include <cstdio>\nint main() {\n  std::ios::sync_with_stdio(false);\n  std::cout << "cout: pending";\n  std::printf("printf: pending");\n  std::cout << std::flush;\n  std::fflush(stdout);\n}\n',
 };
 if ($('sample-program')) $('sample-program').addEventListener('change', () => {
   const sample = samples[$('sample-program').value];
@@ -706,6 +750,7 @@ if (typeof window !== 'undefined') {
   window.__phantomHarnessDebug = {
     applyEvent,
     applyResult,
+    applyObservation,
     finishPending,
     state: () => ({
       epoch: sessionEpoch,
