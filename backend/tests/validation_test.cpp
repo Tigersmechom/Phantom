@@ -144,6 +144,48 @@ int main() {
     gateway["command"]["snapshotId"] = invalidId;
     assert(validation_fails(gateway));
   }
+  // Layout and ELF inspection cannot accept executable expressions or paths.
+  gateway["expectedStop"] = {{"stopId", "stop-1"}, {"stateRevision", 1}};
+  for (const auto* kind : {"inspectModuleSymbols", "inspectVariableLayout"}) {
+    const auto field = std::string(kind) == "inspectModuleSymbols" ? "moduleId" : "locator";
+    gateway["command"] = {{"kind", kind}, {field, "identifier"}};
+    assert(!validation_fails(gateway));
+    auto missingStop = gateway; missingStop.erase("expectedStop");
+    assert(validation_fails(missingStop, "INVALID_REQUEST"));
+    for (const auto* key : {"path", "expression", "pid"}) {
+      auto injected = gateway; injected["command"][key] = "untrusted";
+      assert(validation_fails(injected, "INVALID_REQUEST"));
+    }
+  }
+  // Root variable locators include their frame prefix and must round-trip
+  // identifiers at the engine's 256-byte name limit through this gateway.
+  gateway["command"] = {{"kind", "inspectVariableLayout"}, {"locator", "frame:0:" + std::string(256, 'x')}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["locator"] = "frame:4095:" + std::string(256, 'x');
+  assert(!validation_fails(gateway));
+  gateway["command"]["locator"] = std::string(272, 'x');
+  assert(!validation_fails(gateway));  // Exact locator syntax belongs to GdbEngine.
+  gateway["command"]["locator"] = std::string(273, 'x');
+  assert(validation_fails(gateway, "LIMIT_EXCEEDED"));
+  for (const auto& invalidLocator : Json::array({"", false, nullptr, 1})) {
+    gateway["command"]["locator"] = invalidLocator;
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  gateway["command"]["locator"] = std::string("frame:0:") + char(0xff);
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  // Other IDs retain their existing independent limit.
+  gateway["command"] = {{"kind", "inspectModuleSymbols"}, {"moduleId", std::string(257, 'x')}};
+  assert(validation_fails(gateway, "LIMIT_EXCEEDED"));
+  gateway.erase("expectedStop");
+  gateway["command"] = {{"kind", "readModuleSymbols"}, {"snapshotId", "symbols-1"}, {"start", 0}, {"count", 100}};
+  assert(!validation_fails(gateway));
+  for (const auto& count : Json::array({0, -1, 1025, "1", 1.5})) {
+    gateway["command"]["count"] = count; assert(validation_fails(gateway));
+  }
+  gateway["command"] = {{"kind", "readVariableLayout"}, {"snapshotId", "layout-1"}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["snapshotId"] = "";
+  assert(validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before
   // accepting an asynchronous trace, not discovered after acceptance.
   phantom::ValidationLimits small;

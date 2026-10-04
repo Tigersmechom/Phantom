@@ -72,6 +72,8 @@ class BackendService final {
   Json handleRecorderProbe(const Json& request);
   std::vector<Json> handleRecordedExecution(const Json& request, const FrameSink& publish);
   std::vector<Json> handleModules(const Json& request);
+  std::vector<Json> handleModuleSymbols(const Json& request);
+  std::vector<Json> handleVariableLayout(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
   Json handleInput(const Json& request);

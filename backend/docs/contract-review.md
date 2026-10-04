@@ -345,3 +345,29 @@ prior observation unchanged. Retained history never mutates. Profile, finite
 input and instruction budget participate in the run fingerprint. Native stdin
 and stepping remain the default. The complete contract and limitations are in
 [`RECORDING.md`](../../docs/RECORDING.md).
+
+
+## 2026-10-04: ELF symbol captures and declared variable layout
+
+`inspectModuleSymbols{moduleId}` captures one currently mapped file, its ELF
+sections/symbols and verified load-instance intersections. Its first page and
+`readModuleSymbols{snapshotId,start,count}` use the same immutable capture.
+`totalSymbols` is the retained row count; ELF metadata also reports the full
+on-disk table count. Stripping and retention truncation are distinct. Address
+and size values remain strings, TLS/IFUNC/absolute/common/undefined semantics
+stay separate, and Itanium prefix classification is evidence rather than an
+assertion about valid vptrs. The snapshot's scope is current OS state.
+
+`inspectVariableLayout{locator}` accepts an unambiguous root locator emitted
+at the current stop through observation/readVariables. Layout contains declared
+type structure, bounded child metadata and proven storage addresses; pointer
+values are not followed and target functions never execute. Missing storage,
+optimized values, bitfields, static/reference/base fields, inactive union
+selection and lifetime have explicit limitations. The helper's bit-position
+convention is `gdb-target-bitpos`; output/traversal limits do not claim a byte
+quota on GDB's own DWARF decoding. `readVariableLayout{snapshotId}` only reads
+retained JSON. Both live commands require `expectedStop`.
+
+Schemas are in `backend-runtime-contract.ts`; main command/result unions and
+native runtime validators change together. Their protocol tests join the
+real-traffic TypeScript `satisfies` check.

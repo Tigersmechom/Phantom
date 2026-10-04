@@ -163,5 +163,13 @@ Clang/LLVM toolchain, immutable event schema и coverage gaps — эти фун�
 точные байты stdout/stderr и явно отмеченные пропуски хранения. Эти шлюзы
 предназначены для frontend-интеграции; 2D renderer карты памяти сюда не входит.
 
+`inspectModuleSymbols` / `readModuleSymbols` добавляют секции и символы ELF
+с проверенными runtime-диапазонами и сохранённой пагинацией. Имена vtable/RTTI
+пока дают только классификацию символов; связи конкретных объектов с таблицами
+требуют отдельного ABI-декодера. `inspectVariableLayout` / `readVariableLayout`
+сохраняют declared type, размер, адрес storage и структуру полей/массивов из
+GDB/DWARF. Указатели не разыменовываются, inferior functions не вызываются,
+наличие адреса не считается доказательством начала lifetime переменной.
+
 Контракты и примеры: [RECORDING.md](../docs/RECORDING.md) и
 [INSPECTION_GATEWAYS.md](../docs/INSPECTION_GATEWAYS.md).

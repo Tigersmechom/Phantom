@@ -32,8 +32,10 @@
 memory captures/diff и ограниченная запись изменений между инструкциями.
 Реализованы журнал фактического вывода, снимки runtime ELF modules
 и изолированная проверка recorder. Отдельный ограниченный `gdb-record-full`
-профиль подключён к публичному service. Пакет прошёл 26/26 CTest в Debug и
-ASan/UBSan, проверку 819 реальных DTO и прежние проверки harness.
+профиль подключён к публичному service. Добавлены секции/символы ELF с runtime
+адресами и declared variable layout по GDB/DWARF. Результаты общей приёмки
+и границы нового среза — в §20.7; предыдущий output/modules/recorder checkpoint
+прошёл 26/26 CTest в Debug и ASan/UBSan и проверку 819 реальных DTO.
 Подробный порядок, зависимости и приёмка — [§20](#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
 ## 1. Что уже работает
@@ -780,8 +782,13 @@ ABI подтверждён на установленной libstdc++13, не о�
   покрытие адресов, а не владельца C++ allocation. Snapshot помечен
   `evidenceScope:"current-os-state"`: `/proc` не превращается в исторический
   kernel snapshot после обратного шага GDB.
-- Следующий слой добавляет ELF sections, symbols/DWARF и связь с
-  allocations/objects. Vtable/RTTI/VTT и
+- Реализованы `inspectModuleSymbols` / `readModuleSymbols`: ELF sections,
+  `.symtab`/`.dynsym`, immutable paging и runtime locations по проверенным
+  PT_LOAD instances. Отдельные semantics сохранены для TLS, IFUNC, undefined,
+  common и absolute symbols. `inspectVariableLayout` / `readVariableLayout`
+  добавляют bounded declared-type structure из GDB/DWARF, включая поля,
+  bitfields, compact arrays, union и compiler-provided artificial fields.
+  Связь с подтверждёнными allocations/object lifetimes остаётся будущей работой. Vtable/RTTI/VTT и
   vptr — отдельные ABI-aware overlays; vtable не обязана лежать в `.rodata`
   (возможна relocatable/RELRO data). Указатель объекта может указывать на
   address point внутри таблицы, а multiple/virtual inheritance требует
@@ -922,6 +929,12 @@ observation history, сохраняет границы eviction и не обещ
 - `inspectModules` / `readModuleSnapshot`: ELF metadata, проверенная identity,
   load instances и immutable snapshot текущей ОС. Это база overlays для
   **2D-карты**, без автоматической классификации vtable/RTTI/objects.
+- `inspectModuleSymbols` / `readModuleSymbols`: секции/символы ELF одного
+  модуля, подтверждённые runtime-диапазоны и страницы сохранённого снимка.
+  Vtable/RTTI имена классифицируются по ABI prefix, без проверки объектов.
+- `inspectVariableLayout` / `readVariableLayout`: declared type, storage
+  address и ограниченная структура полей/массивов по GDB/DWARF; отдельный
+  immutable snapshot без pointer traversal и доказательства lifetime.
 - `probeRecorders`: проверка служебного fixture до launch или рядом с живой
   сессией; настоящее доказательство записи/повтора или явная причина отказа.
 - `inspectProcess`: ограниченные `stat`/`status`/`personality`, exe/fd targets,
@@ -944,10 +957,50 @@ observation history, сохраняет границы eviction и не обещ
 этот этап не включает. Контракт, примеры и точные пределы:
 [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
 
-Следующий порядок: **завершение record-full регрессий 20.4 →
-symbols/DWARF и vtable/object overlays 20.2 → вмешательства 20.5**. Ограниченный
+Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
+секции/символы ELF и статическое устройство переменных. Следующий порядок: **ABI-подтверждённые
+vtable/object связи 20.2 → вмешательства с аудитом 20.5**. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
 Каждый срез завершается обновлением DTO/fixtures, headless интеграционными
 тестами и описанием для frontend; продвинутые experiments не блокируют
 текущие cin/stepping/history. Этот порядок не объявляет P2/P4/P6 завершёнными.
+
+
+### 20.7. Секции, символы и структура переменных — 04.10.2026
+
+Добавлены шлюзы `inspectModuleSymbols`, `readModuleSymbols`,
+`inspectVariableLayout`, `readVariableLayout`. Live-операции требуют
+`expectedStop`, сохранённые снимки читаются без обращения к текущей памяти
+и переживают unload/exit в пределах session/retention. ELF имена `_ZTV`,
+`_ZTI`, `_ZTS`, `_ZTT` классифицируются по prefix evidence; это подписи для
+2D-карты, а не доказательство валидного объекта или декодер всех vtable slots.
+
+Для layout сохраняются declared type, размер, адрес доступного storage,
+смещения обычных полей, отдельные bitfield offsets/width, формы массивов
+без полного разворачивания, union overlap, static/artificial/base fields.
+Указатели и ссылки не разыменовываются, функции inferior не вызываются.
+`lifetime:unknown` не подменяется наличием адреса. Адреса base subobjects
+остаются неизвестными, если Python API не подтверждает правила virtual-base
+смещения; reference referent не выдаётся за storage самой ссылки.
+
+Временная проверка emitted locators привязана к остановке: переключение
+кадра через `readVariables` сохраняет ранее выданные root locators; настоящее
+продвижение процесса сбрасывает их. Root locators с неоднозначным shadowing
+отклоняются. Ограничены глубина/число узлов/полей/длина имён/размер ответа,
+ELF metadata reads, sections, symbols и работа над relocation evidence.
+Типы, поля и границы: [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
+
+Приёмка: **31/31 CTest Debug и 31/31 ASan/UBSan**. После последней правки
+лимита locator повторно прошли все пять затронутых проверок в обеих сборках:
+validation, gdb-engine, gdb-variable-layout, layout-integration и
+frontend-contract. **1066 реальных protocol frames** соответствуют
+TypeScript DTO (5.9.3). Прошли пять harness checks и четыре contract fixtures,
+включая прежний интерактивный `cin/getline` и несинхронизированный `cout/flush`.
+
+Новые регрессии покрывают stripped ELF, TLS/IFUNC и недопустимые relocation,
+внешние библиотеки и снимки после unload/exit, повреждённые таблицы и лимиты,
+bitfields/union/arrays, optimized-out storage, глубину/число полей,
+переключение frames, устаревшие/невыданные locators, имена длиной 256/257 байт
+и попытки передать выражение вместо имени. Обнаруженные при ревью ошибки
+удержания locator и несогласованных лимитов исправлены до приёмки.

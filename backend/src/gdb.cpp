@@ -3,6 +3,7 @@
 
 #include "phantom/mi.hpp"
 #include "phantom/process.hpp"
+#include "variable_layout_script.hpp"
 
 #include <algorithm>
 #include <array>
@@ -268,7 +269,12 @@ struct GdbEngine::Impl {
   struct BreakpointEntry { std::string documentId; std::string number; };
   std::vector<BreakpointEntry> breakpoints;
   int selectedFrame = 0;
-  nlohmann::json lastStack = nlohmann::json::array();
+  // Locators are valid for an actual stop, not just the most recently read
+  // frame. Paging another frame must not invalidate earlier issued handles.
+  // Keep this bounded independently of how many pages the client requests.
+  static constexpr std::size_t maxIssuedLayoutLocators = 4096;
+  std::map<std::string, std::size_t> issuedLayoutLocators;
+  bool layoutLocatorLimitReached = false;
   // When input blocks, the selected source frame is a caller of the native
   // input operation. Finish its immediate callee to return to that precise
   // activation; line+1 guesses can skip control flow or target no code.
@@ -349,6 +355,8 @@ struct GdbEngine::Impl {
     killInferior();
     live = false;
     breakpoints.clear();
+    issuedLayoutLocators.clear();
+    layoutLocatorLimitReached = false;
     cleanupTemp();
     setError(e, std::move(code), std::move(message), retry);
   }
@@ -1029,10 +1037,10 @@ struct GdbEngine::Impl {
   // record as well as the command acknowledgement. This keeps every returned
   // GdbStop tied to a real stop, rather than a guessed source line.
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
-               GdbError& e, int preempt = 0) {
+               GdbError& e, int preempt = 0, bool collectConsole = false) {
     e = {};
     consoleOutput.clear();
-    captureConsole = commandText == "-interpreter-exec console \"info record\"";
+    captureConsole = collectConsole || commandText == "-interpreter-exec console \"info record\"";
     captureRecordingDiagnostics = recordingActive && waitStop;
     if (waitStop) recordingDiagnostics.clear();
     if (waitStop) lastExecutionInterrupted = false;
@@ -1602,9 +1610,38 @@ struct GdbEngine::Impl {
         break;
       }
     }
-    lastStack = output;
     result.stack = std::move(output);
     return true;
+  }
+
+  void rememberLayoutLocators(const nlohmann::json& allVariables,
+                              const nlohmann::json& emittedVariables) {
+    // Count the entire frame, even when just one of two shadowed declarations
+    // appeared on this page. Neither declaration has a unique legacy locator.
+    std::map<std::string, std::size_t> counts;
+    for (const auto& variable : allVariables) {
+      const auto locator = variable.value("locator", "");
+      const auto separator = locator.find(':', 6);
+      if (!locator.starts_with("frame:") || locator.size() > 272 || separator == std::string::npos) continue;
+      const auto name = std::string_view(locator).substr(separator + 1);
+      if (name.size() > 256 || !validEnvironmentName(name)) continue;
+      ++counts[locator];
+    }
+    for (const auto& variable : emittedVariables) {
+      const auto locator = variable.value("locator", "");
+      const auto count = counts.find(locator);
+      if (count == counts.end()) continue;
+      const auto existing = issuedLayoutLocators.find(locator);
+      if (existing != issuedLayoutLocators.end()) {
+        existing->second = std::max(existing->second, count->second);
+      } else if (issuedLayoutLocators.size() < maxIssuedLayoutLocators) {
+        issuedLayoutLocators.emplace(locator, count->second);
+      } else {
+        // Preserve already issued handles and ordinary variable paging. A
+        // new uncached layout query reports the explicit retention limit.
+        layoutLocatorLimitReached = true;
+      }
+    }
   }
 
   bool recordingSnapshot(nlohmann::json& result, GdbError& error) {
@@ -1697,6 +1734,8 @@ struct GdbEngine::Impl {
   }
 
   bool makeStop(const MiRecord& stop, GdbStop& result, GdbError& e) {
+    issuedLayoutLocators.clear();
+    layoutLocatorLimitReached = false;
     latestStop = stop;
     result = GdbStop{};
     selectedFrame = 0;
@@ -1728,6 +1767,8 @@ struct GdbEngine::Impl {
     // for a stack here can yield a misleading stale frame or a secondary
     // READ_FAILED error.
     if (!result.exited && !snapshotStack(result, e)) return false;
+    for (const auto& frame : result.stack)
+      rememberLayoutLocators(frame.at("variables"), frame.at("variables"));
     if (result.exited) {
       result.memoryMap = {{"available", false}, {"source", "linux-proc-maps"},
                           {"coverage", "none"}, {"regions", nlohmann::json::array()},
@@ -2210,6 +2251,8 @@ void GdbEngine::stop() noexcept {
   impl_->killInferior();
   impl_->live = false;
   impl_->breakpoints.clear();
+  impl_->issuedLayoutLocators.clear();
+  impl_->layoutLocatorLimitReached = false;
   impl_->cleanupTemp();
 }
 bool GdbEngine::live() const noexcept { return impl_ && impl_->live.load(); }
@@ -2302,9 +2345,79 @@ bool GdbEngine::readVariables(std::string_view reference, std::size_t start,
     result = nlohmann::json::object(); result["variables"] = nlohmann::json::array();
     for (std::size_t i = start; i < vars.size() && i < start + count; ++i) result["variables"].push_back(vars[i]);
     result["hasMore"] = start + count < vars.size();
+    impl_->rememberLayoutLocators(vars, result.at("variables"));
     return true;
   }
   result = {{"variables", nlohmann::json::array()}, {"hasMore", false}};
+  return true;
+}
+
+bool GdbEngine::inspectVariableLayout(std::string_view locator, nlohmann::json& result,
+                                      GdbError& error) {
+  error = {};
+  if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
+  if (!locator.starts_with("frame:") || locator.size() > 272) {
+    error = {"INVALID_REQUEST", "expected an emitted root variable locator", false}; return false;
+  }
+  const auto separator = locator.find(':', 6);
+  if (separator == std::string_view::npos) {
+    error = {"INVALID_REQUEST", "expected frame:<level>:<variable> locator", false}; return false;
+  }
+  const auto levelText = locator.substr(6, separator - 6);
+  unsigned level = 0;
+  const auto parsed = std::from_chars(levelText.data(), levelText.data() + levelText.size(), level);
+  const auto name = locator.substr(separator + 1);
+  if (levelText.empty() || parsed.ec != std::errc{} || parsed.ptr != levelText.data() + levelText.size() ||
+      level > 4095 || (levelText.size() > 1 && levelText.front() == '0') || name.size() > 256 ||
+      !validEnvironmentName(name)) {
+    error = {"INVALID_REQUEST", "only canonical root variable locators with an ASCII identifier are supported", false};
+    return false;
+  }
+  const auto issued = impl_->issuedLayoutLocators.find(std::string(locator));
+  const std::size_t matches = issued == impl_->issuedLayoutLocators.end() ? 0 : issued->second;
+  if (matches == 0 && impl_->layoutLocatorLimitReached) {
+    error = {"LIMIT_EXCEEDED", "per-stop layout locator retention is limited to 4096 variables", false};
+    return false;
+  }
+  if (matches != 1) {
+    error = {matches == 0 ? "READ_FAILED" : "UNSUPPORTED",
+             matches == 0 ? "variable locator was not emitted at this stop" :
+                            "variable locator is ambiguous across shadowed declarations", false};
+    return false;
+  }
+  MiRecord features;
+  if (!impl_->command("-list-features", false, features, error)) return false;
+  bool pythonAvailable = false;
+  if (const auto* supported = field(features.fields, "features"))
+    for (const auto& feature : supported->values)
+      pythonAvailable = pythonAvailable || feature->text == "python";
+  if (!pythonAvailable) {
+    error = {"UNSUPPORTED", "this GDB does not advertise Python support", false}; return false;
+  }
+  std::string script(detail::variableLayoutScript);
+  script += "\n_phantom_variable_layout(" + std::to_string(level) + "," +
+      nlohmann::json(name).dump() + "," + nlohmann::json(locator).dump() + ")\n";
+  // JSON string escaping is valid for a Python string literal here. All
+  // interpolated values are already strict ASCII identifiers / decimal levels.
+  // The source itself is compiled trusted code, not a path from the target.
+  const auto python = "python exec(" + nlohmann::json(script).dump() + ")";
+  MiRecord ignored;
+  if (!impl_->command("-interpreter-exec console " + miQuote(python), false, ignored, error, 0, true)) {
+    if (error.message.find("Python scripting is not supported") != std::string::npos)
+      error = {"UNSUPPORTED", "this GDB was built without Python support", false};
+    return false;
+  }
+  constexpr std::string_view prefix = "PHANTOM_VARIABLE_LAYOUT_V1:";
+  const auto& console = impl_->consoleOutput;
+  if (!console.starts_with(prefix) || console.size() > prefix.size() + 262144 + 1) {
+    error = {"READ_FAILED", "GDB returned an invalid variable layout response", false}; return false;
+  }
+  auto layout = nlohmann::json::parse(console.substr(prefix.size()), nullptr, false);
+  if (!layout.is_object() || layout.value("source", "") != "gdb-python-dwarf" ||
+      layout.value("locator", "") != locator || !layout.contains("root")) {
+    error = {"READ_FAILED", "GDB returned malformed variable layout metadata", false}; return false;
+  }
+  result = std::move(layout);
   return true;
 }
 

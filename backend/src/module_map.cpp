@@ -1,6 +1,8 @@
 #include "phantom/module_map.hpp"
 
 #include "phantom/elf.hpp"
+#include "phantom/elf_symbols.hpp"
+#include "phantom/memory_map.hpp"
 #include "phantom/process_inspection.hpp"
 
 #include <algorithm>
@@ -35,6 +37,13 @@ Json unavailable(std::string reason, std::string detail) {
   auto result = failure(std::move(reason), std::move(detail));
   result.update({{"source", "linux-proc-maps-elf"}, {"coverage", "none"},
                  {"identityVerified", false}, {"modules", Json::array()}});
+  return result;
+}
+Json symbolsUnavailable(std::string_view moduleId, std::string reason, std::string detail) {
+  auto result = failure(std::move(reason), std::move(detail));
+  result.update({{"source", "linux-proc-maps-elf-symbols"}, {"coverage", "none"},
+    {"identityVerified", false}, {"moduleId", moduleId}, {"contentIdentity", "file-metadata-only"},
+    {"sections", Json::array()}, {"symbols", Json::array()}});
   return result;
 }
 
@@ -123,6 +132,22 @@ Json processStat(int procFd) {
   if (used == buffer.size()) return failure("stat-limit", "process stat exceeds read limit");
   buffer.resize(used);
   return parseLinuxProcessStat(buffer);
+}
+
+Json processMaps(int procFd) {
+  Fd fd(::openat(procFd, "maps", O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+  if (fd.value < 0) return failure("maps-unavailable", "cannot read pinned process maps");
+  constexpr std::size_t maxBytes = 1024 * 1024;
+  std::string bytes(maxBytes + 1, '\0');
+  std::size_t used = 0;
+  while (used < bytes.size()) {
+    const auto got = ::read(fd.value, bytes.data() + used, bytes.size() - used);
+    if (got > 0) used += static_cast<std::size_t>(got);
+    else if (got == 0) break;
+    else if (errno != EINTR) return failure("maps-unavailable", "cannot read pinned process maps");
+  }
+  bytes.resize(used);
+  return parseLinuxMemoryMap(bytes, {maxBytes, 8192}, used > maxBytes);
 }
 
 std::optional<std::string> rawPath(const Json& region) {
@@ -319,6 +344,150 @@ void findInstances(Json& module, const std::vector<Region>& all,
   for (const auto* region : group)
     if (!assigned.contains(region->start)) module["unassignedRegionStarts"].push_back(hex(region->start));
 }
+
+struct RuntimeRange {
+  std::uint64_t start, end;
+  Json evidence;
+};
+struct RuntimeInstance {
+  Bias bias;
+  std::vector<RuntimeRange> ranges;
+};
+std::vector<RuntimeInstance> runtimeInstances(const Json& module) {
+  std::vector<RuntimeInstance> result;
+  for (const auto& item : module.at("instances")) {
+    auto biasText = item.at("loadBiasHex").get<std::string>();
+    const bool negative = biasText.starts_with('-');
+    if (negative) biasText.erase(0, 1);
+    auto magnitude = number(biasText);
+    if (!magnitude) throw std::invalid_argument("invalid proven load bias");
+    RuntimeInstance instance{{negative, *magnitude}, {}};
+    for (const auto& segment : item.at("segments"))
+      for (const auto& range : segment.at("mappedRanges"))
+        instance.ranges.push_back({field(range, "startAddressHex"), field(range, "endAddressHex"), range});
+    std::sort(instance.ranges.begin(), instance.ranges.end(), [](const auto& a, const auto& b) {
+      return a.start < b.start || (a.start == b.start && a.end < b.end);
+    });
+    result.push_back(std::move(instance));
+  }
+  return result;
+}
+
+struct RelocationBudget {
+  const ModuleSymbolInspectionLimits& limits;
+  std::size_t locations = 0, ranges = 0, operations = 0;
+  bool truncated = false;
+};
+
+// Empty ranges are point evidence only. A zero-size symbol is not expanded to
+// the next symbol, and its file size never grants ownership of adjacent bytes.
+Json relocate(std::uint64_t address, std::uint64_t size,
+              const std::vector<RuntimeInstance>& instances, RelocationBudget& budget) {
+  Json locations = Json::array();
+  for (const auto& instance : instances) {
+    if (budget.locations >= budget.limits.maxRuntimeLocations) { budget.truncated = true; break; }
+    ++budget.locations;
+    const auto start = instance.bias.apply(address);
+    const auto end = start ? add(*start, size) : std::nullopt;
+    Json location = {{"loadBiasHex", instance.bias.key()}, {"status", "overflow"},
+      {"addressHex", start ? Json(hex(*start)) : Json(nullptr)},
+      {"endAddressHex", end ? Json(hex(*end)) : Json(nullptr)}, {"mappedRanges", Json::array()}};
+    if (!start || !end) { locations.push_back(std::move(location)); continue; }
+    auto coveredThrough = *start;
+    bool gap = false, pointMapped = false;
+    // Ranges are ordered by start; overlapping PT_LOAD segments are
+    // clipped to their union, so an overlay never repeats the same bytes.
+    for (const auto& range : instance.ranges) {
+      if (range.start > *end || (size != 0 && range.start == *end)) break;
+      if (budget.operations >= budget.limits.maxMatchOperations) { budget.truncated = true; break; }
+      ++budget.operations;
+      if (size == 0) {
+        if (range.start <= *start && *start < range.end) { pointMapped = true; break; }
+        continue;
+      }
+      auto a = std::max({*start, range.start, coveredThrough}), b = std::min(*end, range.end);
+      if (a >= b) continue;
+      if (budget.ranges >= budget.limits.maxMappedRanges) { budget.truncated = true; break; }
+      ++budget.ranges;
+      auto clipped = range.evidence;
+      clipped["startAddressHex"] = hex(a); clipped["endAddressHex"] = hex(b);
+      location["mappedRanges"].push_back(std::move(clipped));
+      if (a > coveredThrough) gap = true;
+      coveredThrough = b;
+    }
+    location["status"] = budget.truncated ? "unknown" : size == 0 ? (pointMapped ? "mapped" : "unmapped") :
+      location["mappedRanges"].empty() ? "unmapped" :
+      (!gap && coveredThrough == *end) ? "mapped" : "partial";
+    locations.push_back(std::move(location));
+    if (budget.truncated) break;
+  }
+  return locations;
+}
+
+void relocateMetadata(Json& report, const ModuleSymbolInspectionLimits& limits, bool& truncated,
+                      std::size_t usedRanges, std::size_t usedOperations) {
+  const auto instances = runtimeInstances(report.at("module"));
+  RelocationBudget budget{limits, 0, usedRanges, usedOperations};
+  std::map<std::size_t, const Json*> sections;
+  for (auto& section : report["sections"]) {
+    sections[section.at("index").get<std::size_t>()] = &section;
+    section["runtimeLocations"] = Json::array();
+    if (!section.at("flags").at("alloc").get<bool>()) section["runtimeReason"] = "non-allocated-section";
+    else if (section.at("flags").at("tls").get<bool>()) section["runtimeReason"] = "tls-requires-thread-address";
+    else if (budget.truncated) section["runtimeReason"] = "inspection-limit";
+    else {
+      section["runtimeLocations"] = relocate(field(section, "addressHex"), field(section, "sizeHex"), instances, budget);
+      if (budget.truncated) section["runtimeReason"] = "inspection-limit";
+      else if (instances.empty()) section["runtimeReason"] = "no-proven-load-instance";
+    }
+  }
+  for (auto& symbol : report["symbols"]) {
+    symbol["runtimeLocations"] = Json::array();
+    const auto definition = symbol.at("definition").get<std::string>();
+    const auto valueKind = symbol.at("valueKind").get<std::string>();
+    if (definition == "undefined") symbol["runtimeMeaning"] = "undefined";
+    else if (definition == "absolute") symbol["runtimeMeaning"] = "absolute-value";
+    else if (definition == "common") symbol["runtimeMeaning"] = "common";
+    else if (valueKind == "tls-offset") symbol["runtimeMeaning"] = "tls-offset";
+    else if (definition != "section" || valueKind != "virtual-address")
+      symbol["runtimeMeaning"] = "unsupported-definition";
+    else {
+      const auto index = symbol.at("sectionIndex");
+      const auto section = index.is_number_unsigned() || index.is_number_integer() ?
+        sections.find(index.get<std::size_t>()) : sections.end();
+      if (section == sections.end()) {
+        symbol["runtimeMeaning"] = "non-runtime-section";
+        symbol["runtimeReason"] = "section-metadata-unavailable";
+        continue;
+      }
+      const auto& dto = *section->second;
+      if (!dto.at("flags").at("alloc").get<bool>()) symbol["runtimeMeaning"] = "non-runtime-section";
+      else if (dto.at("flags").at("tls").get<bool>()) {
+        // Non-STT_TLS symbols can identify the TLS initialization template;
+        // their virtual-address value must not become a per-thread offset.
+        symbol["runtimeMeaning"] = "non-runtime-section";
+        symbol["runtimeReason"] = "tls-requires-thread-address";
+      }
+      else {
+        symbol["runtimeMeaning"] = symbol.at("type") == "STT_GNU_IFUNC" ? "ifunc-resolver" : "address";
+        if (budget.truncated) { symbol["runtimeReason"] = "inspection-limit"; continue; }
+        const auto address = field(symbol, "valueHex"), size = field(symbol, "sizeHex");
+        const auto sectionStart = field(dto, "addressHex"), sectionSize = field(dto, "sizeHex");
+        const auto sectionEnd = add(sectionStart, sectionSize), symbolEnd = add(address, size);
+        // Out-of-section symbols can be linker/malformed metadata. They never
+        // authorize an overlay over a different mapped object or section.
+        if (!sectionEnd || !symbolEnd || address < sectionStart || address > *sectionEnd || *symbolEnd > *sectionEnd) {
+          symbol["runtimeReason"] = "symbol-outside-section";
+          continue;
+        }
+        symbol["runtimeLocations"] = relocate(address, size, instances, budget);
+        if (budget.truncated) symbol["runtimeReason"] = "inspection-limit";
+        else if (instances.empty()) symbol["runtimeReason"] = "no-proven-load-instance";
+      }
+    }
+  }
+  truncated = truncated || budget.truncated;
+}
 #endif
 }  // namespace
 
@@ -420,6 +589,112 @@ nlohmann::json inspectRuntimeModules(int pid, const Json& memoryMap,
     return unavailable("invalid-maps", "malformed memory-map snapshot");
   } catch (const std::invalid_argument& error) {
     return unavailable("invalid-maps", error.what());
+  }
+#endif
+}
+
+nlohmann::json inspectRuntimeModuleSymbols(int pid, const Json& memoryMap,
+    std::string_view moduleId, const ModuleSymbolInspectionLimits& requested) {
+  const auto fail = [&](std::string reason, std::string detail) {
+    return symbolsUnavailable(moduleId, std::move(reason), std::move(detail));
+  };
+  if (pid <= 0) return fail("invalid-process", "positive owned inferior PID required");
+#ifndef __linux__
+  (void)memoryMap; (void)requested;
+  return fail("unsupported-platform", "runtime module symbols require Linux procfs");
+#else
+  const ModuleSymbolInspectionLimits hard;
+  const ModuleSymbolInspectionLimits limits{
+    std::min(requested.maxMetadataBytes, hard.maxMetadataBytes),
+    std::min(requested.maxSections, hard.maxSections),
+    std::min(requested.maxSymbols, hard.maxSymbols),
+    std::min(requested.maxRuntimeLocations, hard.maxRuntimeLocations),
+    std::min(requested.maxMappedRanges, hard.maxMappedRanges),
+    std::min(requested.maxMatchOperations, hard.maxMatchOperations)};
+  try {
+    if (!memoryMap.value("available", false) || memoryMap.value("coverage", "none") != "complete")
+      return fail("maps-unavailable", "complete current maps are required for symbol relocation");
+    bool truncated = false;
+    auto all = regions(memoryMap, 8192, truncated);
+    if (truncated) return fail("maps-limit", "maps exceed the module symbol region limit");
+    Fd proc(::open(("/proc/" + std::to_string(pid)).c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC));
+    if (proc.value < 0) return fail("process-unavailable", "cannot pin the inferior proc directory");
+    const auto before = processStat(proc.value);
+    if (!before.value("available", false) || before.at("pid") != std::to_string(pid))
+      return fail("process-unavailable", "cannot verify inferior process identity");
+    const auto mapsBefore = processMaps(proc.value);
+    if (!mapsBefore.value("available", false) || mapsBefore.value("coverage", "none") != "complete")
+      return fail("maps-unavailable", "cannot verify complete current pinned process maps");
+    if (mapsBefore.at("regions") != memoryMap.at("regions"))
+      return fail("maps-changed", "provided memory map no longer matches the stopped process");
+    std::vector<const Region*> group;
+    for (const auto& region : all)
+      if (region.inode != 0 && region.dto->value("kind", "") == "file" && "module:" + region.key == moduleId)
+        group.push_back(&region);
+    if (group.empty()) return fail("module-not-mapped", "module ID is not present in the current maps");
+    const auto& first = *group.front()->dto;
+    Json module = {{"id", moduleId}, {"device", first.at("device")}, {"inodeDecimal", first.at("inodeDecimal")},
+      {"path", first.at("path")}, {"contentIdentity", "file-metadata-only"},
+      {"mappedRegions", Json::array()}, {"instances", Json::array()}, {"unassignedRegionStarts", Json::array()}};
+    if (first.contains("pathBytesHex")) module["pathBytesHex"] = first.at("pathBytesHex");
+    for (const auto* region : group) module["mappedRegions"].push_back(*region->dto);
+    struct stat version{};
+    Fd file(openMappedFile(proc.value, group, module["file"], version));
+    if (file.value < 0) return fail(module["file"].value("reason", "file-unavailable"),
+      "mapped file descriptor identity could not be verified");
+    ElfInspectionLimits elfLimits;
+    elfLimits.maxProgramHeaders = 256;
+    elfLimits.maxMetadataBytes = limits.maxMetadataBytes;
+    std::size_t elfBytes = 0;
+    module["elf"] = inspectElfFd(file.value, elfLimits, &elfBytes);
+    if (!module["elf"].value("available", false))
+      return fail(module["elf"].value("reason", "elf-unavailable"), module["elf"].value("detail", "ELF metadata unavailable"));
+    if ((module["elf"].at("elfType") != "ET_EXEC" && module["elf"].at("elfType") != "ET_DYN") ||
+        module["elf"].at("architecture") != "x86_64")
+      return fail("unsupported-runtime-elf", "runtime symbol relocation requires ELF64 x86_64 ET_EXEC/ET_DYN");
+    const auto page = ::sysconf(_SC_PAGESIZE);
+    if (page <= 0) return fail("page-size-unavailable", "cannot obtain system page size");
+    ModuleInspectionLimits moduleLimits;
+    moduleLimits.maxMappedRanges = limits.maxMappedRanges;
+    moduleLimits.maxMatchOperations = limits.maxMatchOperations;
+    std::size_t ranges = 0, operations = 0;
+    findInstances(module, all, group, static_cast<std::uint64_t>(page), moduleLimits, ranges, operations, truncated);
+    ElfSymbolInspectionLimits symbolLimits;
+    symbolLimits.maxMetadataBytes = limits.maxMetadataBytes - elfBytes;
+    symbolLimits.maxSectionHeaders = limits.maxSections;
+    symbolLimits.maxSymbols = limits.maxSymbols;
+    auto metadata = inspectElfSymbolsFd(file.value, symbolLimits);
+    if (!metadata.value("available", false))
+      return fail(metadata.value("reason", "symbols-unavailable"), metadata.value("detail", "ELF section/symbol metadata unavailable"));
+    Json result = {{"available", true}, {"source", "linux-proc-maps-elf-symbols"}, {"coverage", "complete"},
+      {"identityVerified", true}, {"pid", std::to_string(pid)}, {"moduleId", moduleId},
+      {"contentIdentity", "file-metadata-only"}, {"module", std::move(module)},
+      {"sections", std::move(metadata["sections"])}, {"symbols", std::move(metadata["symbols"])}};
+    metadata.erase("sections"); metadata.erase("symbols");
+    truncated = truncated || metadata.value("coverage", "none") == "truncated";
+    result["elfMetadata"] = std::move(metadata);
+    relocateMetadata(result, limits, truncated, ranges, operations);
+    struct stat afterFile{};
+    if (::fstat(file.value, &afterFile) != 0 || !sameVersion(version, afterFile))
+      return fail("file-changed", "mapped file metadata changed during symbol inspection");
+    const auto after = processStat(proc.value);
+    if (!after.value("available", false) || before.at("pid") != after.at("pid") ||
+        before.at("startTimeTicks") != after.at("startTimeTicks"))
+      return fail("process-changed", "process identity changed during symbol inspection");
+    const auto mapsAfter = processMaps(proc.value);
+    if (!mapsAfter.value("available", false) || mapsAfter.value("coverage", "none") != "complete" ||
+        mapsAfter.at("regions") != mapsBefore.at("regions"))
+      return fail("maps-changed", "process maps changed during symbol inspection");
+    bool partial = result["module"]["instances"].empty() || !result["module"]["unassignedRegionStarts"].empty();
+    for (const auto& instance : result["module"]["instances"])
+      partial = partial || instance.at("coverage") != "complete";
+    result["coverage"] = truncated ? "truncated" : partial ? "partial" : "complete";
+    if (truncated) result["reason"] = "inspection-limit";
+    return result;
+  } catch (const Json::exception&) {
+    return fail("invalid-metadata", "malformed memory map or ELF metadata");
+  } catch (const std::invalid_argument& error) {
+    return fail("invalid-metadata", error.what());
   }
 #endif
 }

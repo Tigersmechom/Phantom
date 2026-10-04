@@ -10,6 +10,9 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/service_symbols.cpp
+  src/service_layout.cpp
+  src/elf_symbols.cpp
   src/service_recording.cpp
   src/service_probe.cpp
   src/service_modules.cpp
@@ -79,14 +82,31 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  foreach(symbol_fixture IN ITEMS phantom-elf-symbols-library phantom-elf-symbols-stripped-library)
+    add_library(${symbol_fixture} SHARED fixtures/elf-symbols.cpp)
+    target_compile_options(${symbol_fixture} PRIVATE -g -fno-sanitize=all)
+    target_link_options(${symbol_fixture} PRIVATE -fno-sanitize=all)
+  endforeach()
+  target_link_options(phantom-elf-symbols-stripped-library PRIVATE -s)
+  add_library(phantom-module-symbols-library SHARED fixtures/module-symbols-library.cpp)
+  target_compile_options(phantom-module-symbols-library PRIVATE -g -fno-sanitize=all)
+  target_link_options(phantom-module-symbols-library PRIVATE -fno-sanitize=all)
   add_library(phantom-module-map-library SHARED fixtures/module-map-library.cpp)
   target_compile_options(phantom-module-map-library PRIVATE -g -fno-sanitize=all)
   target_link_options(phantom-module-map-library PRIVATE -fno-sanitize=all)
-  foreach(module IN ITEMS elf process-inspection output-journal recorder-probe module-map)
+  foreach(module IN ITEMS elf elf-symbols module-symbols process-inspection output-journal recorder-probe module-map)
     string(REPLACE "-" "_" test_file "${module}")
     add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
     target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
-    if(module STREQUAL "recorder-probe")
+    if(module STREQUAL "elf-symbols")
+      add_dependencies(phantom-${module}-test phantom-elf-symbols-library phantom-elf-symbols-stripped-library)
+      add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>"
+        "$<TARGET_FILE:phantom-elf-symbols-library>" "$<TARGET_FILE:phantom-elf-symbols-stripped-library>")
+    elseif(module STREQUAL "module-symbols")
+      add_dependencies(phantom-${module}-test phantom-module-symbols-library)
+      target_link_libraries(phantom-${module}-test PRIVATE ${CMAKE_DL_LIBS})
+      add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>" "$<TARGET_FILE:phantom-module-symbols-library>")
+    elseif(module STREQUAL "recorder-probe")
       add_dependencies(phantom-${module}-test phantom-recorder-probe)
       add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>" "$<TARGET_FILE:phantom-recorder-probe>")
     elseif(module STREQUAL "module-map")
@@ -98,11 +118,14 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure output_journal recorder_probe recording)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure output_journal recorder_probe recording layout)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   endforeach()
+  add_test(NAME symbols-integration COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbols_integration.py" "$<TARGET_FILE:phantom-backend>" "$<TARGET_FILE:phantom-module-symbols-library>")
+  set_tests_properties(symbols-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   add_test(NAME modules-integration COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/modules_integration.py" "$<TARGET_FILE:phantom-backend>" "$<TARGET_FILE:phantom-module-map-library>")
   set_tests_properties(modules-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -117,6 +140,18 @@ if(BUILD_TESTING)
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/memory_gateway_integration.py"
       "$<TARGET_FILE:phantom-backend>")
   set_tests_properties(memory-gateway-integration PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  add_library(phantom-variable-layout-optimized OBJECT fixtures/variable-layout-optimized.cpp)
+  target_compile_options(phantom-variable-layout-optimized PRIVATE -g -O2 -fno-omit-frame-pointer -fno-pie -fno-sanitize=all)
+  add_executable(phantom-variable-layout-fixture fixtures/variable-layout.cpp $<TARGET_OBJECTS:phantom-variable-layout-optimized>)
+  target_compile_options(phantom-variable-layout-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fno-pie -fno-sanitize=all)
+  target_link_options(phantom-variable-layout-fixture PRIVATE -no-pie -fno-sanitize=all)
+  add_executable(phantom-gdb-variable-layout-test tests/gdb_variable_layout_test.cpp)
+  target_link_libraries(phantom-gdb-variable-layout-test PRIVATE phantom-core)
+  add_dependencies(phantom-gdb-variable-layout-test phantom-variable-layout-fixture phantom-io-wrapper)
+  add_test(NAME gdb-variable-layout COMMAND "$<TARGET_FILE:phantom-gdb-variable-layout-test>"
+    "$<TARGET_FILE:phantom-variable-layout-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/variable-layout.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/variable-layout-optimized.cpp")
+  set_tests_properties(gdb-variable-layout PROPERTIES TIMEOUT 90)
   add_executable(phantom-recording-test-fixture fixtures/recording-test.cpp)
   target_compile_options(phantom-recording-test-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fno-sanitize=all)
   target_link_options(phantom-recording-test-fixture PRIVATE -fno-sanitize=all)

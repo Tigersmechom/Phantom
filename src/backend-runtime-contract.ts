@@ -202,3 +202,150 @@ export interface ModuleSnapshotDTO {
   evidenceScope: 'current-os-state';
   modules: RuntimeModulesDTO;
 }
+
+/** Static ELF metadata; file bytes may differ from relocated process memory. */
+export interface ElfSectionDTO {
+  index: number;
+  name: string | null;
+  nameBytesHex?: string;
+  type: string;
+  typeValue: number;
+  flagsHex: string;
+  flags: { alloc: boolean; write: boolean; execute: boolean; tls: boolean; compressed: boolean };
+  addressHex: string;
+  offsetHex: string;
+  sizeHex: string;
+  alignmentHex: string;
+  entrySizeHex: string;
+  link: number;
+  info: number;
+  fileBacked: boolean;
+}
+export interface ElfSymbolDTO {
+  tableSectionIndex: number;
+  index: number;
+  table: 'symtab' | 'dynsym';
+  name: string | null;
+  nameBytesHex?: string;
+  valueHex: string;
+  sizeHex: string;
+  binding: string;
+  bindingValue: number;
+  type: string;
+  typeValue: number;
+  visibility: string;
+  visibilityValue: number;
+  otherValue: number;
+  sectionIndex: number | null;
+  rawSectionIndex: number;
+  definition: 'section' | 'undefined' | 'absolute' | 'common' | 'reserved';
+  valueKind: 'virtual-address' | 'section-offset' | 'tls-offset' | 'absolute' | 'common-alignment' | 'undefined' | 'other';
+  /** Prefix evidence only; it does not verify a C++ object's vptr or lifetime. */
+  classification: 'vtable' | 'typeinfo' | 'typeinfo-name' | 'vtt' | null;
+  classificationEvidence: 'itanium-mangled-prefix' | null;
+}
+export interface ElfSymbolMetadataDTO {
+  available: boolean;
+  source: 'elf-section-symbol-tables';
+  coverage: 'complete' | 'truncated' | 'none';
+  elfType?: string;
+  sectionCount?: number;
+  symbolCount?: number;
+  symbolTables: { sectionIndex: number; kind: 'symtab' | 'dynsym'; symbolCount: number }[];
+  reason?: string;
+  detail?: string;
+}
+export interface RuntimeSymbolLocationDTO {
+  loadBiasHex: string;
+  status: 'mapped' | 'partial' | 'unmapped' | 'overflow' | 'unknown';
+  addressHex: string | null;
+  endAddressHex: string | null;
+  mappedRanges: RuntimeModuleMappedRangeDTO[];
+}
+export type RuntimeSectionDTO = ElfSectionDTO & {
+  runtimeLocations: RuntimeSymbolLocationDTO[];
+  runtimeReason?: string;
+};
+export type RuntimeSymbolDTO = ElfSymbolDTO & {
+  runtimeLocations: RuntimeSymbolLocationDTO[];
+  runtimeReason?: string;
+  runtimeMeaning: 'address' | 'ifunc-resolver' | 'absolute-value' | 'tls-offset' | 'undefined' | 'common' | 'non-runtime-section' | 'unsupported-definition';
+};
+export interface RuntimeModuleSymbolsDTO {
+  available: boolean;
+  source: 'linux-proc-maps-elf-symbols';
+  coverage: 'complete' | 'partial' | 'truncated' | 'none';
+  identityVerified: boolean;
+  pid?: string;
+  moduleId: string;
+  contentIdentity: 'file-metadata-only';
+  module?: RuntimeModuleDTO;
+  elfMetadata?: ElfSymbolMetadataDTO;
+  sections: RuntimeSectionDTO[];
+  symbols: RuntimeSymbolDTO[];
+  reason?: string;
+  detail?: string;
+}
+export interface ModuleSymbolsSnapshotDTO {
+  type: 'moduleSymbolsSnapshot';
+  id: string;
+  point: HistoryPointDTO;
+  stop: StopRefDTO;
+  processInstanceId: string;
+  evidenceScope: 'current-os-state';
+  report: RuntimeModuleSymbolsDTO;
+}
+
+/** GDB's declared type structure; addresses do not establish C++ lifetime. */
+export interface VariableLayoutNodeDTO {
+  id: string;
+  kind: 'struct' | 'union' | 'array' | 'pointer' | 'reference' | 'integer' | 'float' | 'enum' | 'boolean' | 'void' | 'function' | 'other';
+  typeName: string | null;
+  byteSize: string | null;
+  addressHex: string | null;
+  addressReason: string | null;
+  fields?: VariableLayoutFieldDTO[];
+  targetTypeName?: string | null;
+  /** Compact first-element template, not an eagerly expanded allocation. */
+  array?: {
+    lowerBound: string | null;
+    upperBound: string | null;
+    elementCount: string | null;
+    strideBytes: string | null;
+    elementLayout: VariableLayoutNodeDTO | null;
+  };
+}
+export interface VariableLayoutFieldDTO {
+  name: string | null;
+  kind: 'member' | 'base' | 'static';
+  artificial: boolean;
+  /** Relative to the enclosing node. Bit order is GDB's target bitpos. */
+  bitOffset: string | null;
+  byteOffset: string | null;
+  bitOffsetInByte: number | null;
+  bitSize: string | null;
+  offsetEvidence: 'dwarf' | 'unknown';
+  reason: string | null;
+  type: VariableLayoutNodeDTO | null;
+}
+export interface VariableLayoutDTO {
+  available: boolean;
+  source: 'gdb-python-dwarf';
+  bitOffsetConvention: 'gdb-target-bitpos';
+  locator: string;
+  coverage: 'complete' | 'partial' | 'truncated' | 'none';
+  lifetime: 'unknown';
+  storage: { available: boolean; addressHex: string | null; reason: string | null };
+  root: VariableLayoutNodeDTO | null;
+  limits: { maxDepth: number; maxNodes: number; maxFields: number; maxNameLength: number; maxResponseBytes: number };
+  truncationReasons: string[];
+  reason?: string;
+}
+export interface VariableLayoutSnapshotDTO {
+  type: 'variableLayoutSnapshot';
+  id: string;
+  point: HistoryPointDTO;
+  stop: StopRefDTO;
+  processInstanceId: string;
+  layout: VariableLayoutDTO;
+}

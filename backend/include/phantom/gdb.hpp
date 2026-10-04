@@ -144,6 +144,11 @@ class GdbEngine {
   bool readVariables(std::string_view reference, std::size_t start,
                      std::size_t count, nlohmann::json& result,
                      GdbError& error);
+  // Static DWARF type metadata and current storage evidence for one exact
+  // root variable locator emitted by the current stack snapshot. No target
+  // expressions, pretty-printers, inferior calls or pointer traversal.
+  bool inspectVariableLayout(std::string_view locator, nlohmann::json& result,
+                             GdbError& error);
   bool readMemory(std::string_view addressHex, std::size_t byteCount,
                   nlohmann::json& result, GdbError& error);
   bool disassemble(std::string_view addressHex, std::size_t maxInstructions,

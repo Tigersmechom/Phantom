@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string_view>
 #include <nlohmann/json.hpp>
 
 namespace phantom {
@@ -26,5 +27,25 @@ struct ModuleInspectionLimits {
 // Every requested limit is clamped to the defaults above.
 nlohmann::json inspectRuntimeModules(int pid, const nlohmann::json& memoryMap,
                                      const ModuleInspectionLimits& limits = {});
+
+struct ModuleSymbolInspectionLimits {
+  std::size_t maxMetadataBytes = 4 * 1024 * 1024;
+  std::size_t maxSections = 1024;
+  std::size_t maxSymbols = 4096;
+  std::size_t maxRuntimeLocations = 8192;
+  std::size_t maxMappedRanges = 16384;
+  std::size_t maxMatchOperations = 2 * 1024 * 1024;
+};
+
+// Inspect section/symbol metadata for one module ID from the current maps.
+// The caller keeps every inferior thread stopped. Pinned proc maps and process
+// identity are checked before/after, as are the opened mapped file's identity
+// and metadata version. This is file metadata plus PT_LOAD mapping evidence,
+// never proof of live object lifetimes, dynamic symbol binding or vtable layout.
+// TLS, undefined/common and absolute symbols do not get fabricated addresses.
+// All limits are clamped to the defaults above; exhausted budgets are explicit.
+nlohmann::json inspectRuntimeModuleSymbols(
+    int pid, const nlohmann::json& memoryMap, std::string_view moduleId,
+    const ModuleSymbolInspectionLimits& limits = {});
 
 }  // namespace phantom

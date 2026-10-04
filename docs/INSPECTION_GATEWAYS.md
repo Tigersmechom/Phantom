@@ -24,6 +24,12 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `diffMemoryMaps` | No | Compare two retained observation maps. |
 | `traceInstructions` | Required | Advance execution and capture selected values at instruction boundaries. |
 | `readInstructionTrace` | No | Page through a retained instruction trace. |
+| `inspectModules` / `inspectModuleSymbols` | Required | Capture current module mappings or one module's ELF sections/symbols. |
+| `readModuleSnapshot` / `readModuleSymbols` | No | Read retained module metadata or symbol pages. |
+| `inspectVariableLayout` | Required | Capture declared type/storage layout for an emitted root locator. |
+| `readVariableLayout` | No | Read a retained variable layout. |
+| `readOutputJournal` | No | Read retained physical output bytes and gaps. |
+| `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 
 Captures and traces share a separate bounded store: at most 128 records and
 `capabilities.limits.maxInspectionStoreBytes` serialized bytes (16 MiB by
@@ -31,8 +37,10 @@ default). Oldest records are evicted first; missing records return
 `HISTORY_EVICTED`. A fresh launch clears this store. A repeated historical read
 does not execute the inferior, mutate the capture or append output.
 
-All addresses and offsets are hexadecimal strings. Parse them with `BigInt`,
-not JavaScript `Number`. Byte counts within the advertised budgets are numbers.
+Address fields and other fields named `*Hex` are hexadecimal strings. Layout
+sizes, offsets and array bounds/counts are decimal strings. Parse exact integer
+strings with `BigInt`, not JavaScript `Number`. Bounded page/read byte counts
+within the advertised budgets are numbers; use the DTO field types.
 Stop/history ordinals are session-local, not global timestamps.
 
 ## Build and launch address profiles
@@ -246,3 +254,99 @@ journal until they actually reach the output transport.
 
 Recorder commands and their separate external-effect limits are documented in
 [RECORDING.md](RECORDING.md).
+
+## ELF sections and symbols at runtime
+
+Obtain a module ID from the current `inspectModules` result, then capture its
+section/symbol metadata at the same `expectedStop`:
+
+```json
+{"kind":"inspectModuleSymbols","moduleId":"<module.id>"}
+{"kind":"readModuleSymbols","snapshotId":"symbols-1","start":100,"count":100}
+```
+
+Both return `kind:moduleSymbols` with an immutable `snapshot`, `start`,
+`totalSymbols` and `hasMore`. Capture returns the first 100 retained symbols
+(or the configured smaller page size). Further pages read only the saved
+capture, including after `dlclose` or exit. IDs require the session that created
+them. `totalSymbols` counts captured records; `report.elfMetadata.symbolCount`
+counts entries declared by the file's symbol tables. A truncated capture may
+therefore have fewer available records than the file. `.symtab` and `.dynsym`
+retain separate table/index identities; aliases and duplicate names are not
+silently collapsed.
+
+The parser reads ELF64 little-endian x86-64 metadata from a verified descriptor.
+Sections expose flags, file offset, virtual address, size and alignment.
+`SHT_NOBITS` such as BSS does not promise bytes at its file offset. Symbol
+values, sizes and addresses are strings, preserving all 64 bits. Names retain
+exact UTF-8 or `name:null` plus `nameBytesHex`. A stripped or sectionless ELF can
+legitimately provide fewer symbols or none; this does not mean the process
+contains no code or objects. External debug links and separate DWARF files are
+not traversed by this parser.
+
+`runtimeLocations` applies each proven PT_LOAD load bias to allocated sections
+and defined symbols, with intersections against actual mapped ranges. Negative
+bias, overflow, partial mapping and missing load instances remain explicit.
+Exhausted matching budgets use unknown evidence rather than inventing an
+unmapped address. Zero-size symbols describe a point, not an extent inferred
+from the next symbol. TLS offsets require thread-specific resolution; absolute,
+common and undefined symbols do not receive fabricated relocated addresses.
+GNU IFUNC addresses identify resolvers, not the function selected by a call.
+Dynamic symbol interposition and runtime relocation contents are not inferred.
+
+`classification:vtable|typeinfo|typeinfo-name|vtt` is evidence from the Itanium
+mangled-name prefix only. It supports labels in a **2D** memory view; it does not
+prove that an arbitrary pointer is a valid object/vptr or decode every slot of
+a table. Table groups, secondary address points and construction tables require
+additional ABI evidence. A vptr can point inside a table rather than at the
+symbol's first byte. See the [Itanium ABI](https://itanium-cxx-abi.github.io/cxx-abi/abi.html#vtable)
+and [ELF symbol specification](https://gabi.xinuos.com/elf/05-symtab.html).
+
+Capture is limited to one module, 4 MiB metadata reads, 1024 sections and 4096
+symbols, with additional bounded relocation/matching output. Process identity,
+current maps and opened file metadata are checked before/after inspection.
+The shared inspection store bounds retained JSON. File metadata plus mappings
+is evidence of current OS state, including when GDB is replaying old machine
+state; it is not a memory-content hash or an allocation lifetime record.
+
+## Declared variable layout from GDB/DWARF
+
+Use a root variable locator from the current observation or a `readVariables`
+result at the same stop:
+
+```json
+{"kind":"inspectVariableLayout","locator":"frame:0:object"}
+{"kind":"readVariableLayout","snapshotId":"layout-2"}
+```
+
+The live request requires `expectedStop`. Results have `kind:variableLayout`
+and an immutable `snapshot.layout`. They describe the declared type, byte size,
+member offsets, compact array shape/stride, union overlap and compiler-provided
+artificial fields. This is structure metadata, not a value evaluation or an
+allocation trace. `lifetime:unknown` remains explicit even when GDB supplies a
+storage address before a source declaration has executed.
+
+The embedded helper uses GDB's Python metadata API and exact local-variable
+names (`frame:<level>:<ASCII identifier>` in this profile). It accepts no
+expressions, casts, arbitrary Python, dynamic-type queries
+or user helper paths. It never follows pointers/references or stringifies a
+`gdb.Value`; inferior function calls stay disabled. Root locators must be emitted
+at the current stop; ambiguous shadowed names are rejected. The bounded
+per-stop cache retains up to 4096 supported root locators across frame queries;
+saturation preserves already issued entries and reports a limit for new ones. Missing Python or
+debug metadata has an explicit error/unavailable result.
+
+Bitfield offsets use `bitOffsetConvention:gdb-target-bitpos`, with separate
+bit size and offset within a byte; bitfields have no invented address. Static
+members are not placed in object storage. Union fields overlap without a claim
+about the active member. Reference referent addresses are not mislabeled as
+reference-slot storage. Optimized-out variables may retain type metadata while
+storage is unavailable. Base-class addresses stay unknown where this Python
+API cannot prove whether an offset requires virtual-base evaluation.
+
+Arrays use a first-element template, bounds, count and stride; a large array is
+not expanded element by element. Limits are depth 8, 128 nodes, 128 fields,
+256 characters per name and 256 KiB emitted helper JSON. Truncation is explicit;
+these are traversal/output limits, not a byte quota on GDB's own DWARF decoder.
+The normal debugger command deadline still applies. Metadata API reference:
+[GDB Types in Python](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Types-In-Python.html).

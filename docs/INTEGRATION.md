@@ -101,3 +101,14 @@ source/function breakpoints или останавливается в безоп�
 `return` не считается надёжной реализацией, потому что функция `noreturn`.
 
 `unreal/` — независимый эксперимент с материалами и геометрией букв. Карта сохранена и проверена; неудачный offscreen-кадр не является превью или подтверждением работающего отладчика.
+
+
+Срез секций/символов и DWARF layout предоставляет ещё четыре команды:
+`inspectModuleSymbols` / `readModuleSymbols` и `inspectVariableLayout` /
+`readVariableLayout`. Первые связывают on-disk ELF metadata с проверенными
+load instances и сохраняют страницы символов; вторые описывают declared
+structure конкретной переменной без inferior calls и pointer traversal.
+Снимки неизменяемы, root locators принадлежат остановке, а storage address
+не является свидетельством lifetime. Vtable/RTTI prefix classification
+служит подписью области; полный object/ABI overlay требует следующего слоя.
+Примеры и точные поля — [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).

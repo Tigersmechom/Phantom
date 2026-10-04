@@ -1,4 +1,4 @@
-import type { ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -598,6 +598,8 @@ export interface BackendCapabilitiesDTO {
   memoryCapture: boolean;
   memoryMapDiff: boolean;
   outputJournal: boolean;
+  moduleSymbols: 'elf-section-symbol-tables' | 'none';
+  variableLayout: 'gdb-python-dwarf' | 'none';
   moduleInspection: 'linux-proc-maps-elf' | 'none';
   recorderProbe: boolean;
   recordingProfiles: RecordingProfileDTO[];
@@ -636,6 +638,10 @@ export type BackendCommandDTO =
   | { kind: 'readOutputJournal'; stream: 'stdout' | 'stderr'; fromByte: number; byteCount: number; point?: HistoryPointDTO }
   | { kind: 'inspectProcess' }
   | { kind: 'inspectModules' }
+  | { kind: 'inspectModuleSymbols'; moduleId: string }
+  | { kind: 'readModuleSymbols'; snapshotId: string; start: number; count: number }
+  | { kind: 'inspectVariableLayout'; locator: string }
+  | { kind: 'readVariableLayout'; snapshotId: string }
   | { kind: 'readModuleSnapshot'; snapshotId: string }
   | { kind: 'probeRecorders' }
   | { kind: 'readRecording' }
@@ -664,6 +670,8 @@ export interface BackendRequestDTO {
 export type BackendResultDTO =
   | OutputJournalDTO
   | { kind: 'moduleSnapshot'; snapshot: ModuleSnapshotDTO }
+  | { kind: 'moduleSymbols'; snapshot: ModuleSymbolsSnapshotDTO; start: number; totalSymbols: number; hasMore: boolean }
+  | { kind: 'variableLayout'; snapshot: VariableLayoutSnapshotDTO }
   | { kind: 'recorderProbe'; probe: RecorderProbeDTO }
   | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }

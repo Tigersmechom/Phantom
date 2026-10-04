@@ -25,6 +25,8 @@ import advanced_gateway_integration
 import modules_integration
 import recorder_probe_integration
 import recording_integration
+import layout_integration
+import symbols_integration
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -105,6 +107,10 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         if not library.is_file():
             raise RuntimeError(f"Module fixture is unavailable: {library}; build phantom-module-map-library or pass --module-library")
         scenarios.append((modules_integration, [str(library.resolve())]))
+    if capabilities.get("moduleSymbols") == "elf-section-symbol-tables":
+        scenarios.append((symbols_integration, [str(executable.parent / "libphantom-module-symbols-library.so")]))
+    if capabilities.get("variableLayout") == "gdb-python-dwarf":
+        scenarios.append((layout_integration, []))
     if "gdb-record-full" in capabilities.get("recordingProfiles", []):
         scenarios.append((recording_integration, []))
     if capabilities.get("recorderProbe", False):
