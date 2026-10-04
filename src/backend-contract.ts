@@ -1,4 +1,4 @@
-/** Proposed debugger adapter protocol. This file does not implement or expose an IPC bridge. */
+/** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
 export const BACKEND_PROTOCOL_VERSION = 1 as const;
 export type BackendProtocolVersion = typeof BACKEND_PROTOCOL_VERSION;
 export type ArchitectureDTO = 'arm64' | 'x86_64';
@@ -45,11 +45,41 @@ export interface SessionRefDTO { id: string; generation: number }
 export interface HistoryPointDTO { branchId: string; eventOrdinal: number }
 export interface StopRefDTO { stopId: string; stateRevision: number }
 
+export type AddressProfileDTO = 'native' | 'fixed-executable';
+export type AddressPolicyDTO = 'native' | 'disable-aslr' | 'require-fixed';
+export type ElfTypeDTO = 'ET_NONE' | 'ET_REL' | 'ET_EXEC' | 'ET_DYN' | 'ET_CORE' | 'unknown';
+export interface ElfProgramHeaderDTO {
+  index: number;
+  type: 'PT_LOAD' | 'PT_INTERP' | 'PT_GNU_STACK' | 'PT_GNU_RELRO';
+  offsetHex: string;
+  virtualAddressHex: string;
+  fileSizeHex: string;
+  memorySizeHex: string;
+  alignmentHex: string;
+  flags: { read: boolean; write: boolean; execute: boolean };
+}
+export type ElfInspectionDTO = {
+  available: true;
+  format: 'ELF';
+  class: 64;
+  endianness: 'little';
+  elfType: ElfTypeDTO;
+  elfTypeValue: number;
+  architecture: 'x86_64' | 'unsupported';
+  machine: number;
+  entryAddressHex: string;
+  programHeaders: ElfProgramHeaderDTO[];
+  /** GNU build ID from PT_NOTE, not the backend artifact ID. */
+  buildId: string | null;
+} | { available: false; reason: string; detail: string };
+
 export interface BuildConfigurationDTO {
   revisionId: string;
   compiler: string;
   flags: string[];
   outputDirectory: string;
+  /** Omitted means native; fixed-executable adds non-PIE flags and verifies ET_EXEC. */
+  addressProfile?: AddressProfileDTO;
 }
 export interface BuildArtifactDTO {
   id: string;
@@ -62,6 +92,8 @@ export interface BuildArtifactDTO {
   binaryPath: string;
   binarySha256: string;
   debugSymbolsAvailable: boolean;
+  addressProfile: AddressProfileDTO;
+  elf: ElfInspectionDTO;
 }
 export interface SubmittedInputDTO {
   id: string;
@@ -249,6 +281,213 @@ export type MemoryMapSnapshotDTO = {
   detail?: string;
   lineNumber?: number;
 };
+
+export interface ProcUnavailableSectionDTO {
+  available: false;
+  coverage: 'none';
+  reason: string;
+  detail: string;
+}
+export type ProcSectionDTO<T> =
+  | ({ available: true; coverage: 'complete' | 'partial' } & T)
+  | ProcUnavailableSectionDTO;
+/** Kernel-reported values may be zeroed by ptrace restrictions; null means absent. */
+export interface ProcessAddressBoundariesDTO {
+  startCodeHex: string | null;
+  endCodeHex: string | null;
+  startStackHex: string | null;
+  startDataHex: string | null;
+  endDataHex: string | null;
+  startBrkHex: string | null;
+  argStartHex: string | null;
+  argEndHex: string | null;
+  envStartHex: string | null;
+  envEndHex: string | null;
+}
+export interface ProcessIdentityIdsDTO {
+  real: string;
+  effective: string;
+  saved: string;
+  filesystem: string;
+}
+export type ProcPathDTO = ProcSectionDTO<{
+  /** Paths are metadata only; the backend never opens the link target. */
+  path: string | null;
+  pathBytesHex?: string;
+}>;
+export type ProcessInspectionDTO = {
+  source: 'linux-procfs';
+  pid: string;
+} & ((ProcUnavailableSectionDTO & { identityVerified: false }) | {
+  available: true;
+  coverage: 'complete' | 'partial';
+  /** starttime verified around reads through one pinned proc-directory descriptor. */
+  identityVerified: true;
+  stat: ProcSectionDTO<{
+    pid: string;
+    startTimeTicks: string;
+    command: string | null;
+    commandBytesHex?: string;
+    state: string;
+    addresses: ProcessAddressBoundariesDTO;
+    addressEvidence: 'kernel-reported-may-be-redacted';
+  }>;
+  personality: ProcSectionDTO<{
+    maskHex: string;
+    /** Observed ADDR_NO_RANDOMIZE flag, not proof of allocator/replay determinism. */
+    addrNoRandomize: boolean;
+  }>;
+  status: ProcSectionDTO<{
+    state?: string;
+    threads?: number;
+    tracerPid?: string;
+    seccomp?: number;
+    noNewPrivs?: boolean;
+    uid?: ProcessIdentityIdsDTO;
+    gid?: ProcessIdentityIdsDTO;
+  }>;
+  executable: ProcPathDTO;
+  fileDescriptors: ProcUnavailableSectionDTO | {
+    available: true;
+    coverage: 'complete' | 'partial' | 'truncated';
+    reason?: 'descriptor-limit' | 'directory-read-error' | 'malformed-descriptor';
+    entries: (ProcPathDTO & { descriptor: number })[];
+  };
+  memory: ProcSectionDTO<{
+    countersBytes: {
+      rss?: string;
+      pss?: string;
+      sharedClean?: string;
+      sharedDirty?: string;
+      privateClean?: string;
+      privateDirty?: string;
+      anonymous?: string;
+      swap?: string;
+      swapPss?: string;
+      locked?: string;
+    };
+  }>;
+  system: ProcSectionDTO<{
+    kernelRelease: string | null;
+    kernelReleaseBytesHex?: string;
+    machine: string | null;
+    machineBytesHex?: string;
+    pageSizeBytes?: string;
+  }>;
+});
+
+/** Evidence captured at launch, not a guarantee of addresses after future execution. */
+export interface ExecutionLayoutDTO {
+  addressPolicy: AddressPolicyDTO;
+  elfType: ElfTypeDTO | null;
+  aslr: {
+    requestedDisabled: boolean;
+    verifiedDisabled: boolean | null;
+    evidence: 'linux-proc-personality' | 'unavailable';
+    personalityMaskHex: string | null;
+  };
+  addresses: ProcessAddressBoundariesDTO | null;
+  processStartTimeTicks: string | null;
+  runFingerprint: string;
+  allocatorDeterminism: 'not-established';
+  replayVerified: false;
+}
+
+export interface InspectionContextDTO {
+  point: HistoryPointDTO;
+  stop: StopRefDTO;
+  processInstanceId: string;
+}
+export interface MemoryRangeRequestDTO { addressHex: string; byteCount: number }
+export type CapturedMemoryRangeDTO = MemoryRangeRequestDTO & (
+  | { available: true; bytesBase64: string; unreadableBytes: 0 }
+  | {
+    available: false;
+    bytesBase64?: string;
+    unreadableBytes: number;
+    reason: 'read-failed' | 'partial-read' | 'process-exited';
+  }
+);
+/** Immutable retained bytes from selected ranges; contents are not allocation identities. */
+export interface MemoryCaptureDTO extends InspectionContextDTO {
+  type: 'memoryCapture';
+  id: string;
+  coverage: 'complete' | 'partial';
+  ranges: CapturedMemoryRangeDTO[];
+}
+export interface MemoryByteChangeDTO {
+  addressHex: string;
+  byteCount: number;
+  beforeBytesHex: string;
+  afterBytesHex: string;
+}
+export interface MemoryCaptureDiffDTO {
+  kind: 'memoryCaptureDiff';
+  beforeCaptureId: string;
+  afterCaptureId: string;
+  coverage: 'complete' | 'partial';
+  comparedBytes: number;
+  changedBytes: number;
+  unavailableRanges: (MemoryRangeRequestDTO & { beforeAvailable: boolean; afterAvailable: boolean })[];
+  changes: MemoryByteChangeDTO[];
+  start: number;
+  totalChanges: number;
+  hasMore: boolean;
+}
+/** Exact VMA interval comparison: splitting a mapping produces removed/added intervals. */
+export type MemoryMapChangeDTO =
+  | { kind: 'added'; before: null; after: MemoryRegionDTO }
+  | { kind: 'removed'; before: MemoryRegionDTO; after: null }
+  | { kind: 'changed'; before: MemoryRegionDTO; after: MemoryRegionDTO };
+export interface MemoryMapDiffDTO {
+  kind: 'memoryMapDiff';
+  beforePoint: HistoryPointDTO;
+  afterPoint: HistoryPointDTO;
+  changes: MemoryMapChangeDTO[];
+  start: number;
+  totalChanges: number;
+  hasMore: boolean;
+}
+export type RegisterValueDTO = { number: number; name: string } & (
+  | { available: true; valueHex: string }
+  | { available: false; reason: 'not-returned' | 'non-hex-or-unavailable' | 'process-exited' | 'read-failed' }
+);
+export interface InstructionTraceEntryDTO {
+  ordinal: number;
+  pcBeforeHex: string | null;
+  pcAfterHex: string | null;
+  registerChanges: { name: string; before: RegisterValueDTO; after: RegisterValueDTO }[];
+  memoryChanges: (MemoryRangeRequestDTO & { before: CapturedMemoryRangeDTO; after: CapturedMemoryRangeDTO })[];
+  /** GDB stop reason; a signal/breakpoint does not prove one instruction completed. */
+  reason: string;
+  instructionCompleted: boolean;
+}
+export type InstructionTraceStatusDTO = 'complete' | 'terminated' | 'failed';
+export interface InstructionTraceDTO {
+  type: 'instructionTrace';
+  id: string;
+  processInstanceId: string;
+  beforePoint: HistoryPointDTO;
+  beforeStop: StopRefDTO;
+  afterPoint: HistoryPointDTO | null;
+  afterStop: StopRefDTO | null;
+  requestedInstructions: number;
+  executedInstructions: number;
+  attemptedInstructions: number;
+  status: InstructionTraceStatusDTO;
+  /** Backend termination category, error code, or a GDB stop reason. */
+  terminationReason: string;
+  coverage: {
+    registers: 'selected-instruction-boundaries';
+    memory: 'selected-instruction-boundaries';
+    sameValueWrites: false;
+    otherThreads: 'not-recorded';
+  };
+  initialRegisters: RegisterValueDTO[];
+  initialMemory: CapturedMemoryRangeDTO[];
+  /** Paged entries; initial values always describe the beginning of the entire trace. */
+  entries: InstructionTraceEntryDTO[];
+}
 export interface StopObservationDTO {
   id: string;
   point: HistoryPointDTO;
@@ -266,6 +505,7 @@ export interface StopObservationDTO {
   stderr: OutputSnapshotDTO;
   /** VMA metadata at this stop, not resident bytes or C++ allocation identity. */
   memoryMap?: MemoryMapSnapshotDTO;
+  executionLayout?: ExecutionLayoutDTO;
   expressions: ExpressionTraceDTO[];
   coverage: { variables: 'complete' | 'partial'; expressions: 'none' | 'partial' | 'observed'; memory: 'none' | 'partial' };
 }
@@ -288,6 +528,10 @@ export interface ResourceLimitsDTO {
   maxStringBytes: number;
   maxMemoryReadBytes: number;
   maxInstructionsPerRequest: number;
+  maxTraceInstructions: number;
+  maxTraceMemoryBytes: number;
+  maxCaptureBytes: number;
+  maxInspectionStoreBytes: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
 }
@@ -309,6 +553,13 @@ export interface BackendCapabilitiesDTO {
   asm: { currentPc: boolean; sourceRange: boolean };
   memoryRead: boolean;
   memoryMap?: 'linux-proc-maps' | 'none';
+  addressProfiles: AddressProfileDTO[];
+  addressPolicies: AddressPolicyDTO[];
+  processInspection: 'linux-procfs' | 'none';
+  registerRead: boolean;
+  instructionTrace: 'instruction-boundaries' | 'none';
+  memoryCapture: boolean;
+  memoryMapDiff: boolean;
   eventReplay: boolean;
   limits: ResourceLimitsDTO;
 }
@@ -324,7 +575,7 @@ export interface BackendErrorDTO {
 export type BackendCommandDTO =
   | { kind: 'capabilities' }
   | { kind: 'build'; source: SourceBundleDTO; configuration: BuildConfigurationDTO; architecture: ArchitectureDTO }
-  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean }
+  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean; addressPolicy?: AddressPolicyDTO }
   | { kind: 'appendInput'; id: string; text: string }
   | { kind: 'closeInput' }
   | { kind: 'step'; stepKind: 'over' | 'into' | 'out' | 'instruction' }
@@ -340,6 +591,16 @@ export type BackendCommandDTO =
   | { kind: 'writeVariable'; locator: string; expected: RuntimeValueDTO; value: ScalarValueDTO }
   | { kind: 'disassemble'; buildId: string; target: { kind: 'pc'; addressHex: string } | { kind: 'source'; range: SourceSpanDTO }; maxInstructions: number }
   | { kind: 'readMemory'; addressHex: string; byteCount: number }
+  | { kind: 'inspectProcess' }
+  | { kind: 'readRegisters'; registers?: string[] }
+  /** Executes instructions. Produces observation/state/trace-recorded/commandFinished events. */
+  | { kind: 'traceInstructions'; count: number; registers?: string[]; memoryRanges: MemoryRangeRequestDTO[] }
+  | { kind: 'captureMemory'; ranges: MemoryRangeRequestDTO[] }
+  /** Retained reads/diffs require the session, but no live expectedStop. */
+  | { kind: 'readMemoryCapture'; captureId: string }
+  | { kind: 'diffMemoryCaptures'; beforeCaptureId: string; afterCaptureId: string; start: number; count: number }
+  | { kind: 'diffMemoryMaps'; beforePoint: HistoryPointDTO; afterPoint: HistoryPointDTO; start: number; count: number }
+  | { kind: 'readInstructionTrace'; traceId: string; start: number; count: number }
   | { kind: 'cancel'; targetRequestId: string }
   | { kind: 'replayEvents'; afterSequence: number };
 export interface BackendRequestDTO {
@@ -365,6 +626,12 @@ export type BackendResultDTO =
   | { kind: 'breakpoints'; breakpoints: BreakpointDTO[] }
   | { kind: 'asm'; architecture: ArchitectureDTO; instructions: InstructionDTO[]; truncated: boolean }
   | { kind: 'memory'; addressHex: string; bytesBase64: string; unreadableBytes: number }
+  | (InspectionContextDTO & { kind: 'processInspection'; inspection: ProcessInspectionDTO })
+  | (InspectionContextDTO & { kind: 'registers'; architecture: ArchitectureDTO; registers: RegisterValueDTO[] })
+  | { kind: 'memoryCapture'; capture: MemoryCaptureDTO }
+  | MemoryCaptureDiffDTO
+  | MemoryMapDiffDTO
+  | { kind: 'instructionTrace'; trace: InstructionTraceDTO; start: number; totalEntries: number; hasMore: boolean }
   | { kind: 'events'; events: BackendEventDTO[] };
 export type BackendResponseDTO = {
   protocolVersion: BackendProtocolVersion;
@@ -381,6 +648,7 @@ export type BackendEventPayloadDTO =
   | { kind: 'restoreProgress'; completedCommands: number; totalCommands: number; phase: 'replaying' | 'verifying'; candidateProcessInstanceId: string }
   | { kind: 'branchCreated'; branchId: string; parent: HistoryPointDTO }
   | { kind: 'historyEvicted'; branchId: string; throughOrdinal: number }
+  | { kind: 'instructionTraceRecorded'; traceId: string; status: InstructionTraceStatusDTO; terminationReason: string; totalEntries: number }
   | { kind: 'commandFinished'; requestId: string; outcome: 'completed' | 'waiting' | 'cancelled' | 'failed'; error?: BackendErrorDTO }
   | { kind: 'error'; error: BackendErrorDTO };
 export interface BackendEventDTO {
@@ -394,7 +662,7 @@ export interface BackendEventDTO {
   causedByRequestId?: string;
   payload: BackendEventPayloadDTO;
 }
-/** New adapter seam; a future implementation must validate all incoming JSON at runtime. */
+/** Adapter seam; implementations must validate all incoming JSON at runtime. */
 export interface DebugBackendAdapter {
   readonly protocolVersion: BackendProtocolVersion;
   connect(request: { supportedProtocolVersions: number[] }): Promise<

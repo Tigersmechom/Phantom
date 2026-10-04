@@ -89,6 +89,21 @@ rr проверяются отдельно на выбранном компью�
 
 ## Проверка rr на настоящем компьютере
 
+До подключения rr доступны обычный GDB, ограниченный forward instruction trace
+и [backend-шлюзы памяти/процесса](INSPECTION_GATEWAYS.md). Визуализация памяти
+планируется **2D**; standalone service отдаёт DTO и не содержит renderer.
+`configuration.addressProfile:"fixed-executable"` собирает и проверяет `ET_EXEC`.
+`launch.addressPolicy:"require-fixed"` требует реального `ADDR_NO_RANDOMIZE`
+у принадлежащего сессии процесса; если host/seccomp/procfs не даёт подтвердить
+его, запуск завершится `LAUNCH_FAILED`. Менее строгий `disable-aslr` остаётся
+доступен с честным requested/verified evidence. Глобальные sysctl не меняются.
+
+`inspectProcess` читает ограниченные procfs metadata, fd symlink targets и
+`smaps_rollup`, раздельно отмечая недоступные секции. Поддержка определяется
+проверкой конкретного kernel/ABI/permissions, а не только названием Ubuntu.
+Наличие этих шлюзов и совпадение адресов не означает поддержку rollback:
+`restore:"none"`, `allocatorDeterminism:"not-established"`, `replayVerified:false`.
+
 `scripts/backend-doctor.sh` только читает сведения об ОС, CPU, версиях инструментов,
 `perf_event_paranoid` и `ptrace_scope`. Он не устанавливает пакеты, не меняет sysctl,
 не запускает запись и не объявляет replay поддерживаемым. Отсутствующий tool

@@ -1,4 +1,8 @@
 #include "phantom/validation.hpp"
+#include "phantom/service.hpp"
+
+#include <cstdlib>
+#include <filesystem>
 
 #include <cassert>
 #include <iostream>
@@ -77,5 +81,32 @@ int main() {
   assert(!validation_fails(append));
   append["command"] = {{"kind", "closeInput"}};
   assert(!validation_fails(append));
+  // A configured smaller budget must be advertised and rejected before
+  // accepting an asynchronous trace, not discovered after acceptance.
+  phantom::ValidationLimits small;
+  small.maxInstructions = 16;
+  small.maxMemoryReadBytes = 32;
+  Json trace = append;
+  trace["command"] = {{"kind","traceInstructions"},{"count",16},{"memoryRanges",Json::array()}};
+  phantom::validate_request(trace, small);
+  trace["command"]["count"] = 17;
+  try { phantom::validate_request(trace, small); assert(false); }
+  catch (const ValidationError& e) { assert(e.code == "INVALID_REQUEST"); }
+  trace["command"]["count"] = 1;
+  trace["command"]["memoryRanges"] = {{{"addressHex","0x10"},{"byteCount",33}}};
+  try { phantom::validate_request(trace, small); assert(false); }
+  catch (const ValidationError& e) { assert(e.code == "INVALID_REQUEST"); }
+  char temporary[] = "/tmp/phantom-service-limits-XXXXXX";
+  const auto directory = ::mkdtemp(temporary); assert(directory);
+  {
+    phantom::ServiceOptions options; options.workspace = directory; options.limits = small;
+    phantom::BackendService service(options);
+    auto connected = service.connect({{"supportedProtocolVersions",{1}}});
+    const auto& budgets = connected.front().at("capabilities").at("limits");
+    assert(budgets.at("maxTraceInstructions") == 16);
+    assert(budgets.at("maxTraceMemoryBytes") == 32);
+    assert(budgets.at("maxCaptureBytes") == 32);
+  }
+  std::filesystem::remove_all(directory);
   std::cout << "validation tests passed\n";
 }

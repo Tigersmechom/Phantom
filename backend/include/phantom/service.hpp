@@ -69,6 +69,9 @@ class BackendService final {
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
   Json handleInput(const Json& request);
+  std::vector<Json> handleInspection(const Json& request);
+  std::vector<Json> handleTrace(const Json& request, const FrameSink& publish);
+  std::string storeInspection(Json value, std::string_view prefix);
   Json handleHistory(const Json& request);
   std::filesystem::path safePath(const std::string& supplied, bool allowMissing) const;
   void appendHistory(const Json& observation, const Json& state);
@@ -109,6 +112,11 @@ class BackendService final {
   std::uint64_t sequence_ = 0;
   std::uint64_t ordinal_ = 0;
   std::uint64_t stateRevision_ = 0;
+  Json executionLayout_ = nullptr;
+  struct InspectionEntry { std::string id; Json value; std::size_t bytes; };
+  std::vector<InspectionEntry> inspectionStore_;
+  std::size_t inspectionBytes_ = 0;
+  std::uint64_t inspectionCounter_ = 0;
   Json liveState_ = nullptr;
   Json liveObservation_ = nullptr;
   std::vector<HistoryEntry> history_;

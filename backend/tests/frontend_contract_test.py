@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import service_integration
+import advanced_gateway_integration
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,6 +77,18 @@ def capture(executable: Path) -> list[tuple[str, dict]]:
             raise RuntimeError(f"GDB integration exited with {result}")
     finally:
         service_integration.Client = original_client
+        sys.argv = original_argv
+    original_argv = sys.argv
+    try:
+        advanced_gateway_integration.TRAFFIC.clear()
+        sys.argv = [str(Path(advanced_gateway_integration.__file__)), str(executable)]
+        if advanced_gateway_integration.main():
+            raise RuntimeError("advanced gateway integration failed")
+        # Deliberately malformed inputs exercise the transport validator, whose
+        # uncorrelated wire-error envelope is outside DebugBackendAdapter DTOs.
+        traffic.extend((direction, frame) for direction, frame in advanced_gateway_integration.TRAFFIC
+                       if frame.get("kind") != "error")
+    finally:
         sys.argv = original_argv
     return traffic
 

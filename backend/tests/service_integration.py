@@ -99,7 +99,8 @@ def main() -> int:
                     "protocolVersion", "backendName", "backendVersion", "architectures", "stepKinds",
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
-                    "eventReplay", "limits",
+                    "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -107,6 +108,22 @@ def main() -> int:
                 fail("unexpected backend capability identity", caps)
             if caps.get("sourceBreakpoints") is not True:
                 fail("source breakpoints are not advertised", caps)
+            require_keys(
+                caps["limits"],
+                {"maxOutputBytes", "maxHistoryBytes", "maxResidentSnapshots", "maxVariablesPerPage",
+                 "maxStringBytes", "maxMemoryReadBytes", "maxInstructionsPerRequest", "maxTraceInstructions",
+                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes",
+                 "commandTimeoutMs", "replayTimeoutMs"},
+                "ResourceLimitsDTO",
+            )
+            if caps["addressProfiles"] != ["native", "fixed-executable"] or \
+                    caps["addressPolicies"] != ["native", "disable-aslr", "require-fixed"] or \
+                    caps["processInspection"] != "linux-procfs" or \
+                    caps["instructionTrace"] != "instruction-boundaries" or \
+                    any(caps[field] is not True for field in ("registerRead", "memoryCapture", "memoryMapDiff")):
+                fail("inspection capability values do not match the native gateway", caps)
+            if any(type(value) is not int or value <= 0 for value in caps["limits"].values()):
+                fail("resource limits must be positive integers", caps["limits"])
 
             common = {
                 "protocolVersion": 1,
@@ -161,6 +178,23 @@ def main() -> int:
             if not build.get("ok") or not build.get("result", {}).get("success"):
                 fail("build failed", build)
             artifact = build["result"]["artifact"]
+            require_keys(
+                artifact,
+                {"id", "sourceBundleId", "configurationRevisionId", "architecture", "targetTriple", "compiler",
+                 "command", "binaryPath", "binarySha256", "debugSymbolsAvailable", "addressProfile", "elf"},
+                "BuildArtifactDTO",
+            )
+            if artifact["addressProfile"] != "native" or artifact["elf"].get("available") is not True:
+                fail("native artifact did not expose ELF evidence", artifact)
+            require_keys(
+                artifact["elf"],
+                {"available", "format", "class", "endianness", "elfType", "elfTypeValue", "architecture",
+                 "machine", "entryAddressHex", "programHeaders", "buildId"},
+                "ElfInspectionDTO",
+            )
+            if artifact["elf"]["class"] != 64 or artifact["elf"]["architecture"] != "x86_64" or \
+                    artifact["elf"]["elfType"] not in ("ET_DYN", "ET_EXEC"):
+                fail("artifact contains unsupported executable metadata", artifact["elf"])
             if not Path(artifact["binaryPath"]).is_file():
                 fail("build artifact is missing", artifact)
 
@@ -187,9 +221,29 @@ def main() -> int:
             observation = event_frames[0]["payload"]["observation"]
             require_keys(
                 observation,
-                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage", "memoryMap"},
+                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage", "memoryMap", "executionLayout"},
                 "StopObservationDTO",
             )
+            layout = observation["executionLayout"]
+            require_keys(
+                layout,
+                {"addressPolicy", "elfType", "aslr", "addresses", "processStartTimeTicks", "runFingerprint",
+                 "allocatorDeterminism", "replayVerified"},
+                "ExecutionLayoutDTO",
+            )
+            require_keys(layout["aslr"],
+                         {"requestedDisabled", "verifiedDisabled", "evidence", "personalityMaskHex"}, "AslrEvidenceDTO")
+            if layout["addressPolicy"] != "disable-aslr" or layout["aslr"]["requestedDisabled"] is not True or \
+                    layout["elfType"] != artifact["elf"]["elfType"] or \
+                    layout["allocatorDeterminism"] != "not-established" or layout["replayVerified"] is not False:
+                fail("launch layout overstates address guarantees or loses the requested policy", layout)
+            if layout["aslr"]["evidence"] == "unavailable":
+                if layout["aslr"]["verifiedDisabled"] is not None or layout["aslr"]["personalityMaskHex"] is not None:
+                    fail("unavailable ASLR evidence must be null", layout)
+            elif layout["aslr"]["evidence"] != "linux-proc-personality" or \
+                    type(layout["aslr"]["verifiedDisabled"]) is not bool or \
+                    not isinstance(layout["aslr"]["personalityMaskHex"], str):
+                fail("verified ASLR evidence has an invalid shape", layout)
             require_keys(event_frames[1]["payload"]["state"], {"session", "phase", "processInstanceId", "buildId", "live", "exit"}, "DebugSessionStateDTO")
             require_keys(
                 event_frames[2]["payload"],

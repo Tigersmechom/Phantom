@@ -155,14 +155,58 @@ New command kinds and mutation/audit records still require a versioned
 DTO/fixture change. Unsupported commands or fields fail closed with
 `UNSUPPORTED`/`INVALID_REQUEST`.
 
-## Frontend gateway roadmap (2026-10-04)
+## Implemented inspection gateways (2026-10-04)
+
+The current native slice adds accepted request kinds together with strict DTO
+validation and advertised capabilities. The frontend's virtual-memory view is
+**2D**; this backend slice implements its data gateways only. Request examples,
+retention semantics and actual bounds are in
+[INSPECTION_GATEWAYS.md](../../docs/INSPECTION_GATEWAYS.md).
+
+- Build `configuration.addressProfile` is `native` (default) or
+  `fixed-executable`. The latter appends `-fno-pie -no-pie` and verifies the
+  actual x86_64 `ET_EXEC`, not just requested flags. `artifact.elf` includes
+  bounded ELF64 little-endian program-header metadata and GNU PT_NOTE build ID.
+- Launch `addressPolicy` is `native`, `disable-aslr` (default) or
+  `require-fixed`. Strict launch requires actual ET_EXEC and a verified
+  `ADDR_NO_RANDOMIZE` mask on the owned inferior; otherwise it stops it and
+  returns `LAUNCH_FAILED`. `executionLayout` records entry-time evidence and
+  requested launch-input fingerprint. It does not verify inherited environment,
+  dependency contents, allocator determinism or replay; `restore` stays `none`.
+- `inspectProcess` reads bounded stat/status/personality, exe/fd symlink targets,
+  smaps_rollup and kernel/page-size metadata. It pins the proc directory and
+  compares start time before/after collection. Independent denial/partial data
+  stays explicit; kernel-redacted zero address fields do not establish absence.
+- `readRegisters` reads frame-0 machine values, with per-register availability.
+  `captureMemory` retains up to eight nonoverlapping ranges (64 KiB total by
+  default); `readMemoryCapture` and `diffMemoryCaptures` use only saved bytes.
+  Missing bytes are not filled with zero or read from a later live stop.
+- `diffMemoryMaps` compares complete retained observation maps. A changed
+  interval with the same endpoints is `changed`; split/merged intervals are
+  `removed`/`added`, with no allocation/object identity claim.
+- `traceInstructions` advances execution through at most 256 instruction
+  attempts and captures selected registers plus up to eight ranges/4096 bytes
+  at instruction boundaries. It returns normal lifecycle events and an
+  `instructionTraceRecorded` event with trace ID; `readInstructionTrace` pages
+  at most 64 entries per response. Changes within a source step become visible
+  when they cross recorded instruction boundaries. Same-value writes,
+  instruction-internal reversals and other-thread write history remain absent.
+
+All new live read/capture/trace requests require `expectedStop`. Saved-capture,
+map-diff and trace-read requests are session-scoped historical queries, never
+implicit execution or live reads. Capture/trace retention is separate from
+stop history, bounded to 128 records and `maxInspectionStoreBytes`; a new
+session clears it and eviction yields `HISTORY_EVICTED`. Reading shared memory
+sequentially is not a globally atomic snapshot if external writers exist.
+
+## Remaining frontend gateway roadmap (2026-10-04)
 
 The new requirements extend P1/P4/P5/P6; they do not replace the existing
-operation/lifetime and input plans. Unsynchronized `cout` inspection, a native
-mapping snapshot and a unified output harness are the current implementation
-slice. The contracts below describe subsequent integration boundaries, **not
-new accepted request kinds**. Names are provisional until DTOs, runtime
-validation, capability checks and fixtures land together. See the complete
+operation/lifetime and input plans. The implementation includes native output,
+mapping snapshots and the accepted inspection/layout gateways above. The
+contracts below describe the broader remaining integration boundaries, **not
+additional accepted request kinds**. Proposed names remain provisional until
+DTOs, runtime validation, capabilities and fixtures land together. See the complete
 acceptance matrix and order in [handoff §20](../../docs/BACKEND_HANDOFF.md#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
 The native mapping entry point is `capabilities.memoryMap:'linux-proc-maps'`
@@ -170,18 +214,18 @@ and `StopObservationDTO.memoryMap:MemoryMapSnapshotDTO`, carrying availability,
 `source:'linux-proc-maps'`, `coverage:'complete'|'truncated'` and region
 metadata. This does not change `observation.coverage.memory` to captured:
 mapping metadata contains no memory bytes. The existing bounded `readMemory`
-command retains its `expectedStop` requirement. ELF/vtable overlays, richer
-diagnostics and the journal/profile/trace/intervention gateways remain future
-work as described below.
+command retains its `expectedStop` requirement. Runtime-module/vtable overlays,
+a durable output-effect journal, full replay recording and intervention
+gateways remain future work as described below.
 
 | Gateway | Proposed data and invariants | Dependencies |
 | --- | --- | --- |
-| Virtual address space | `MemoryMapSnapshot`: process/stop/point, source, coverage, ordered regions with hex `[start,end)`, permissions/sharing, hex file offset, device/inode/path. A bounded region listing is separate from captured bytes. `MemoryReadPage` carries address/length and per-range availability; historical reads require captured data. | Native procfs snapshot first; paging and immutable history storage next. |
-| Modules and C++ layout | `ModuleImage`: build-id, artifact hash, ELF kind/load bias/segments/sections. `MemoryOverlay`: region/module/object generation, extent, symbol/type/ABI, evidence; vtable address points, vptr, RTTI/VTT and inheritance relationships are optional typed overlays. | ELF/DWARF plus ABI adapters; P2 required for confirmed lifetime. A VMA is not an allocation or C++ object. |
-| OS diagnostics | `RuntimeEnvironment`: kernel/architecture, debugger/library identities, procfs/ptrace/ASLR probes with status/reason/evidence. `smaps`, fd and status views have separate cost/capability/permissions. | Actual runner probes; absent permissions degrade only affected features, with no global sysctl edits. |
+| Virtual address space | Implemented maps, immutable explicit byte captures and paged map/capture differences; a future `MemoryReadPage` may expose broader partial islands. | Retention/coverage remain bounded. Full-process byte capture is not implied by a complete mapping list. |
+| Modules and C++ layout | `ModuleImage`: build-id, artifact hash, ELF kind/load bias/segments/sections. `MemoryOverlay`: region/module/object generation, extent, symbol/type/ABI, evidence; vtable address points, vptr, RTTI/VTT and inheritance relationships are optional typed overlays. | Main-artifact ELF headers are implemented; runtime module indexing, ELF sections/DWARF and ABI adapters remain. P2 is required for confirmed lifetime. |
+| OS diagnostics | Current `inspectProcess` exposes procfs, descriptors, smaps_rollup, kernel and personality evidence; broader `RuntimeEnvironment` adds debugger/library identities and recorder probes. | Per-section evidence rather than a distro assumption. Full smaps and physical-page indexing remain outside the current collector. |
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ buffer probes first; journal persists separately from history eviction. Recorder effects need a replay policy before reverse execution is enabled. |
-| Execution layout | `ExecutionProfile`: requested ASLR/PIE/allocator configuration; `ExecutionManifest`: actual ELF/toolchain/runtime/environment identities, measured layout evidence, warnings and reproducibility coverage. | Build identity change, prelaunch probes and verified rerun checks; equal addresses alone never authorize restore. |
-| Changes inside a step | `ChangeIntervalPage`: capture/profile, from/to points, instruction or operation occurrence, thread/activation, changed registers/ranges with before/after availability, ordering, gaps and continuation cursor. | Recorder or instrumentation enabled before the interval. Captured stores, snapshot differences and semantic assignments remain distinct kinds. |
+| Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
+| Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
 | Runtime intervention | `InterventionRecord`: request/branch/expected stop, mechanism, requested edits, actual effects, cleanup status and resulting context. Execution requires an explicitly selected supported intervention profile. | P5 audit/branch foundations, ABI implementation, recorder compatibility and rollback/partial-failure tests. |
 
 All memory addresses and offsets retain exact string representations; no
@@ -213,11 +257,11 @@ journal. Separate branches preserve each original run's effects and provenance.
 
 ### Address stability and recorder choice
 
-Plan a named non-PIE profile with matching compile/link flags, validate `ET_EXEC`
-in the artifact, and request ASLR disable only for the owned inferior. Record
-requested versus verified settings and refusal evidence. Do not change global
-kernel policy. GDB exposes the per-launch setting, but its configuration value
-is not proof that the host permitted it. [GDB launch settings](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
+The named fixed-executable profile validates `ET_EXEC`; the launch policy
+requests ASLR disable only for the owned inferior and records entry-time
+personality evidence. Global kernel policy stays untouched. GDB's configuration
+value alone is not proof that the host permitted it.
+[GDB launch settings](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
 Allocator state, environment, input and external nondeterminism still belong to
 replay validation. Neither fixed heap placement nor equal module addresses
 prove replay equivalence; object identity continues to use logical generations.
@@ -262,7 +306,8 @@ repeated historical reads and immutable branch provenance. Specific priorities:
 - Intervention: denied/partial syscall, timeout/cancel/signal, restored
   bytes/protections/registers, cleanup on stop and consistent replay audit.
 
-Deliver native output/maps first, then the verified layout profile, recorder
-prototype, richer ELF/vtable overlays and finally runtime interventions. Probe
+Native output/maps, entry-time layout evidence and bounded inspection/trace
+gateways are implemented. Next come a recorder/replay prototype, runtime
+ELF/vtable overlays and then runtime interventions. Probe
 Ubuntu versions through OS/ABI/capability evidence; a distro label alone does
 not establish support.

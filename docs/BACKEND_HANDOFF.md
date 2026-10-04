@@ -294,7 +294,7 @@ C++20 — язык **реализации backend**, не запрет на от
 | `compile` | semantic hooks, sanitizer profile, symbols, оптимизация | Новый build artifact и обычно новая сессия; существующую запись не улучшает задним числом |
 | `capture` | операции/operands, allocation/lifetime, IO, memory accesses, recorder | Новая сессия, если collector нельзя подключить безопасно; иначе атомарная смена config revision на границе события с явным interval coverage |
 | `index` | история значения, temporal predicates, causal edges, memory lookup | Перестроение из имеющейся записи с progress/cancel/budget; если исходных событий нет, индекс их не создаёт |
-| `view` | 3D код, birth/death, overlays, память, крупные цифры | Только presentation. Выключение вида не удаляет историю и не останавливает нужный другим видам collector |
+| `view` | 3D код, birth/death, overlays, 2D карта памяти, крупные цифры | Только presentation. Выключение вида не удаляет историю и не останавливает нужный другим видам collector |
 
 Каждая функция декларирует зависимости, конфликты и цену: `requested`, `effective`, `supported`, `reason`, требуемый rebuild/relaunch/index rebuild. Это **предлагаемая модель расширения**, пока не новый DTO. Общий collector запускается один раз и работает, пока его требует хотя бы один включённый потребитель. Например, allocation events одновременно нужны dangling pointers, iterator invalidation и memory map; выключение карты не выключает две другие функции. Планировщик считает объединение зависимостей, а не отдельный процесс захвата на каждую панель.
 
@@ -450,7 +450,7 @@ instrumented assertion hook или replay/branch с известной точк�
 
 - **Зависимости:** P1/P2; query P3 расширяет поиск причины; recorder P4 — возврат к предыдущим записям.
 - **Поставка:** карта виртуальных regions/sections с permissions/coverage; stack layout и hover по известным bytes/variables, allocations/objects/subobjects, live/freed/reused/unmapped states; pointer/reference/iterator invalidation chronology. Crash/assert/RE/UB diagnostics, signal location, отдельные профили AddressSanitizer (ASan), UndefinedBehaviorSanitizer (UBSan), MemorySanitizer (MSan) с проверкой покрытия и выделенная красная/жёлтая карточка причины/предупреждения. Поддерживаемая exception visualizer: throw → observed search/unwind → destructors → catch/terminate. `goto`/scope cleanup связывается с Clang CFG и реальными событиями, а не предполагает уничтожение всех locals.
-- **Исследование:** stack padding/optimized locals, allocation versus object lifetime, alias tracking, неинструментированные allocators/libraries, MSan origins и требуемая инструментированная стандартная библиотека, совместимость sanitizer/recorder/semantic hooks, heap corruption cause versus crash symptom, качество диагноза бесконечного `while(true)`. MSan для phantom планируется как Linux-профиль, не macOS; комбинации профилей должны проверяться и несовместимости объясняться. Трёхмерная карта памяти/Unreal и guest/host physical addresses — отдельные experiments с capability, не основание откладывать полезную 2D карту.
+- **Исследование:** stack padding/optimized locals, allocation versus object lifetime, alias tracking, неинструментированные allocators/libraries, MSan origins и требуемая инструментированная стандартная библиотека, совместимость sanitizer/recorder/semantic hooks, heap corruption cause versus crash symptom, качество диагноза бесконечного `while(true)`. MSan для phantom планируется как Linux-профиль, не macOS; комбинации профилей должны проверяться и несовместимости объясняться. Карта виртуальной памяти — 2D; backend предоставляет её шлюзы, frontend реализует вид. Guest/host physical addresses остаются отдельным исследованием с capability и не требуются для виртуальной карты.
 - **Приёмка:** невалидный указатель не разыменовывается для анимации; тот же адрес после reuse различает поколения. Heap/stack/unknown регионы не выдумываются по расположению адреса. Crash point и вероятная первопричина различены доказательством. Timeout означает budget exhausted/подозрение, не математическое доказательство бесконечного цикла. Core+symbols допускает post-mortem inspection; предыдущий invalidation event показывается только при записи. Красная/жёлтая форма UI не меняет severity/evidence.
 
 ### P7. Объясняющие инструменты и стоимость
@@ -470,7 +470,7 @@ instrumented assertion hook или replay/branch с известной точк�
 ### P9. Позже: графы, структуры и отдельные 3D виды
 
 - **Зависимости:** P2 object/type/shape metadata, P1 history, стабильный frontend integration.
-- **Сохранённые идеи:** 2D граф по adjacency matrix/list/weighted edge list; 1D массив как дерево отрезков при явной схеме; 3D/Unreal представления графов/памяти. Варианты структуры выбираются пользователем/подтверждённой schema, не определяются как факт по имени `g`/размеру массива.
+- **Сохранённые идеи:** 2D граф по adjacency matrix/list/weighted edge list; 1D массив как дерево отрезков при явной схеме; 3D/Unreal представления графов. Карта виртуальной памяти по уточнению пользователя остаётся 2D. Варианты структуры выбираются пользователем/подтверждённой schema, не определяются как факт по имени `g`/размеру массива.
 - **Приёмка:** вид отображает данные той же history point, корректно переживает mutation/reallocation/unavailable; отсутствие схемы не вызывает произвольную интерпретацию. UI/Unreal не становятся обязательными для headless debugger.
 
 ### P10. Позже: ограниченная многопоточность и русский → DSL
@@ -496,8 +496,8 @@ instrumented assertion hook или replay/branch с известной точк�
 | History DB: i==j, a[5] changed, size(v) grew, p invalid, foo(arg<0), sum<previous | P3; typed read-only query, exact values, unknown |
 | Русский запрос → DSL, небольшая модель | P10; позднее, без обхода validation |
 | Stack sectors/layout, hover values | P6; только фактически доступные bytes/location mappings |
-| Вся карта regions/sections, live/freed/reused, 3D Unreal, physical addresses | P6/P9 + §15; virtual/guest physical/host physical явно различны |
-| Вся виртуальная память, включая vtable/RTTI/rodata, `/proc` и Ubuntu diagnostics | §20.2; regions раньше object overlays, bytes по запросу; backend без привязки к 3D renderer |
+| 2D карта виртуальных regions/sections, live/freed/reused; отдельное исследование physical addresses | P6 + §15; backend-шлюз отдельно от renderer, virtual/guest physical/host physical явно различны |
+| Вся виртуальная память, включая vtable/RTTI/rodata, `/proc` и Ubuntu diagnostics | §20.2; regions раньше object overlays, bytes по запросу; backend-шлюз для 2D-карты без собственного renderer |
 | `cout` после отключения sync; единый вывод с красным несброшенным хвостом | §20.1; отдельные физические буферы, journal и исторический pending без придуманного порядка |
 | ASLR off, ET_EXEC и стабильные адреса кучи при rollback | §20.3; отдельный per-inferior профиль, проверка ELF/среды; адресная стабильность не заменяет recorder |
 | Все изменения внутри одного шага, глубокие GDB/Python возможности | §20.4; запись до начала интервала, инструкции/данные/coverage различаются |
@@ -669,12 +669,20 @@ node_modules/готовые app/Unreal/recordings с пользовательс�
 Это дополнение сохраняет P0–P10 и уточняет backend-шлюзы для frontend-агента.
 Все перечисленные ниже будущие DTO — предложения до синхронного изменения
 контракта, валидаторов, fixtures и capability. Статус текущего среза:
-несинхронизированный `cout` (Linux x86_64 / libstdc++), карта mappings и единый вывод **реализованы**;
-профиль адресов, recorder изменений и runtime injection **запланированы**.
+несинхронизированный `cout` (Linux x86_64 / libstdc++), карта mappings и единый вывод **реализованы**.
+Следующий backend-срез добавляет проверяемый ELF/ASLR профиль, procfs diagnostics,
+регистры, сохраняемые memory captures/diff, map diff и ограниченную запись
+изменений на границах инструкций. Подробные принятые запросы и их ограничения —
+в [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md). rr/`record full`, verified
+rollback, автоматические vtable overlays и runtime injection остаются в плане.
 Assertions по согласованию с пользователем остаются на будущее.
 
-Проверки этого среза: 13/13 CTest Debug и 13/13 ASan; проверки frontend
+Проверки предшествующего output/maps-среза: 13/13 CTest Debug и 13/13 ASan; проверки frontend
 digest/controls, input races, output rendering, live HTTP→GDB и smoke lifecycle.
+Текущий inspection-срез: 18/18 зарегистрированных CTest прошли в Debug и ASan/UBSan;
+477 реальных protocol frames проверены по TypeScript DTO, прежние пять harness checks
+и четыре contract fixture checks также проходят. Детали — [INSPECTION_GATEWAYS.md](./INSPECTION_GATEWAYS.md).
+
 Memory gateway проходит реальную цепочку object→vptr→read-only vtable→code,
 `mmap`/`mprotect`/`munmap` и проверку неизменности истории. Это подтверждает
 чтение сырых таблиц; их автоматическая классификация остаётся следующим слоем.
@@ -710,7 +718,7 @@ ABI подтверждён на установленной libstdc++13, не о�
   отсутствие повторов при flush, исторический round trip и отсутствие
   side effects у чтения; неопределённый порядок обозначается явно.
 
-### 20.2. Вся виртуальная память, включая vtable — шлюз для P6/P9
+### 20.2. Вся виртуальная память, включая vtable — шлюз для 2D-карты P6/P9
 
 - Основа — снимок **всех mappings** `/proc/<pid>/maps` у принадлежащего сессии
   inferior: stack, heap, anonymous/file/shared mappings, executable/library
@@ -743,21 +751,35 @@ ABI подтверждён на установленной libstdc++13, не о�
   mapping split/reuse, guard/unreadable страницы, пустые/пробельные/удалённые
   пути, `dlopen`/`dlclose`, PIE/non-PIE, stripped symbols, virtual inheritance,
   адреса за пределами JS safe integer, huge sparse regions, stale stop,
-  process exit/PID reuse, permission denied/отсутствующий procfs. 3D renderer
-  получает те же DTO, что и 2D/JSON inspector, без собственного чтения ОС.
+  process exit/PID reuse, permission denied/отсутствующий procfs. Пользователь
+  уточнил: визуализация карты должна быть **2D**; backend реализует только
+  шлюзы, а frontend рисует её по DTO без собственного чтения ОС.
 
-### 20.3. Проверяемый профиль адресов — следующий после наблюдения
+### 20.3. Проверяемый профиль адресов — реализован базовый срез
 
-- Добавить явно выбранный build/run profile: `-fno-pie` при компиляции,
+Доступны `configuration.addressProfile: native|fixed-executable`,
+`artifact.elf` и `launch.addressPolicy: native|disable-aslr|require-fixed`.
+По умолчанию build native, launch disable-aslr. Профиль fixed-executable
+проверяет фактический x86_64 `ET_EXEC`; строгий launch требует подтверждённый
+`ADDR_NO_RANDOMIZE` через `/proc/<pid>/personality`, иначе завершает inferior
+и возвращает `LAUNCH_FAILED`. `observation.executionLayout` хранит свидетельство
+при entry, а `inspectProcess` даёт текущие сведения. Дальнейшая приёмка allocator,
+изменения personality самим процессом и replay — отдельные этапы.
+
+- Явно выбранный build/run profile: `-fno-pie` при компиляции,
   `-no-pie` при линковке, проверка итогового ELF `ET_EXEC`, per-inferior
-  `set disable-randomization on`. Флаги, ELF kind, compiler/linker identity,
-  ABI и профиль входят в build/run manifest; смена профиля создаёт другой
-  artifact. Не менять глобальный `kernel.randomize_va_space`.
+  `set disable-randomization on`. Флаги, ELF kind, compiler identity и
+  профиль входят в build/run metadata; смена профиля создаёт другой artifact.
+  Полная идентичность linker/ABI/runtime dependencies ещё не реализована.
+  Не менять глобальный `kernel.randomize_va_space`.
   [GCC link options](https://gcc.gnu.org/onlinedocs/gcc/Link-Options.html),
   [GDB launch settings](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Starting.html).
 - Разделить requested/effective/evidence: GDB setting сам по себе не доказывает,
-  что kernel разрешил отключение. Отказ personality/seccomp и warning GDB
-  публикуются; проверяется расположение text/stack/brk/mmap/shared libraries.
+  что kernel разрешил отключение. Доступен фактический personality mask либо
+  явная недоступность свидетельства; procfs возвращает kernel-reported границы
+  code/data/stack/brk, maps показывает mappings. Это ещё не проверка одинакового
+  размещения всех регионов между запусками; глобальные warning GDB не являются
+  контрактом доказательства.
   ET_EXEC фиксирует размещение основного ELF, но не всех остальных regions.
 - Heap ASLR и работа allocator — разные вещи. Фиксированный brk/mmap base
   не фиксирует последовательность allocation/free, tcache/arenas, внешние
@@ -772,6 +794,14 @@ ABI подтверждён на установленной libstdc++13, не о�
   опирается на recorder и проверенные checkpoints.
 
 ### 20.4. Изменения внутри одного шага и глубокие возможности GDB
+
+Текущий ограниченный срез — `traceInstructions`: реальное продвижение GDB
+по инструкциям с initial snapshots, PC, изменениями выбранных регистров и
+memory ranges между границами. До 256 попыток/8 диапазонов/4096 байтов,
+постраничное чтение retained trace и обычные pause/cancel/stop. Coverage явно
+`selected-instruction-boundaries`, same-value writes не видны, история чужих
+потоков не записывается. Это forward trace; replay и восстановление исходной
+позиции этим запросом не выполняются.
 
 - Два снимка показывают только разность границ: `x=1; x=2; x=0;` может вообще
   не изменить итоговый `x`. Полная история требует записи **до** этого
@@ -816,8 +846,30 @@ ABI подтверждён на установленной libstdc++13, не о�
   cleanup при detach/stop и повторное воспроизведение audit. Непроверенная
   комбинация OS/ABI/recorder возвращает unsupported, а не частичный успех.
 
-Порядок поставки: **20.1 + базовые maps из 20.2 → профиль 20.3 → recorder
-prototype 20.4 → ELF/vtable/object overlays 20.2 → вмешательства 20.5**.
+### 20.6. Поставленные шлюзы для frontend-агента
+
+- `inspectProcess`: ограниченные `stat`/`status`/`personality`, exe/fd targets,
+  `smaps_rollup`, kernel/page size; proc directory закреплён descriptor,
+  start time проверяется до/после чтения, недоступные секции не скрываются.
+- `readRegisters`: фактические machine registers frame 0 с exact hex и
+  availability. Выбранные caller frame/locals не подменяют аппаратное состояние.
+- `captureMemory` / `readMemoryCapture` / `diffMemoryCaptures`: до 8 диапазонов
+  и 64 KiB, исторические bytes независимо от live memory, точные before/after
+  changes и недоступные участки. Captures сравниваются при одинаковых диапазонах.
+- `diffMemoryMaps`: сравнение двух complete retained maps; split/merge VMA
+  показывается как removed/added. Identity C++ объектов отсюда не выводится.
+- `traceInstructions` / `readInstructionTrace`: сохраняемая история выбранных
+  значений на instruction boundaries. Capture/trace store ограничен 128 records
+  и 16 MiB по умолчанию; eviction возвращает `HISTORY_EVICTED`.
+
+Живые запросы требуют `expectedStop`; исторические запросы не читают нынешний
+процесс. Адреса — hex strings, byte counts — bytes. Нового frontend renderer
+этот этап не включает. Контракт, примеры и точные пределы:
+[INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
+
+Следующий порядок: **recorder/replay prototype 20.4 → runtime ELF/vtable/object
+overlays 20.2 → вмешательства 20.5**. Ограниченный instruction trace не заменяет
+recorder, а metadata основного ELF ещё не являются индексом загруженных modules.
 Каждый срез завершается обновлением DTO/fixtures, headless интеграционными
 тестами и описанием для frontend; продвинутые experiments не блокируют
 текущие cin/stepping/history. Этот порядок не объявляет P2/P4/P6 завершёнными.

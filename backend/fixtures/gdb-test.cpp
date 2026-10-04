@@ -5,6 +5,7 @@
 #include <sstream>
 #include <ext/stdio_filebuf.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 struct StorageFixture {
   int x;
@@ -163,7 +164,49 @@ __attribute__((noinline)) void pendingOutput(const char* mode) {
   }
 }
 
+__attribute__((noinline)) int traceStores() {
+  volatile int value = 0;
+  value = 1; value = 2; value = 0; value = 0;  // GDB_TEST_TRACE_STORES
+  asm volatile("nop" : : : "memory");  // GDB_TEST_TRACE_END
+  return value;
+}
+
+__attribute__((noinline)) int traceInput() {
+  char value = 0;
+  // A direct syscall keeps the blocking read inside a small instruction budget.
+  long received;
+  asm volatile("syscall" : "=a"(received) : "a"(0L), "D"(0L), "S"(&value), "d"(1L) : "rcx", "r11", "memory");  // GDB_TEST_TRACE_INPUT
+  return received == 1 ? value : 0;
+}
+
+__attribute__((noinline)) void traceSignal() {
+  asm volatile("ud2" : : : "memory");  // GDB_TEST_TRACE_SIGNAL
+}
+
+__attribute__((noinline)) void traceExit() {
+  asm volatile("syscall" : : "a"(60L), "D"(23L) : "rcx", "r11", "memory");  // GDB_TEST_TRACE_EXIT
+}
+
+__attribute__((noinline)) int memoryHole() {
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  auto* region = static_cast<char*>(::mmap(nullptr, page * 3, PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (region == MAP_FAILED) return 1;
+  std::memset(region, 'a', page);
+  std::memset(region + page * 2, 'b', page);
+  if (::munmap(region + page, page) != 0) return 2;
+  asm volatile("nop" : : "r"(region), "r"(page) : "memory");  // GDB_TEST_MEMORY_HOLE
+  ::munmap(region, page);
+  ::munmap(region + page * 2, page);
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], "trace-stores") == 0) return traceStores();
+  if (argc > 1 && std::strcmp(argv[1], "trace-input") == 0) return traceInput();
+  if (argc > 1 && std::strcmp(argv[1], "trace-signal") == 0) { traceSignal(); return 0; }
+  if (argc > 1 && std::strcmp(argv[1], "trace-exit") == 0) { traceExit(); return 0; }
+  if (argc > 1 && std::strcmp(argv[1], "memory-hole") == 0) return memoryHole();
   if (argc > 1 && std::strncmp(argv[1], "streambuf-", 10) == 0) {
     streambufOutput(argv[1]);
     return 0;

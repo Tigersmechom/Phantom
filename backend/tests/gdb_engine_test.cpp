@@ -582,6 +582,236 @@ void testMissingWrapper(GdbOptions options, const GdbLaunchRequest& request) {
     require(!engine.live() && !engine.gdbPid(), "missing wrapper left a live debugger");
   }
 }
+
+void setTraceBreakpoints(GdbEngine& engine, const GdbLaunchRequest& request,
+                         const std::vector<std::string>& markers) {
+  const auto& source = request.sourceBundle.documents.front().text;
+  Json requested = Json::array(), result;
+  for (const auto& marker : markers) {
+    const auto offset = source.find(marker);
+    require(offset != std::string::npos, "missing trace fixture marker " + marker);
+    const auto line = 1 + std::count(source.begin(), source.begin() + offset, '\n');
+    requested.push_back({{"id", marker}, {"documentId", "fixture"}, {"enabled", true},
+                         {"range", {{"start", {{"line", line}, {"column", 1}}},
+                                    {"end", {{"line", line}, {"column", 1}}}}}});
+  }
+  GdbError error;
+  require(engine.setBreakpoints({{"documentId", "fixture"}, {"breakpoints", requested}}, result, error),
+          "cannot set trace breakpoints: " + error.message);
+  for (const auto& breakpoint : result)
+    require(breakpoint.value("verified", false), "unverified trace breakpoint");
+}
+
+void testInstructionTrace(GdbOptions options, GdbLaunchRequest request) {
+  options.commandTimeout = 5s;
+  request.argv = {"trace-stores"};
+  // Exercise explicit randomization opt-out as well as the default used by
+  // the other tests. Address stability is a separately verified OS contract.
+  request.disableRandomization = false;
+  GdbEngine engine(options);
+  GdbStop stop;
+  launch(engine, request, stop);
+  require(engine.inferiorPid() && engine.inferiorPid() != engine.gdbPid(),
+          "inferior PID gateway returned debugger PID");
+  GdbError error;
+  Json registers, trace;
+  require(engine.readRegisters({}, registers, error) && registers["registers"].size() >= 18,
+          "default registers unavailable: " + error.message);
+  for (const auto& reg : registers["registers"])
+    require(reg["available"] == true && reg.at("valueHex").get<std::string>().rfind("0x", 0) == 0,
+            "general register not returned as hexadecimal: " + reg.dump());
+  for (const auto& names : std::vector<std::vector<std::string>>{
+         {"rip\n-exec-continue"}, {"$rip"}, {"rip", "rip"}, {"not_a_register"}})
+    require(!engine.readRegisters(names, registers, error) && error.code == "INVALID_REQUEST",
+            "invalid register selection accepted");
+  require(!engine.readRegisters(std::vector<std::string>(65, "rax"), registers, error) &&
+          error.code == "LIMIT_EXCEEDED", "oversized register selection accepted");
+  setTraceBreakpoints(engine, request, {"GDB_TEST_TRACE_STORES"});
+  require(engine.resume("continue", stop, error), "cannot reach trace stores");
+  const auto& variables = stop.stack.front().at("variables");
+  const auto value = std::find_if(variables.begin(), variables.end(), [](const Json& variable) {
+    return variable.value("name", "") == "value";
+  });
+  require(value != variables.end() && value->contains("addressHex"), "trace value address unavailable");
+  const auto address = value->at("addressHex").get<std::string>();
+  Json before, after;
+  require(engine.readRegisters({"rip"}, before, error), "cannot capture pre-validation PC");
+  for (const auto count : {std::size_t(0), std::size_t(257)})
+    require(!engine.traceInstructions(count, {}, Json::array(), stop, trace, error) &&
+            error.code == "LIMIT_EXCEEDED", "invalid trace instruction count accepted");
+  for (const auto& invalid : std::vector<Json>{
+         nullptr, Json::array({{{"addressHex", "0x0; quit"}, {"byteCount", 4}}}),
+         Json::array({{{"addressHex", "0xffffffffffffffff"}, {"byteCount", 4}}}),
+         Json::array({{{"addressHex", address}, {"byteCount", -1}}}),
+         Json::array({{{"addressHex", address}, {"byteCount", 0}}}),
+         Json::array({{{"addressHex", address}, {"byteCount", 4096}},
+                      {{"addressHex", address}, {"byteCount", 1}}})})
+    require(!engine.traceInstructions(1, {}, invalid, stop, trace, error), "invalid trace memory selection accepted");
+  require(engine.readRegisters({"rip"}, after, error) && before == after,
+          "trace validation executed an instruction");
+  // Selecting a caller must not turn subsequent register reads into unwound
+  // caller-register values instead of the stopped instruction context.
+  Json caller;
+  require(engine.readVariables("frame:1", 0, 8, caller, error), "cannot select trace caller");
+  require(engine.readRegisters({"rip"}, after, error) && before == after,
+          "register gateway leaked selected caller frame");
+  setTraceBreakpoints(engine, request, {"GDB_TEST_TRACE_END"});
+  require(engine.traceInstructions(64, {"rax", "rsp"},
+          Json::array({{{"addressHex", address}, {"byteCount", 4}},
+                       {{"addressHex", "0x0"}, {"byteCount", 4}}}), stop, trace, error),
+          "instruction trace failed: " + error.code + ": " + error.message);
+  require(trace["status"] == "terminated" && trace["terminationReason"] == "breakpoint-hit" &&
+          stop.stopped && !stop.exited && stop.reason == "breakpoint-hit",
+          "trace stepped across the user breakpoint: " + trace.dump());
+  require(trace["initialRegisters"].size() == 3 && trace["initialMemory"][1]["available"] == false &&
+          trace["coverage"]["sameValueWrites"] == false,
+          "trace omitted PC, unreadable status, or sampling coverage");
+  std::vector<std::string> writes;
+  bool pcChanged = false;
+  std::size_t boundariesWithoutMemoryChange = 0;
+  for (const auto& entry : trace["entries"]) {
+    require(entry["pcBeforeHex"].is_string() && entry["pcAfterHex"].is_string(),
+            "live trace boundary omitted PC");
+    if (entry["memoryChanges"].empty()) ++boundariesWithoutMemoryChange;
+    for (const auto& change : entry["memoryChanges"])
+      if (change["addressHex"] == address && change["after"].value("available", false))
+        writes.push_back(change["after"].at("bytesBase64").get<std::string>());
+    for (const auto& change : entry["registerChanges"])
+      if (change["name"] == "rip") pcChanged = true;
+  }
+  require(writes == std::vector<std::string>{"AQAAAA==", "AgAAAA==", "AAAAAA=="} && pcChanged &&
+          boundariesWithoutMemoryChange >= 1,
+          "trace lost intermediate stores or fabricated a same-value write: " + trace.dump());
+  // A one-instruction bounded trace also succeeds independently of the
+  // breakpoint-terminated case and remains inspectable afterwards.
+  require(engine.traceInstructions(1, {"rip"}, Json::array(), stop, trace, error) &&
+          trace["status"] == "complete" && trace["executedInstructions"] == 1 && stop.stopped,
+          "single-instruction trace failed");
+  require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+          "cannot continue after trace");
+  require(!engine.inferiorPid() && !engine.readRegisters({}, registers, error),
+          "register gateway accepted an exited inferior");
+}
+
+void testTraceInputAndInterrupt(GdbOptions options, GdbLaunchRequest request) {
+  options.commandTimeout = 5s;
+  options.stepTimeout = 500ms;
+  request.argv = {"trace-input"};
+  request.closeInputAfterWrite = false;
+  request.input.clear();
+  GdbEngine engine(options);
+  GdbStop stop;
+  launch(engine, request, stop);
+  setTraceBreakpoints(engine, request, {"GDB_TEST_TRACE_INPUT"});
+  GdbError error;
+  Json trace, input;
+  require(engine.resume("continue", stop, error), "cannot reach trace stdin fixture");
+  setTraceBreakpoints(engine, request, {});
+  require(!engine.traceInstructions(64, {"rip"}, Json::array(), stop, trace, error) &&
+          error.code == "INPUT_WAIT" && stop.reason == "input-wait" &&
+          trace["terminationReason"] == "input-wait",
+          "blocked instruction trace did not preserve stdin wait: " + error.code + " " + trace.dump());
+  engine.interrupt(1);
+  require(engine.traceInstructions(64, {}, Json::array(), stop, trace, error) &&
+          trace["status"] == "terminated" && trace["terminationReason"] == "interrupted" &&
+          trace["attemptedInstructions"] == 0 && stop.stopped,
+          "preempted trace executed an instruction");
+  require(engine.appendInput("trace-byte", "X", input, error), "cannot append trace stdin");
+  const bool resumed = engine.resume("continue", stop, error);
+  require(resumed && stop.exited && stop.exitCode == 'X',
+          "trace input wait cannot resume normally: " + error.code + " " + error.message +
+              " exit=" + (stop.exitCode ? std::to_string(*stop.exitCode) : "none") +
+              " reason=" + stop.reason);
+  launch(engine, request, stop);
+  setTraceBreakpoints(engine, request, {"GDB_TEST_TRACE_INPUT"});
+  require(engine.resume("continue", stop, error), "cannot reach trace pause fixture");
+  setTraceBreakpoints(engine, request, {});
+  {
+    std::jthread pause([&] { std::this_thread::sleep_for(30ms); engine.interrupt(1); });
+    const auto started = std::chrono::steady_clock::now();
+    const bool paused = engine.traceInstructions(256, {}, Json::array(), stop, trace, error);
+    require((paused || error.code == "INPUT_WAIT") && stop.stopped && !stop.exited &&
+            trace["status"] == "terminated" && std::chrono::steady_clock::now() - started < 2s,
+            "Pause did not retain an active instruction trace stop: " + error.code + " " + trace.dump());
+  }
+  require(engine.appendInput("trace-after-pause", "Y", input, error), "cannot append after trace Pause");
+  require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 'Y',
+          "Pause during syscall trace left a stray interrupt or changed the read");
+  launch(engine, request, stop);
+  const auto pid = engine.inferiorPid();
+  require(pid.has_value(), "trace cancellation missing inferior PID");
+  // Publish Stop while the trace owns the debugger, rather than relying only
+  // on a pre-command check. It must reap the inferior and return promptly.
+  setTraceBreakpoints(engine, request, {"GDB_TEST_TRACE_INPUT"});
+  require(engine.resume("continue", stop, error), "cannot reach cancellation fixture");
+  setTraceBreakpoints(engine, request, {});
+  std::jthread interrupt([&] { std::this_thread::sleep_for(30ms); engine.interrupt(2); });
+  require(!engine.traceInstructions(256, {}, Json::array(), stop, trace, error) &&
+          error.code == "CANCELLED" && !engine.live(),
+          "Stop did not cancel active instruction trace: " + error.code);
+  (void)engine.stopAndSnapshot();
+  requireExited(*pid);
+}
+
+void testMemoryHole(GdbOptions options, GdbLaunchRequest request) {
+  request.argv = {"memory-hole"};
+  GdbEngine engine(options);
+  GdbStop stop;
+  launch(engine, request, stop);
+  setTraceBreakpoints(engine, request, {"GDB_TEST_MEMORY_HOLE"});
+  GdbError error;
+  require(engine.resume("continue", stop, error), "cannot reach memory-hole checkpoint");
+  const auto& variables = stop.stack.front().at("variables");
+  const auto region = std::find_if(variables.begin(), variables.end(), [](const Json& value) {
+    return value.value("name", "") == "region";
+  });
+  require(region != variables.end(), "memory-hole region pointer missing");
+  const auto address = std::stoull(region->at("value").at("value").at("addressHex").get<std::string>(), nullptr, 16);
+  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  std::ostringstream hex;
+  hex << std::hex << address + page - 8;
+  Json memory;
+  // The bare hexadecimal form is canonicalized before MI; it must not be
+  // interpreted as a symbol or decimal expression by GDB.
+  require(engine.readMemory(hex.str(), 8, memory, error) && memory["bytesBase64"] == "YWFhYWFhYWE=",
+          "memory read at readable prefix failed: " + error.message);
+  const bool readable = engine.readMemory(hex.str(), page + 16, memory, error);
+  if (readable)
+    require(memory["bytesBase64"] == "YWFhYWFhYWE=" && memory["unreadableBytes"] == page + 8,
+            "readMemory concatenated disjoint readable islands across an unmapped hole: " + memory.dump());
+  else require(error.code == "READ_FAILED" && engine.live(), "memory hole destroyed debugger session");
+  require(!engine.readMemory("0xffffffffffffffff", 2, memory, error) && error.code == "INVALID_REQUEST",
+          "overflowing memory range accepted");
+  require(engine.resume("continue", stop, error) && stop.exited && stop.exitCode == 0,
+          "memory-hole inspection affected inferior execution");
+}
+
+void testTraceTerminalEvents(GdbOptions options, GdbLaunchRequest request) {
+  for (const auto* mode : {"trace-signal", "trace-exit"}) {
+    request.argv = {mode};
+    const bool exiting = request.argv.front() == "trace-exit";
+    GdbEngine engine(options);
+    GdbStop stop;
+    launch(engine, request, stop);
+    setTraceBreakpoints(engine, request, {exiting ? "GDB_TEST_TRACE_EXIT" : "GDB_TEST_TRACE_SIGNAL"});
+    GdbError error;
+    Json trace;
+    require(engine.resume("continue", stop, error), "cannot reach terminal trace fixture");
+    setTraceBreakpoints(engine, request, {});
+    require(engine.traceInstructions(64, {"rip"}, Json::array(), stop, trace, error) &&
+            trace["status"] == "terminated" && trace["entries"].size() < 64,
+            "trace did not stop at terminal event: " + error.code + " " + trace.dump());
+    if (exiting)
+      require(stop.exited && stop.exitCode == 23 && trace["terminationReason"] == "exit" &&
+              trace["entries"].back()["pcAfterHex"].is_null(),
+              "exit trace fabricated live register values or lost exit code");
+    else
+      require(stop.stopped && !stop.exited && stop.signalName == "SIGILL" &&
+              trace["terminationReason"] == "signal-received" &&
+              trace["entries"].back()["instructionCompleted"] == false,
+              "trace hid a program signal or counted its faulting instruction as retired");
+  }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -598,6 +828,10 @@ int main(int argc, char** argv) {
     const auto source = std::filesystem::absolute(argv[3]);
     request.sourceBundle = {"fixture-bundle", {{"fixture", "fixture-revision", source, readFile(source)}}};
     testMissingWrapper(options, request);
+    testInstructionTrace(options, request);
+    testTraceInputAndInterrupt(options, request);
+    testMemoryHole(options, request);
+    testTraceTerminalEvents(options, request);
     testBufferedStdout(options, request);
     for (const auto* mode : {"streambuf-sync", "streambuf-unsync", "streambuf-resync",
                              "streambuf-empty", "streambuf-unitbuf", "streambuf-large",

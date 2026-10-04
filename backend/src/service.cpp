@@ -1,6 +1,8 @@
 #include "phantom/service.hpp"
 
 #include "phantom/process.hpp"
+#include "phantom/elf.hpp"
+#include "phantom/process_inspection.hpp"
 #include "phantom/sha256.hpp"
 
 #include <algorithm>
@@ -106,6 +108,10 @@ Json BackendService::capabilities() const {
       {"inputTracking", "transport-only"}, {"interactiveInput", true}, {"expressionGroups", false}, {"history", true},
       {"restore", "none"}, {"asm", {{"currentPc", true}, {"sourceRange", false}}},
       {"memoryRead", true}, {"memoryMap", "linux-proc-maps"}, {"eventReplay", true},
+      {"addressProfiles", {"native", "fixed-executable"}},
+      {"addressPolicies", {"native", "disable-aslr", "require-fixed"}},
+      {"processInspection", "linux-procfs"}, {"registerRead", true},
+      {"instructionTrace", "instruction-boundaries"}, {"memoryCapture", true}, {"memoryMapDiff", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
                    {"maxResidentSnapshots", 4096},
@@ -113,6 +119,10 @@ Json BackendService::capabilities() const {
                    {"maxStringBytes", options_.limits.maxStringBytes},
                    {"maxMemoryReadBytes", options_.limits.maxMemoryReadBytes},
                    {"maxInstructionsPerRequest", options_.limits.maxInstructions},
+                   {"maxTraceInstructions", std::min<std::size_t>(256, options_.limits.maxInstructions)},
+                   {"maxTraceMemoryBytes", std::min<std::size_t>(4096, options_.limits.maxMemoryReadBytes)},
+                   {"maxCaptureBytes", std::min<std::size_t>(65536, options_.limits.maxMemoryReadBytes)},
+                   {"maxInspectionStoreBytes", options_.limits.maxWireBytes},
                    {"commandTimeoutMs", 30000}, {"replayTimeoutMs", 30000}}},
   };
 }
@@ -178,6 +188,7 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   observation["threadId"] = stop.threadId.empty() ? Json(nullptr) : Json(stop.threadId);
   observation["stack"] = stop.stack.is_array() ? stop.stack : Json::array();
   if (stop.memoryMap.is_object()) observation["memoryMap"] = stop.memoryMap;
+  if (executionLayout_.is_object()) observation["executionLayout"] = executionLayout_;
   if (!observation.contains("input")) {
     auto input = defaultInput();
     if (stop.input.is_object()) for (auto it = stop.input.begin(); it != stop.input.end(); ++it) input[it.key()] = it.value();
@@ -269,6 +280,10 @@ Json BackendService::handleBuild(const Json& request) {
   for (const auto& flag : config.at("flags")) flags.push_back(flag.get<std::string>());
   if (contains_flag(flags, "-o") || contains_flag(flags, "--output") || std::any_of(flags.begin(), flags.end(), redirects_output))
     throw std::runtime_error("configuration must not override output path or use response files");
+  const auto addressProfile = config.value("addressProfile", "native");
+  if (addressProfile == "fixed-executable") {
+    flags.push_back("-fno-pie"); flags.push_back("-no-pie");
+  }
   const auto compiler = config.at("compiler").get<std::string>();
   const auto bundleId = source.at("id").get<std::string>();
   const auto stamp = sha256_hex(json_text(source) + json_text(config) + architecture);
@@ -327,6 +342,11 @@ Json BackendService::handleBuild(const Json& request) {
     std::ifstream in(binary, std::ios::binary); std::string bytes((std::istreambuf_iterator<char>(in)), {});
     if (!in) throw std::runtime_error("cannot read compiler artifact");
     const auto binaryHash = sha256_hex(bytes);
+    const auto elf = inspectElf(binary);
+    if (addressProfile == "fixed-executable" &&
+        (!elf.value("available", false) || elf.value("elfType", "") != "ET_EXEC" ||
+         elf.value("architecture", "") != "x86_64"))
+      throw std::runtime_error("fixed-executable requires an actual x86_64 ET_EXEC ELF artifact");
     Json compilerInfo = {{"path", compiler}, {"version", "unknown"}};
     try {
       Process version = Process::spawn({{compiler, "--version"}, options_.workspace.string(), {}, true, 65536}); version.close_stdin();
@@ -339,7 +359,7 @@ Json BackendService::handleBuild(const Json& request) {
     });
     artifact = {{"id", id}, {"sourceBundleId", bundleId}, {"configurationRevisionId", config.at("revisionId")},
                 {"architecture", architecture}, {"targetTriple", "x86_64-pc-linux-gnu"}, {"compiler", compilerInfo},
-                {"command", argv}, {"binaryPath", binary.string()}, {"binarySha256", binaryHash}, {"debugSymbolsAvailable", debugSymbols}};
+                {"command", argv}, {"binaryPath", binary.string()}, {"binarySha256", binaryHash}, {"debugSymbolsAvailable", debugSymbols}, {"addressProfile", addressProfile}, {"elf", elf}};
     artifact_ = Artifact{artifact, binary, sourceSnapshot};
   } else artifact_.reset();
   return okResponse(request, {{"kind", "build"}, {"artifact", artifact}, {"success", success}, {"command", argv},
@@ -386,7 +406,14 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
     frames.push_back(errorResponse(request, "UNSUPPORTED", "asynchronous launch without stopAtEntry is not enabled in the serialized GDB profile", false));
     return frames;
   }
+  const auto addressPolicy = command.value("addressPolicy", "disable-aslr");
+  const auto elf = artifact_->dto.value("elf", Json::object());
+  if (addressPolicy == "require-fixed" &&
+      (!elf.value("available", false) || elf.value("elfType", "") != "ET_EXEC" ||
+       elf.value("architecture", "") != "x86_64"))
+    return {errorResponse(request, "LAUNCH_FAILED", "require-fixed needs an x86_64 ET_EXEC build", false)};
   GdbLaunchRequest launch;
+  launch.disableRandomization = addressPolicy != "native";
   launch.binaryPath = artifact_->binary; launch.stopAtEntry = command.value("stopAtEntry", true);
   for (const auto& arg : command.at("argv")) launch.argv.push_back(arg.get<std::string>());
   for (auto it = command.at("environment").begin(); it != command.at("environment").end(); ++it) launch.environment.emplace_back(it.key(), it.value().get<std::string>());
@@ -408,7 +435,32 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   }
   controlWake_.notify_all();
   GdbError error; GdbStop stop;
-  const bool launched = engine_->launch(launch, stop, error, cancellation);
+  bool launched = engine_->launch(launch, stop, error, cancellation);
+  Json layout = nullptr;
+  if (launched) {
+    const auto pid = engine_->inferiorPid();
+    const auto proc = pid ? inspectOwnedProcess(*pid) : Json::object();
+    const auto personality = proc.value("personality", Json::object());
+    const bool verified = proc.value("identityVerified", false) && personality.value("available", false);
+    const bool disabled = verified && personality.value("addrNoRandomize", false);
+    const auto stat = proc.value("stat", Json::object());
+    layout = {{"addressPolicy", addressPolicy},
+              {"elfType", elf.value("available", false) ? elf.at("elfType") : Json(nullptr)},
+              {"aslr", {{"requestedDisabled", launch.disableRandomization},
+                        {"verifiedDisabled", verified ? Json(disabled) : Json(nullptr)},
+                        {"evidence", verified ? "linux-proc-personality" : "unavailable"},
+                        {"personalityMaskHex", verified ? personality.at("maskHex") : Json(nullptr)}}},
+              {"addresses", proc.value("identityVerified", false) ? stat.value("addresses", Json(nullptr)) : Json(nullptr)},
+              {"processStartTimeTicks", proc.value("identityVerified", false) ? stat.value("startTimeTicks", Json(nullptr)) : Json(nullptr)},
+              {"runFingerprint", sha256_hex(artifact_->dto.at("binarySha256").get<std::string>() +
+                  json_text(command.at("argv")) + json_text(command.at("environment")) +
+                  json_text(command.at("input")) + addressPolicy)},
+              {"allocatorDeterminism", "not-established"}, {"replayVerified", false}};
+    if (addressPolicy == "require-fixed" && !disabled) {
+      engine_->stop(); launched = false;
+      error = {"LAUNCH_FAILED", "require-fixed could not verify ADDR_NO_RANDOMIZE on the owned inferior", false};
+    }
+  }
   const auto interruption = activeInterruption(string_at(request, "requestId"));
   if (launched && !interruption.empty()) {
     engine_->stop();
@@ -426,6 +478,8 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   // Sequence and history ordinals belong to a session generation. A fresh
   // launch must not replay frames or expose points from the previous run.
   sequence_ = ordinal_ = stateRevision_ = 0;
+  inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+  executionLayout_ = std::move(layout);
   history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0; liveObservation_ = nullptr; liveState_ = nullptr;
   sessionId_ = make_id("session", ++sessionGeneration_); processInstanceId_ = stop.processInstanceId.empty() ? make_id("process", sessionGeneration_) : stop.processInstanceId;
   const auto accepted = okResponse(request, {{"kind", "launchAccepted"}, {"session", {{"id", sessionId_}, {"generation", sessionGeneration_}}}, {"throughSequence", sequence_}});
@@ -590,6 +644,8 @@ std::vector<Json> BackendService::connect(const Json& request) {
     artifact_.reset(); sessionId_.clear(); processInstanceId_.clear();
     liveState_ = nullptr; liveObservation_ = nullptr; history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0;
     sequence_ = ordinal_ = stateRevision_ = 0;
+    inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+    executionLayout_ = nullptr;
     workspace_ = request.at("workspace");
   }
   return {{{"kind", "connectResult"}, {"ok", true}, {"protocolVersion", 1}, {"workspace", workspace_}, {"session", sessionId_.empty() ? Json(nullptr) : Json{{"id", sessionId_}, {"generation", sessionGeneration_}}}, {"state", liveState_}, {"observation", liveObservation_}, {"capabilities", capabilities()}, {"throughSequence", sequence_}}};
@@ -606,7 +662,8 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         (sessionId_.empty() || request.at("session").at("id").get<std::string>() != sessionId_ ||
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
-    if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents") &&
+    if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
+         kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
         !sessionId_.empty() && request.at("session").is_null())
       return {errorResponse(request, "STALE_CONTEXT", "history belongs to the current debugging session", false)};
     // pause/stop/cancel may already have interrupted the active GDB command
@@ -631,10 +688,11 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     }
     if (shuttingDown_.load() && (kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
-                                 kind == "appendInput" || kind == "closeInput"))
+                                 kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
+                             kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
                              kind == "setBreakpoints" || kind == "writeVariable";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
@@ -646,7 +704,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
                            liveObservation_.at("stop") == expected;
       if (!matches) return {errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false)};
     }
-    const bool longOperation = kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
+    const bool longOperation = kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
     std::optional<std::string> activeId;
     if (longOperation) {
       const auto requestId = string_at(request, "requestId");
@@ -690,6 +748,10 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       catch (const std::exception& e) { artifact_.reset(); return {errorResponse(request, "BUILD_FAILED", e.what(), false)}; }
     }
     if (kind == "launch") return handleLaunch(request, publish);
+    if (kind == "traceInstructions") return handleTrace(request, publish);
+    if (kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" ||
+        kind == "readMemoryCapture" || kind == "diffMemoryCaptures" ||
+        kind == "diffMemoryMaps" || kind == "readInstructionTrace") return handleInspection(request);
     if (kind == "appendInput" || kind == "closeInput") return {handleInput(request)};
     if (kind == "step" || kind == "continue" || kind == "pause" || kind == "stop") return handleExecution(request, kind, publish);
     if (kind == "listHistory" || kind == "readHistory") return {handleHistory(request)};
@@ -746,7 +808,7 @@ std::optional<Json> BackendService::inputControl(const Json& request, bool waitF
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return std::nullopt;
-  if (active_->kind != "continue" && active_->kind != "step")
+  if (active_->kind != "continue" && active_->kind != "step" && active_->kind != "traceInstructions")
     return errorResponse(request, "BUSY", "interactive input is available while execution is running", true);
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session)
     return errorResponse(request, "STALE_CONTEXT", "input request does not match the active session", false);
@@ -775,7 +837,7 @@ bool BackendService::control(const Json& request, bool waitForActive) {
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return false;
-  if (active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue") return false;
+  if (active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
   if (active_->kind == "build" && kind != "cancel") return false;
   if (active_->kind == "launch" && kind == "pause") return false;
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session) return false;

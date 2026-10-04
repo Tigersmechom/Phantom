@@ -10,6 +10,9 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/elf.cpp
+  src/process_inspection.cpp
+  src/service_inspection.cpp
   src/gdb.cpp
   src/memory_map.cpp
   src/mi.cpp
@@ -67,6 +70,18 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  foreach(module IN ITEMS elf process-inspection)
+    string(REPLACE "-" "_" test_file "${module}")
+    add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
+    target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
+    add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>")
+    set_tests_properties(${module} PROPERTIES TIMEOUT 15)
+  endforeach()
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure)
+    add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
+    set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  endforeach()
   add_executable(phantom-memory-map-test tests/memory_map_test.cpp)
   target_link_libraries(phantom-memory-map-test PRIVATE phantom-core)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

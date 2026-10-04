@@ -60,6 +60,8 @@ struct GdbLaunchRequest {
   std::string inputId = "input-none";
   bool closeInputAfterWrite = true;
   bool stopAtEntry = true;
+  // Explicit request to GDB, not proof the kernel accepted ADDR_NO_RANDOMIZE.
+  bool disableRandomization = true;
   GdbSourceBundle sourceBundle;
 };
 
@@ -126,6 +128,7 @@ class GdbEngine {
   GdbStop stopAndSnapshot();
   bool live() const noexcept;
   std::optional<int> gdbPid() const noexcept;
+  std::optional<int> inferiorPid() const noexcept;
 
   bool setBreakpoints(const nlohmann::json& request, nlohmann::json& result,
                       GdbError& error);
@@ -136,6 +139,19 @@ class GdbEngine {
                   nlohmann::json& result, GdbError& error);
   bool disassemble(std::string_view addressHex, std::size_t maxInstructions,
                    nlohmann::json& result, GdbError& error);
+  // Empty selection returns general registers. Names are resolved through MI
+  // register metadata; no expression supplied by the client is evaluated.
+  bool readRegisters(const std::vector<std::string>& names,
+                     nlohmann::json& result, GdbError& error);
+  // Execute at most 256 actual instruction steps and retain bounded boundary
+  // observations, not a store log or a reversible process recording. Ranges
+  // are [{addressHex, byteCount}], at most eight / 4096 bytes in total.
+  // Like resume(), false can still provide an authoritative stopped result.
+  bool traceInstructions(std::size_t count,
+                         const std::vector<std::string>& registerNames,
+                         const nlohmann::json& memoryRanges,
+                         GdbStop& finalStop, nlohmann::json& trace,
+                         GdbError& error);
 
   // Variable writes and conditions are deliberately not implemented until a
   // non-evaluating, typed assignment policy is available.  Calling these

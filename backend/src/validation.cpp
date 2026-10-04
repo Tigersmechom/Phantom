@@ -56,6 +56,42 @@ void enum_string(const Json& j, std::string_view p, std::initializer_list<std::s
 }
 void array_limit(const Json& j, std::string_view p, std::size_t n) { expect_array(j,p); if (j.size() > n) limit(std::string(p), "array exceeds configured limit"); }
 
+void memory_ranges(const Json& ranges, std::string_view path, std::size_t budget) {
+  array_limit(ranges, path, 8);
+  std::vector<std::pair<std::uint64_t,std::uint64_t>> intervals;
+  std::size_t total = 0;
+  for (const auto& range : ranges) {
+    exact_keys(range, {"addressHex", "byteCount"}, path);
+    const auto& address = req(range, "addressHex", path);
+    string_value(address, path, 18);
+    auto text = address.get<std::string>();
+    if (!text.starts_with("0x") || text.size() <= 2) invalid(std::string(path), "expected hexadecimal 0x address");
+    std::uint64_t start = 0;
+    const auto parsed = std::from_chars(text.data()+2, text.data()+text.size(), start, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size()) invalid(std::string(path), "invalid address");
+    const auto& count = req(range, "byteCount", path);
+    positive_uint(count, path, budget);
+    const auto bytes = count.get<std::uint64_t>();
+    if (start > std::numeric_limits<std::uint64_t>::max() - bytes) invalid(std::string(path), "address interval overflows");
+    for (const auto& [a,b] : intervals)
+      if (start < b && a < start+bytes) invalid(std::string(path), "memory intervals overlap");
+    intervals.emplace_back(start,start+bytes);
+    total += bytes;
+    if (total > budget) limit(std::string(path), "total memory observation budget exceeded");
+  }
+}
+void register_names(const Json& names) {
+  array_limit(names, "command.registers", 64);
+  std::set<std::string> seen;
+  for (const auto& name : names) {
+    string_value(name, "command.registers", 64);
+    const auto s = name.get<std::string>();
+    if (s.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+      invalid("command.registers", "invalid register name");
+    if (!seen.insert(s).second) invalid("command.registers", "duplicate register name");
+  }
+}
+
 std::uint32_t hex4(std::string_view s) {
   std::uint32_t n = 0;
   for (char c : s) { n <<= 4; if (c >= '0' && c <= '9') n += c-'0'; else if (c >= 'a' && c <= 'f') n += c-'a'+10; else if (c >= 'A' && c <= 'F') n += c-'A'+10; else invalid("wire", "invalid unicode escape"); }
@@ -142,7 +178,7 @@ void workspace(const Json& w,const ValidationLimits& l){exact_keys(w,{"id","revi
 void session(const Json& s,const ValidationLimits& l){if(s.is_null())return;exact_keys(s,{"id","generation"},"session");id(req(s,"id","session"),"session.id",l);safe_uint(req(s,"generation","session"),"session.generation");}
 void stop(const Json& s,const ValidationLimits& l){exact_keys(s,{"stopId","stateRevision"},"stop");id(req(s,"stopId","stop"),"stop.stopId",l);safe_uint(req(s,"stateRevision","stop"),"stop.stateRevision");}
 void source_bundle(const Json& s,const ValidationLimits& l){exact_keys(s,{"id","documents"},"source");id(req(s,"id","source"),"source.id",l);array_limit(req(s,"documents","source"),"source.documents",l.maxDocuments);std::unordered_set<std::string> ids;std::size_t total=0;for(const auto&d:req(s,"documents","source")){document(d,l);if(!ids.insert(d["documentId"].get<std::string>()).second)invalid("source.documents","duplicate documentId");total+=d["text"].get_ref<const std::string&>().size();if(total>l.maxSourceBytes)limit("source.documents","source bundle exceeds byte budget");}}
-void config(const Json& c,const ValidationLimits& l){exact_keys(c,{"revisionId","compiler","flags","outputDirectory"},"configuration");id(req(c,"revisionId","configuration"),"configuration.revisionId",l);string_value(req(c,"compiler","configuration"),"configuration.compiler",l.maxStringBytes);array_limit(req(c,"flags","configuration"),"configuration.flags",l.maxArguments);for(const auto&x:req(c,"flags","configuration"))string_value(x,"configuration.flags",l.maxArgumentBytes,false);string_value(req(c,"outputDirectory","configuration"),"configuration.outputDirectory",l.maxStringBytes);}
+void config(const Json& c,const ValidationLimits& l){exact_keys(c,{"revisionId","compiler","flags","outputDirectory","addressProfile"},"configuration");id(req(c,"revisionId","configuration"),"configuration.revisionId",l);string_value(req(c,"compiler","configuration"),"configuration.compiler",l.maxStringBytes);array_limit(req(c,"flags","configuration"),"configuration.flags",l.maxArguments);for(const auto&x:req(c,"flags","configuration"))string_value(x,"configuration.flags",l.maxArgumentBytes,false);string_value(req(c,"outputDirectory","configuration"),"configuration.outputDirectory",l.maxStringBytes);if(has(c,"addressProfile"))enum_string(c["addressProfile"],"configuration.addressProfile",{"native","fixed-executable"});}
 void submitted(const Json&s,const ValidationLimits&l){exact_keys(s,{"id","text","encoding","closeAfterWrite"},"input");id(req(s,"id","input"),"input.id",l);string_value(req(s,"text","input"),"input.text",l.maxInputBytes,false);enum_string(req(s,"encoding","input"),"input.encoding",{"utf-8"});boolean(req(s,"closeAfterWrite","input"),"input.closeAfterWrite");}
 bool environment_name(std::string_view name) {
   if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_')) return false;
@@ -237,13 +273,14 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
-  if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState") { only({"kind"}); return; }
+  if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess") { only({"kind"}); return; }
   if (kind == "build") { only({"kind","source","configuration","architecture"}); source_bundle(req(c,"source","command"),l); config(req(c,"configuration","command"),l); enum_string(req(c,"architecture","command"),"command.architecture",{"arm64","x86_64"}); return; }
   if (kind == "launch") {
-    only({"kind","buildId","input","argv","environment","stopAtEntry"}); id(req(c,"buildId","command"),"command.buildId",l); submitted(req(c,"input","command"),l);
+    only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy"});
+    if(has(c,"addressPolicy")) enum_string(c["addressPolicy"],"command.addressPolicy",{"native","disable-aslr","require-fixed"}); id(req(c,"buildId","command"),"command.buildId",l); submitted(req(c,"input","command"),l);
     const auto& argv=req(c,"argv","command"); array_limit(argv,"command.argv",l.maxArguments); for(const auto& x: argv) { string_value(x,"command.argv",l.maxArgumentBytes,false); if(!mi_argument_safe(x.get<std::string>())) invalid("command.argv","arguments must not contain NUL or line breaks"); }
     const auto& env=req(c,"environment","command"); expect_object(env,"command.environment"); if(env.size()>l.maxArguments) limit("command.environment","too many variables"); std::size_t total=0;
     for(auto it=env.begin();it!=env.end();++it){ string_value(Json(it.key()),"command.environment.key",l.maxArgumentBytes); if(!environment_name(it.key())) invalid("command.environment.key","must be a POSIX environment name"); string_value(it.value(),"command.environment",l.maxArgumentBytes,false); if(it.key().find('\0') != std::string::npos || it.value().get<std::string>().find('\0') != std::string::npos) invalid("command.environment","must not contain NUL"); total += it.key().size()+it.value().get<std::string>().size(); }
@@ -260,6 +297,40 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "writeVariable") { only({"kind","locator","expected","value"}); id(req(c,"locator","command"),"command.locator",l); validate_runtime_value(req(c,"expected","command"),l); validate_scalar_value(req(c,"value","command"),l); return; }
   if (kind == "disassemble") { only({"kind","buildId","target","maxInstructions"}); id(req(c,"buildId","command"),"command.buildId",l); const auto& t=req(c,"target","command"); expect_object(t,"command.target"); const auto tk=t.value("kind",""); if(tk=="pc"){exact_keys(t,{"kind","addressHex"},"command.target");string_value(req(t,"addressHex","command.target"),"command.target.addressHex",l.maxIdBytes);} else if(tk=="source"){exact_keys(t,{"kind","range"},"command.target");span(req(t,"range","command.target"),l);} else invalid("command.target.kind","unknown target"); positive_uint(req(c,"maxInstructions","command"),"command.maxInstructions",l.maxInstructions); return; }
   if (kind == "readMemory") { only({"kind","addressHex","byteCount"}); string_value(req(c,"addressHex","command"),"command.addressHex",l.maxIdBytes); positive_uint(req(c,"byteCount","command"),"command.byteCount",l.maxMemoryReadBytes); return; }
+  if (kind == "readRegisters") {
+    only({"kind","registers"}); if(has(c,"registers")) register_names(c["registers"]); return;
+  }
+  if (kind == "traceInstructions") {
+    only({"kind","count","registers","memoryRanges"});
+    positive_uint(req(c,"count","command"),"command.count",std::min<std::size_t>(256,l.maxInstructions));
+    if(has(c,"registers")) register_names(c["registers"]);
+    memory_ranges(req(c,"memoryRanges","command"),"command.memoryRanges",std::min<std::size_t>(4096,l.maxMemoryReadBytes)); return;
+  }
+  if (kind == "captureMemory") {
+    only({"kind","ranges"}); const auto& ranges=req(c,"ranges","command");
+    memory_ranges(ranges,"command.ranges",std::min<std::size_t>(65536,l.maxMemoryReadBytes));
+    if(ranges.empty()) invalid("command.ranges","at least one range required"); return;
+  }
+  if (kind == "readMemoryCapture") {
+    only({"kind","captureId"}); id(req(c,"captureId","command"),"command.captureId",l); return;
+  }
+  if (kind == "diffMemoryCaptures" || kind == "readInstructionTrace" || kind == "diffMemoryMaps") {
+    if(kind == "diffMemoryCaptures") {
+      only({"kind","beforeCaptureId","afterCaptureId","start","count"});
+      for(const auto* key : {"beforeCaptureId","afterCaptureId"}) id(req(c,key,"command"),std::string("command.")+key,l);
+    } else if(kind == "readInstructionTrace") {
+      only({"kind","traceId","start","count"}); id(req(c,"traceId","command"),"command.traceId",l);
+    } else {
+      only({"kind","beforePoint","afterPoint","start","count"});
+      for(const auto* key : {"beforePoint","afterPoint"}) {
+        const auto& point=req(c,key,"command"); exact_keys(point,{"branchId","eventOrdinal"},key);
+        id(req(point,"branchId",key),"command.point.branchId",l);
+        safe_uint(req(point,"eventOrdinal",key),"command.point.eventOrdinal");
+      }
+    }
+    safe_uint(req(c,"start","command"),"command.start");
+    positive_uint(req(c,"count","command"),"command.count",kind == "readInstructionTrace" ? 64 : l.maxPageSize); return;
+  }
   if (kind == "cancel") { only({"kind","targetRequestId"}); id(req(c,"targetRequestId","command"),"command.targetRequestId",l); return; }
   if (kind == "replayEvents") { only({"kind","afterSequence"}); safe_uint(req(c,"afterSequence","command"),"command.afterSequence"); return; }
   unsupported("command.kind", "unknown command");

@@ -275,6 +275,12 @@ struct GdbEngine::Impl {
   bool inputWaitActive = false;
   int inputWaitFrame = -1;
   nlohmann::json inputWaitLocation = nullptr;
+  MiRecord latestStop;
+  std::vector<std::string> registerNames;
+  // Preserve a Pause arriving during boundary reads until the trace loop
+  // handles it. A read command itself never needs to interrupt a stopped task.
+  bool traceActive = false;
+  bool lastExecutionInterrupted = false;
 
   static bool isInputRuntimeFrame(std::string_view function) {
     return function.find("__GI___libc_read") != std::string_view::npos ||
@@ -979,6 +985,7 @@ struct GdbEngine::Impl {
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
                GdbError& e, int preempt = 0) {
     e = {};
+    if (waitStop) lastExecutionInterrupted = false;
     // Callers may reuse the record for a finish followed by a source step.
     // A poll containing only the previous prompt must not let that old stop
     // satisfy the new command before its acknowledgement arrives.
@@ -1017,8 +1024,13 @@ struct GdbEngine::Impl {
         setError(e, "CANCELLED", "debugger stopped", true); return false;
       }
       pendingInterrupt = pendingInterrupt || mode == 1;
+      if (traceActive && !waitStop && mode == 1) {
+        int idle = 0;
+        (void)control.compare_exchange_strong(idle, 1);
+      }
       if (waitStop && running && pendingInterrupt && !interruptSent) {
         process->interrupt(); interruptSent = true;
+        lastExecutionInterrupted = true;
       }
       if (waitStop && running && !interruptSent && !pendingInterrupt &&
           (recoverableStep || commandText == "-exec-continue") &&
@@ -1114,6 +1126,83 @@ struct GdbEngine::Impl {
     }
     failClosed(e, "TIMEOUT", "GDB command timed out");
     return false;
+  }
+
+  bool resolveRegisters(const std::vector<std::string>& requested,
+                        std::vector<std::pair<std::size_t, std::string>>& selection,
+                        GdbError& error, bool includePc = false) {
+    if (requested.size() > 64) {
+      setError(error, "LIMIT_EXCEEDED", "at most 64 registers may be selected"); return false;
+    }
+    std::vector<std::string> names = requested;
+    if (names.empty()) names = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"};
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (names[i].empty() || names[i].size() > 64 ||
+          names[i].find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos ||
+          std::find(names.begin(), names.begin() + i, names[i]) != names.begin() + i) {
+        setError(error, "INVALID_REQUEST", "register names must be unique plain names"); return false;
+      }
+    }
+    if (registerNames.empty()) {
+      MiRecord metadata;
+      if (!command("-data-list-register-names", false, metadata, error)) return false;
+      const auto* list = field(metadata.fields, "register-names");
+      if (!list || list->values.empty() || list->values.size() > 4096) {
+        setError(error, "READ_FAILED", "GDB returned invalid register metadata", true); return false;
+      }
+      for (const auto& name : list->values) registerNames.push_back(name ? name->text : "");
+    }
+    if (includePc && std::find(names.begin(), names.end(), "rip") == names.end()) names.push_back("rip");
+    selection.clear();
+    for (const auto& name : names) {
+      const auto found = std::find(registerNames.begin(), registerNames.end(), name);
+      if (found == registerNames.end()) {
+        setError(error, "INVALID_REQUEST", "unknown register name: " + name); return false;
+      }
+      selection.emplace_back(static_cast<std::size_t>(found - registerNames.begin()), name);
+    }
+    return true;
+  }
+
+  bool captureRegisters(const std::vector<std::pair<std::size_t, std::string>>& selection,
+                        nlohmann::json& result, GdbError& error) {
+    std::string request = "-data-list-register-values x";
+    for (const auto& [number, name] : selection) request += " " + std::to_string(number);
+    MiRecord record;
+    if (!command(request, false, record, error)) return false;
+    std::map<std::size_t, std::string> values;
+    const auto* list = field(record.fields, "register-values");
+    if (!list) { setError(error, "READ_FAILED", "GDB omitted register values", true); return false; }
+    const auto append = [&](const MiValue* value) {
+      if (!value) return false;
+      const auto number = parseUnsigned(valText(field(*value, "number")));
+      if (!number || *number >= registerNames.size()) return false;
+      return values.emplace(static_cast<std::size_t>(*number), valText(field(*value, "value"))).second;
+    };
+    for (const auto& value : list->values) if (!append(value.get())) {
+      setError(error, "READ_FAILED", "GDB returned malformed register values", true); return false;
+    }
+    for (const auto& [key, value] : list->fields) if (!append(value.get())) {
+      setError(error, "READ_FAILED", "GDB returned malformed register values", true); return false;
+    }
+    result = nlohmann::json::array();
+    for (const auto& [number, name] : selection) {
+      nlohmann::json value = {{"number", number}, {"name", name}, {"available", false}};
+      const auto found = values.find(number);
+      // Some vector/pseudo registers have a structured MI representation even
+      // with format x. Never label that structure as raw hexadecimal bytes.
+      if (found != values.end() && found->second.size() > 2 && found->second.size() <= 258 &&
+          found->second.rfind("0x", 0) == 0 &&
+          found->second.find_first_not_of("0123456789abcdefABCDEF", 2) == std::string::npos) {
+        value["available"] = true;
+        value["valueHex"] = found->second;
+      } else {
+        value["reason"] = found == values.end() ? "not-returned" : "non-hex-or-unavailable";
+      }
+      result.push_back(std::move(value));
+    }
+    return true;
   }
 
   nlohmann::json runtimeValue(std::string type, std::string text) {
@@ -1466,6 +1555,7 @@ struct GdbEngine::Impl {
   }
 
   bool makeStop(const MiRecord& stop, GdbStop& result, GdbError& e) {
+    latestStop = stop;
     result = GdbStop{};
     selectedFrame = 0;
     result.stopped = stop.klass == "stopped";
@@ -1515,6 +1605,63 @@ struct GdbEngine::Impl {
     return true;
   }
 
+  bool settleInputInterrupt(MiRecord& stopped, GdbError& error) {
+    if ((error.code != "INPUT_CHECK" && error.code != "STEP_TIMEOUT") ||
+        valText(field(stopped.fields, "reason")) != "end-stepping-range" || !interruptedInputRead()) return true;
+    // Linux can report the syscall-exit single-step trap before the SIGINT
+    // that interrupted this read. The pending signal must reach its ptrace
+    // delivery stop before returning the wait to our caller; otherwise the
+    // next Continue unexpectedly stops a second time. At this verified
+    // restart boundary, signal delivery precedes another user instruction.
+    // Still honor every actual returned breakpoint/signal instead of hiding
+    // it if the target behaves differently.
+    const auto interrupted = error;
+    MiRecord signalStop;
+    if (!command("-exec-step-instruction", true, signalStop, error)) return false;
+    stopped = std::move(signalStop);
+    if (valText(field(stopped.fields, "signal-name")) == "SIGINT") error = interrupted;
+    else if (error.code.empty())
+      error = {"READ_FAILED", "interrupted syscall did not reach the expected signal-delivery stop", true};
+    return true;
+  }
+
+  bool finishExecutionStop(const MiRecord& stopped, GdbStop& result, GdbError& error) {
+    const bool incompleteStep = error.code == "STEP_TIMEOUT";
+    const bool inputCandidate = error.code == "INPUT_CHECK" || incompleteStep;
+    // Single-stepping a blocking syscall may acknowledge our interrupt as an
+    // end-stepping-range rather than a SIGINT stop. Both still need the same
+    // kernel restart-register and owned-stdin-FIFO evidence.
+    const auto stopReason = valText(field(stopped.fields, "reason"));
+    const bool inputWait = inputCandidate &&
+        (valText(field(stopped.fields, "signal-name")) == "SIGINT" ||
+         (error.code == "INPUT_CHECK" && stopReason == "end-stepping-range")) && interruptedInputRead();
+    if (error.code == "INPUT_CHECK" && !inputWait) error = {};
+    GdbError snapshotError;
+    if (!makeStop(stopped, result, snapshotError)) { error = std::move(snapshotError); return false; }
+    if (process) result.processInstanceId = inferiorPid.empty() ? std::to_string(process->pid()) : inferiorPid;
+    if (inputWait && result.stopped && !result.exited) {
+      inputWaitActive = true;
+      inputWaitFrame = -1;
+      inputWaitLocation = nullptr;
+      result.reason = "input-wait";
+      result.signalName.clear();
+      for (const auto& frame : result.stack) {
+        const auto location = frame.value("location", nlohmann::json(nullptr));
+        if (location.is_null()) continue;
+        const auto id = frame.value("id", std::string{});
+        const auto colon = id.find(':');
+        if (colon == std::string::npos) continue;
+        try { inputWaitFrame = std::stoi(id.substr(colon + 1)); } catch (...) { continue; }
+        inputWaitLocation = location;
+        if (result.location.is_null()) result.location = location;
+        break;
+      }
+      error = {"INPUT_WAIT", "program is waiting for stdin; provide input to continue", true};
+      return false;
+    }
+    return !incompleteStep && error.code.empty();
+  }
+
   bool startGdb(const GdbLaunchRequest& request, GdbError& e) {
     if (options.execWrapper.empty() || ::access(options.execWrapper.c_str(), X_OK) != 0) {
       setError(e, "LAUNCH_FAILED", "the inferior I/O wrapper is unavailable", true);
@@ -1539,6 +1686,8 @@ struct GdbEngine::Impl {
     live = true;
     auto setup = [&](std::string_view c) { MiRecord ignored; return command(c, false, ignored, e); };
     if (!setup("-gdb-set pagination off") || !setup("-gdb-set confirm off") ||
+        !setup(request.disableRandomization ? "-gdb-set disable-randomization on" :
+                                             "-gdb-set disable-randomization off") ||
         // Address/sizeof probes are intentionally non-evaluating.  Refuse
         // any fallback that would invoke a user function or overloaded call.
         !setup("-gdb-set may-call-functions off") || !setup("-gdb-set overload-resolution off") ||
@@ -1589,6 +1738,9 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   impl_->inputWaitActive = false;
   impl_->inputWaitFrame = -1;
   impl_->inputWaitLocation = nullptr;
+  impl_->latestStop = {};
+  impl_->registerNames.clear();
+  impl_->traceActive = false;
   impl_->sourceBundle = request.sourceBundle;
   if (!impl_->prepareTemp(request, error)) return false;
   if (!impl_->startGdb(request, error)) { stop(); return false; }
@@ -1695,36 +1847,8 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
       if (!impl_->command(stepKind == "into" ? "-exec-step" : "-exec-next", true, stopped, error)) return false;
     }
   }
-  const bool incompleteStep = error.code == "STEP_TIMEOUT";
-  const bool inputCandidate = error.code == "INPUT_CHECK" || incompleteStep;
-  const bool inputWait = inputCandidate && valText(field(stopped.fields, "signal-name")) == "SIGINT" &&
-      impl_->interruptedInputRead();
-  if (error.code == "INPUT_CHECK" && !inputWait) error = {};
-  GdbError snapshotError;
-  if (!impl_->makeStop(stopped, result, snapshotError)) { error = std::move(snapshotError); return false; }
-  if (impl_->process) result.processInstanceId = impl_->inferiorPid.empty() ? std::to_string(impl_->process->pid()) : impl_->inferiorPid;
-  if (inputWait && result.stopped && !result.exited) {
-    impl_->inputWaitActive = true;
-    impl_->inputWaitFrame = -1;
-    impl_->inputWaitLocation = nullptr;
-    result.reason = "input-wait";
-    result.signalName.clear(); // SIGINT is debugger bookkeeping, not a program failure.
-    for (const auto& frame : result.stack) {
-      const auto location = frame.value("location", nlohmann::json(nullptr));
-      if (location.is_null()) continue;
-      const auto id = frame.value("id", std::string{});
-      const auto colon = id.find(':');
-      if (colon == std::string::npos) continue;
-      try { impl_->inputWaitFrame = std::stoi(id.substr(colon + 1)); } catch (...) { continue; }
-      impl_->inputWaitLocation = location;
-      if (result.location.is_null()) result.location = location;
-      break;
-    }
-    error = {"INPUT_WAIT", "program is waiting for stdin; provide input to continue", true};
-    return false;
-  }
-  if (incompleteStep) return false;
-  return true;
+  if (!impl_->settleInputInterrupt(stopped, error)) return false;
+  return impl_->finishExecutionStop(stopped, result, error);
 }
 
 bool GdbEngine::pause(GdbStop& result, GdbError& error) {
@@ -1774,6 +1898,17 @@ bool GdbEngine::live() const noexcept { return impl_ && impl_->live.load(); }
 std::optional<int> GdbEngine::gdbPid() const noexcept {
   std::lock_guard lock(impl_->processMutex);
   return impl_->process ? std::optional<int>(impl_->process->pid()) : std::nullopt;
+}
+std::optional<int> GdbEngine::inferiorPid() const noexcept {
+  if (!live()) return std::nullopt;
+  const auto reason = valText(field(impl_->latestStop.fields, "reason"));
+  if (reason.rfind("exited", 0) == 0 || impl_->latestStop.klass.rfind("exited", 0) == 0)
+    return std::nullopt;
+  int pid = 0;
+  const auto& text = impl_->inferiorPid;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), pid);
+  return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && pid > 0 ?
+      std::optional<int>(pid) : std::nullopt;
 }
 
 bool GdbEngine::setBreakpoints(const nlohmann::json& request, nlohmann::json& result,
@@ -1859,28 +1994,65 @@ bool GdbEngine::readMemory(std::string_view addressHex, std::size_t byteCount,
                            nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
   if (byteCount > impl_->options.maxMemoryReadBytes) { error = {"LIMIT_EXCEEDED", "memory request exceeds configured limit", false}; return false; }
-  if (!parseAddress(addressHex)) { error = {"INVALID_REQUEST", "invalid memory address", false}; return false; }
-  MiRecord rec;
-  if (!impl_->command("-data-read-memory-bytes " + std::string(addressHex) + " " + std::to_string(byteCount), false, rec, error)) return false;
+  const auto address = parseAddress(addressHex);
+  if (!address || *address > std::numeric_limits<std::uint64_t>::max() - byteCount) {
+    error = {"INVALID_REQUEST", "invalid or overflowing memory address", false}; return false;
+  }
+  // Canonicalize parsed addresses: a bare hexadecimal input must never become
+  // a GDB identifier/expression merely because it omits the 0x prefix.
+  std::ostringstream canonical;
+  canonical << "0x" << std::hex << *address;
   std::string bytes;
-  if (const MiValue* memory = field(rec.fields, "memory")) {
-    auto appendCell = [&](const MiValue* cell) {
-      if (!cell) return true;
-      return appendHexBytes(valText(field(*cell, "contents")), bytes);
-    };
-    if (!memory->values.empty()) {
+  const long nativePageSize = ::sysconf(_SC_PAGESIZE);
+  if (nativePageSize <= 0) { error = {"READ_FAILED", "cannot determine OS page size", true}; return false; }
+  const auto pageSize = static_cast<std::size_t>(nativePageSize);
+  while (bytes.size() < byteCount) {
+    const auto chunkAddress = *address + bytes.size();
+    const auto chunkSize = std::min(byteCount - bytes.size(), pageSize - static_cast<std::size_t>(chunkAddress % pageSize));
+    std::ostringstream chunkHex;
+    chunkHex << "0x" << std::hex << chunkAddress;
+    MiRecord rec;
+    if (!impl_->command("-data-read-memory-bytes " + chunkHex.str() + " " + std::to_string(chunkSize), false, rec, error)) {
+      if (bytes.empty() || !live() || error.code != "READ_FAILED") return false;
+      error = {};
+      break;
+    }
+    std::map<std::uint64_t, std::string> blocks;
+    if (const MiValue* memory = field(rec.fields, "memory")) {
+      const auto appendCell = [&](const MiValue* cell) {
+        if (!cell) return false;
+        const auto begin = parseAddress(valText(field(*cell, "begin")));
+        const auto end = parseAddress(valText(field(*cell, "end")));
+        std::string contents;
+        if (!begin || !end || *begin < chunkAddress || *end < *begin || *end > chunkAddress + chunkSize ||
+            !appendHexBytes(valText(field(*cell, "contents")), contents) || *end - *begin != contents.size()) return false;
+        if (const auto* offset = field(*cell, "offset")) {
+          const auto parsed = parseUnsigned(offset->text);
+          if (!parsed || *parsed != *begin - chunkAddress) return false;
+        }
+        return blocks.emplace(*begin, std::move(contents)).second;
+      };
       for (const auto& cell : memory->values) if (!appendCell(cell.get())) {
-        error = {"READ_FAILED", "GDB returned malformed memory bytes", true}; return false;
+        error = {"READ_FAILED", "GDB returned malformed memory block bounds or bytes", true}; return false;
       }
-    } else {
       for (const auto& [key, cell] : memory->fields) if (!appendCell(cell.get())) {
-        error = {"READ_FAILED", "GDB returned malformed memory bytes", true}; return false;
+        error = {"READ_FAILED", "GDB returned malformed memory block bounds or bytes", true}; return false;
       }
     }
+    // Some GDB versions report a stray byte beyond the readable prefix when
+    // one MI request straddles an unmapped page. Query each OS page separately
+    // and retain only a verified contiguous prefix, never joining islands.
+    std::uint64_t next = chunkAddress;
+    for (const auto& [begin, contents] : blocks) {
+      if (begin > next) break;
+      if (begin < next) { error = {"READ_FAILED", "GDB returned overlapping memory blocks", true}; return false; }
+      bytes += contents;
+      next += contents.size();
+    }
+    if (next != chunkAddress + chunkSize) break;
   }
-  if (bytes.size() > byteCount) bytes.resize(byteCount);
-  result = {{"addressHex", std::string(addressHex)}, {"bytesBase64", base64(bytes)},
-            {"unreadableBytes", byteCount > bytes.size() ? byteCount - bytes.size() : 0}};
+  result = {{"addressHex", canonical.str()}, {"bytesBase64", base64(bytes)},
+            {"unreadableBytes", byteCount - bytes.size()}};
   return true;
 }
 
@@ -1922,6 +2094,201 @@ bool GdbEngine::disassemble(std::string_view addressHex, std::size_t maxInstruct
   }
   result = {{"instructions", std::move(instructions)}, {"truncated", false}};
   return true;
+}
+
+bool GdbEngine::readRegisters(const std::vector<std::string>& names,
+                              nlohmann::json& result, GdbError& error) {
+  error = {};
+  if (!inferiorPid()) { error = {"INVALID_REQUEST", "no stopped inferior", false}; return false; }
+  std::vector<std::pair<std::size_t, std::string>> selection;
+  if (!impl_->resolveRegisters(names, selection, error)) return false;
+  MiRecord selected;
+  if (!impl_->command("-stack-select-frame 0", false, selected, error)) return false;
+  impl_->selectedFrame = 0;
+  nlohmann::json registers;
+  if (!impl_->captureRegisters(selection, registers, error)) return false;
+  result = {{"architecture", "x86_64"}, {"registers", std::move(registers)}};
+  return true;
+}
+
+bool GdbEngine::traceInstructions(std::size_t count,
+                                  const std::vector<std::string>& registerNames,
+                                  const nlohmann::json& memoryRanges,
+                                  GdbStop& finalStop, nlohmann::json& trace,
+                                  GdbError& error) {
+  error = {};
+  finalStop = {};
+  trace = {{"requestedInstructions", count}, {"executedInstructions", 0}, {"attemptedInstructions", 0},
+           {"status", "failed"}, {"terminationReason", "not-started"},
+           {"coverage", {{"registers", "selected-instruction-boundaries"},
+                         {"memory", "selected-instruction-boundaries"},
+                         {"sameValueWrites", false}, {"otherThreads", "not-recorded"}}},
+           {"initialRegisters", nlohmann::json::array()}, {"initialMemory", nlohmann::json::array()},
+           {"entries", nlohmann::json::array()}};
+  if (!inferiorPid()) { error = {"INVALID_REQUEST", "no stopped inferior", false}; return false; }
+  if (count == 0 || count > std::min<std::size_t>(256, impl_->options.maxInstructions)) {
+    error = {"LIMIT_EXCEEDED", "instruction trace count must be between 1 and the configured limit (at most 256)", false};
+    return false;
+  }
+  if (!memoryRanges.is_array() || memoryRanges.size() > 8) {
+    error = {"INVALID_REQUEST", "trace memory ranges must be an array of at most eight ranges", false}; return false;
+  }
+  std::vector<std::pair<std::string, std::size_t>> ranges;
+  std::size_t bytes = 0;
+  for (const auto& range : memoryRanges) {
+    if (!range.is_object() || !range.contains("addressHex") || !range["addressHex"].is_string() ||
+        !range.contains("byteCount") || !range["byteCount"].is_number_integer() ||
+        range["byteCount"] <= 0 || range["byteCount"] > 4096) {
+      error = {"INVALID_REQUEST", "trace ranges require a hexadecimal address and positive bounded byte count", false};
+      return false;
+    }
+    const auto address = parseAddress(range["addressHex"].get<std::string>());
+    const auto size = range["byteCount"].get<std::size_t>();
+    if (!address || *address > std::numeric_limits<std::uint64_t>::max() - size) {
+      error = {"INVALID_REQUEST", "invalid or overflowing trace memory range", false}; return false;
+    }
+    bytes += size;
+    if (bytes > 4096 || size > impl_->options.maxMemoryReadBytes) {
+      error = {"LIMIT_EXCEEDED", "trace memory ranges exceed the 4096-byte observation budget", false}; return false;
+    }
+    std::ostringstream hex;
+    hex << "0x" << std::hex << *address;
+    ranges.emplace_back(hex.str(), size);
+  }
+  impl_->traceActive = true;
+  struct ResetTrace { bool& active; ~ResetTrace() { active = false; } } reset{impl_->traceActive};
+  std::vector<std::pair<std::size_t, std::string>> selection;
+  if (!impl_->resolveRegisters(registerNames, selection, error, true)) return false;
+  MiRecord selected;
+  if (!impl_->command("-stack-select-frame 0", false, selected, error)) return false;
+  impl_->selectedFrame = 0;
+  nlohmann::json beforeRegisters;
+  if (!impl_->captureRegisters(selection, beforeRegisters, error)) return false;
+  GdbError rangeCaptureError;
+  const auto readRanges = [&](bool exited) {
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto& [address, size] : ranges) {
+      nlohmann::json captured;
+      GdbError localError;
+      if (!exited && readMemory(address, size, captured, localError)) {
+        captured["available"] = captured.value("unreadableBytes", size) == 0;
+        if (!captured["available"].get<bool>()) captured["reason"] = "partial-read";
+      } else {
+        if (!exited && !live() && rangeCaptureError.code.empty()) rangeCaptureError = localError;
+        captured = {{"addressHex", address}, {"available", false},
+                    {"unreadableBytes", size}, {"reason", exited ? "process-exited" : "read-failed"}};
+      }
+      captured["byteCount"] = size;
+      result.push_back(std::move(captured));
+    }
+    return result;
+  };
+  auto beforeMemory = readRanges(false);
+  if (!live()) {
+    error = rangeCaptureError.code.empty() ? GdbError{"READ_FAILED", "debugger failed during initial trace capture", true} : rangeCaptureError;
+    return false;
+  }
+  trace["initialRegisters"] = beforeRegisters;
+  trace["initialMemory"] = beforeMemory;
+  const auto pc = [](const nlohmann::json& registers) -> nlohmann::json {
+    for (const auto& reg : registers)
+      if (reg.value("name", "") == "rip" && reg.value("available", false)) return reg.at("valueHex");
+    return nullptr;
+  };
+  MiRecord lastStop = impl_->latestStop;
+  GdbError executionError;
+  const auto deadline = std::chrono::steady_clock::now() + impl_->options.commandTimeout;
+  trace["status"] = "complete";
+  trace["terminationReason"] = "count-reached";
+  for (std::size_t instruction = 0; instruction < count; ++instruction) {
+    const int control = impl_->control.exchange(0);
+    if (control >= 2) {
+      impl_->traceActive = false;
+      finalStop = stopAndSnapshot();
+      trace["status"] = "terminated";
+      trace["terminationReason"] = "cancelled";
+      error = {"CANCELLED", "instruction trace stopped", true};
+      return false;
+    }
+    if (control == 1) {
+      trace["status"] = "terminated";
+      trace["terminationReason"] = "interrupted";
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      trace["status"] = "terminated";
+      trace["terminationReason"] = "timeout";
+      executionError = {"TIMEOUT", "instruction trace reached its command budget at a stopped boundary", true};
+      break;
+    }
+    MiRecord stopped;
+    impl_->inputWaitActive = false;
+    trace["attemptedInstructions"] = instruction + 1;
+    if (!impl_->command("-exec-step-instruction", true, stopped, executionError)) {
+      trace["status"] = "failed";
+      trace["terminationReason"] = executionError.code;
+      break;
+    }
+    const bool externallyInterrupted = impl_->lastExecutionInterrupted;
+    if (externallyInterrupted && executionError.code.empty() &&
+        valText(field(stopped.fields, "reason")) == "end-stepping-range" && impl_->interruptedInputRead())
+      executionError = {"INPUT_CHECK", "interrupted a pending stdin read", true};
+    if (!impl_->settleInputInterrupt(stopped, executionError)) {
+      trace["status"] = "failed";
+      trace["terminationReason"] = executionError.code;
+      break;
+    }
+    lastStop = stopped;
+    const auto reason = valText(field(stopped.fields, "reason"));
+    const bool exited = reason.rfind("exited", 0) == 0 || stopped.klass.rfind("exited", 0) == 0;
+    const bool completed = reason == "end-stepping-range" && executionError.code.empty() && !externallyInterrupted;
+    if (completed) trace["executedInstructions"] = trace["executedInstructions"].get<std::size_t>() + 1;
+    nlohmann::json afterRegisters = beforeRegisters;
+    GdbError captureError;
+    if (exited || !impl_->captureRegisters(selection, afterRegisters, captureError)) {
+      afterRegisters = nlohmann::json::array();
+      for (const auto& [number, name] : selection)
+        afterRegisters.push_back({{"number", number}, {"name", name}, {"available", false},
+                                  {"reason", exited ? "process-exited" : "read-failed"}});
+    }
+    auto afterMemory = readRanges(exited || !live());
+    nlohmann::json registerChanges = nlohmann::json::array();
+    for (std::size_t i = 0; i < beforeRegisters.size(); ++i)
+      if (beforeRegisters[i] != afterRegisters[i])
+        registerChanges.push_back({{"name", beforeRegisters[i]["name"]},
+                                   {"before", beforeRegisters[i]}, {"after", afterRegisters[i]}});
+    nlohmann::json memoryChanges = nlohmann::json::array();
+    for (std::size_t i = 0; i < beforeMemory.size(); ++i)
+      if (beforeMemory[i] != afterMemory[i])
+        memoryChanges.push_back({{"addressHex", ranges[i].first}, {"byteCount", ranges[i].second},
+                                 {"before", beforeMemory[i]}, {"after", afterMemory[i]}});
+    trace["entries"].push_back({{"ordinal", instruction + 1}, {"pcBeforeHex", pc(beforeRegisters)},
+                               {"pcAfterHex", pc(afterRegisters)}, {"registerChanges", std::move(registerChanges)},
+                               {"memoryChanges", std::move(memoryChanges)}, {"reason", reason},
+                               {"instructionCompleted", completed}});
+    beforeRegisters = std::move(afterRegisters);
+    beforeMemory = std::move(afterMemory);
+    if (!completed || !captureError.code.empty() || !live()) {
+      trace["status"] = "terminated";
+      trace["terminationReason"] = !executionError.code.empty() ? executionError.code :
+          externallyInterrupted ? "interrupted" :
+          exited ? "exit" : !captureError.code.empty() ? "capture-failed" : reason;
+      if (!captureError.code.empty() && executionError.code.empty()) executionError = captureError;
+      if (!rangeCaptureError.code.empty() && executionError.code.empty()) executionError = rangeCaptureError;
+      break;
+    }
+  }
+  impl_->traceActive = false;
+  error = executionError;
+  if (!live()) return false;
+  const bool finished = impl_->finishExecutionStop(lastStop, finalStop, error);
+  if (error.code == "INPUT_WAIT") trace["terminationReason"] = "input-wait";
+  else if (error.code == "STEP_TIMEOUT") trace["terminationReason"] = "timeout";
+  if (!finished && trace["status"] == "complete") {
+    trace["status"] = "failed";
+    trace["terminationReason"] = error.code;
+  }
+  return finished;
 }
 
 bool GdbEngine::writeVariable(std::string_view, const nlohmann::json&,
