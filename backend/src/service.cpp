@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -42,7 +43,10 @@ bool redirects_output(std::string_view flag) {
 constexpr std::uintmax_t maxArtifactBytes = 256u * 1024u * 1024u;
 } // namespace
 
-BackendService::BackendService(ServiceOptions options) : options_(std::move(options)) {
+BackendService::BackendService(ServiceOptions options)
+    : options_(std::move(options)),
+      stdoutJournal_(std::min<std::size_t>(4 * 1024 * 1024,options_.limits.maxWireBytes/4)),
+      stderrJournal_(std::min<std::size_t>(4 * 1024 * 1024,options_.limits.maxWireBytes/4)) {
   if (options_.workspace.empty()) options_.workspace = std::filesystem::current_path();
   options_.workspace = std::filesystem::weakly_canonical(options_.workspace);
   if (options_.buildDirectory.empty()) options_.buildDirectory = options_.workspace / ".phantom" / "backend-build";
@@ -50,6 +54,7 @@ BackendService::BackendService(ServiceOptions options) : options_(std::move(opti
   std::filesystem::create_directories(options_.buildDirectory);
   GdbOptions gdbOptions;
   gdbOptions.execWrapper = options_.ioWrapper;
+  gdbOptions.gdbPath = options_.gdbPath;
   gdbOptions.maxOutputBytes = std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16);
   gdbOptions.maxVariablesPerPage = options_.limits.maxPageSize;
   gdbOptions.maxMemoryReadBytes = options_.limits.maxMemoryReadBytes;
@@ -111,7 +116,9 @@ Json BackendService::capabilities() const {
       {"addressProfiles", {"native", "fixed-executable"}},
       {"addressPolicies", {"native", "disable-aslr", "require-fixed"}},
       {"processInspection", "linux-procfs"}, {"registerRead", true},
-      {"instructionTrace", "instruction-boundaries"}, {"memoryCapture", true}, {"memoryMapDiff", true},
+      {"instructionTrace", "instruction-boundaries"}, {"memoryCapture", true}, {"memoryMapDiff", true}, {"outputJournal", true},
+      {"moduleInspection", "linux-proc-maps-elf"}, {"recorderProbe", true},
+      {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
                    {"maxResidentSnapshots", 4096},
@@ -123,6 +130,8 @@ Json BackendService::capabilities() const {
                    {"maxTraceMemoryBytes", std::min<std::size_t>(4096, options_.limits.maxMemoryReadBytes)},
                    {"maxCaptureBytes", std::min<std::size_t>(65536, options_.limits.maxMemoryReadBytes)},
                    {"maxInspectionStoreBytes", options_.limits.maxWireBytes},
+                   {"maxOutputJournalBytesPerStream", std::min<std::size_t>(4 * 1024 * 1024,options_.limits.maxWireBytes/4)},
+                   {"maxOutputJournalReadBytes", 65536}, {"maxRecordedInstructions", 1000000},
                    {"commandTimeoutMs", 30000}, {"replayTimeoutMs", 30000}}},
   };
 }
@@ -189,6 +198,8 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   observation["stack"] = stop.stack.is_array() ? stop.stack : Json::array();
   if (stop.memoryMap.is_object()) observation["memoryMap"] = stop.memoryMap;
   if (executionLayout_.is_object()) observation["executionLayout"] = executionLayout_;
+  if (stop.recording.is_object()) observation["recording"] = stop.recording;
+  observation["osEvidenceScope"] = "current-process";
   if (!observation.contains("input")) {
     auto input = defaultInput();
     if (stop.input.is_object()) for (auto it = stop.input.begin(); it != stop.input.end(); ++it) input[it.key()] = it.value();
@@ -202,6 +213,32 @@ Json BackendService::makeObservation(const GdbStop& stop, std::string reason) {
   }
   if (!observation.contains("stdout")) observation["stdout"] = stop.stdoutSnapshot.is_object() && stop.stdoutSnapshot.contains("text") ? stop.stdoutSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
   if (!observation.contains("stderr")) observation["stderr"] = stop.stderrSnapshot.is_object() && stop.stderrSnapshot.contains("text") ? stop.stderrSnapshot : Json{{"text", ""}, {"totalBytes", 0}, {"retainedFromByte", 0}, {"truncated", false}};
+  const auto stdoutTotal = observation["stdout"].value("totalBytes",std::uint64_t{0});
+  const auto stderrTotal = observation["stderr"].value("totalBytes",std::uint64_t{0});
+  const bool stdoutConsistent = stdoutJournal_.observe(stdoutTotal,stop.stdoutRaw);
+  const bool stderrConsistent = stderrJournal_.observe(stderrTotal,stop.stderrRaw);
+  outputJournalConsistent_ = outputJournalConsistent_ && stdoutConsistent && stderrConsistent;
+  observation["outputCursor"] = {{"source","transport"},{"stdoutThroughByte",stdoutTotal},{"stderrThroughByte",stderrTotal}};
+  if (stop.recording.is_object() && stop.recording.value("profile", "native") != "native")
+    observation["outputCursor"] = {{"source","unknown"},{"stdoutThroughByte",nullptr},{"stderrThroughByte",nullptr}};
+  if (stop.recording.is_object() && stop.recording.value("available", false)) {
+    const auto cursorText = stop.recording.at("currentInstruction").get<std::string>();
+    std::uint64_t cursor = 0;
+    const auto parsed = std::from_chars(cursorText.data(), cursorText.data()+cursorText.size(), cursor);
+    observation["outputCursor"] = {{"source","unknown"},{"stdoutThroughByte",nullptr},{"stderrThroughByte",nullptr}};
+    if (parsed.ec == std::errc{} && parsed.ptr == cursorText.data()+cursorText.size()) {
+      // Replay does not repeat external writes. Reuse only an observed prefix;
+      // an arbitrary earlier instruction has no proven output boundary.
+      auto marker = recordingOutputMarkers_.find(cursor);
+      if (marker == recordingOutputMarkers_.end() && cursorText == stop.recording.at("lastInstruction").get<std::string>()) {
+        marker = recordingOutputMarkers_.emplace(cursor,std::pair{stdoutTotal,stderrTotal}).first;
+        if (recordingOutputMarkers_.size() > 4096) recordingOutputMarkers_.erase(recordingOutputMarkers_.begin());
+      }
+      if (marker != recordingOutputMarkers_.end())
+        observation["outputCursor"] = {{"source","recording-checkpoint"},
+            {"stdoutThroughByte",marker->second.first},{"stderrThroughByte",marker->second.second}};
+    }
+  }
   if (!observation.contains("expressions")) observation["expressions"] = Json::array();
   if (!observation.contains("coverage")) observation["coverage"] = {{"variables", "partial"}, {"expressions", "none"}, {"memory", "none"}};
   return observation;
@@ -414,6 +451,8 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
     return {errorResponse(request, "LAUNCH_FAILED", "require-fixed needs an x86_64 ET_EXEC build", false)};
   GdbLaunchRequest launch;
   launch.disableRandomization = addressPolicy != "native";
+  launch.recordingProfile = command.value("recordingProfile", "native");
+  launch.maxRecordedInstructions = command.value("maxRecordedInstructions", std::size_t{200000});
   launch.binaryPath = artifact_->binary; launch.stopAtEntry = command.value("stopAtEntry", true);
   for (const auto& arg : command.at("argv")) launch.argv.push_back(arg.get<std::string>());
   for (auto it = command.at("environment").begin(); it != command.at("environment").end(); ++it) launch.environment.emplace_back(it.key(), it.value().get<std::string>());
@@ -454,7 +493,8 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
               {"processStartTimeTicks", proc.value("identityVerified", false) ? stat.value("startTimeTicks", Json(nullptr)) : Json(nullptr)},
               {"runFingerprint", sha256_hex(artifact_->dto.at("binarySha256").get<std::string>() +
                   json_text(command.at("argv")) + json_text(command.at("environment")) +
-                  json_text(command.at("input")) + addressPolicy)},
+                  json_text(command.at("input")) + addressPolicy + launch.recordingProfile +
+                  std::to_string(launch.maxRecordedInstructions))},
               {"allocatorDeterminism", "not-established"}, {"replayVerified", false}};
     if (addressPolicy == "require-fixed" && !disabled) {
       engine_->stop(); launched = false;
@@ -479,6 +519,7 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   // launch must not replay frames or expose points from the previous run.
   sequence_ = ordinal_ = stateRevision_ = 0;
   inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+  stdoutJournal_.clear(); stderrJournal_.clear(); outputJournalConsistent_ = true; recordingOutputMarkers_.clear();
   executionLayout_ = std::move(layout);
   history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0; liveObservation_ = nullptr; liveState_ = nullptr;
   sessionId_ = make_id("session", ++sessionGeneration_); processInstanceId_ = stop.processInstanceId.empty() ? make_id("process", sessionGeneration_) : stop.processInstanceId;
@@ -537,16 +578,19 @@ std::vector<Json> BackendService::handleExecution(const Json& request, std::stri
     // `while (true) { continue; }` case).  GDB was interrupted at the step
     // deadline and returned a real stopped snapshot; keep that session live.
     // A blocked stdin read is reported separately as a recoverable input wait.
-    if ((error.code == "STEP_TIMEOUT" || error.code == "INPUT_WAIT") && stop.stopped && engine_->live()) {
+    if (interruption != "stop" && stop.stopped && engine_->live()) {
       const bool inputWait = error.code == "INPUT_WAIT" || stop.reason == "input-wait";
-      auto observation = makeObservation(stop, inputWait ? "input-wait" : "step-timeout");
+      auto observation = makeObservation(stop, inputWait ? "input-wait" : interruption == "pause" ? "pause" :
+          error.code == "STEP_TIMEOUT" ? "step-timeout" : "recording-error");
       auto state = makeState(observation, inputWait ? "waitingForInput" : "stopped", stop.exitCode,
                              stop.signalName.empty() ? std::nullopt : std::optional<std::string>(stop.signalName));
       appendHistory(observation, state);
       frames.push_back(event({{"kind", "observation"}, {"observation", observation}}, processInstanceId_, string_at(request, "requestId")));
       frames.push_back(event({{"kind", "state"}, {"state", state}}, processInstanceId_, string_at(request, "requestId")));
       const Json err = {{"code", error.code}, {"message", error.message}, {"retryable", error.retryable}};
-      emitCommandFinished(frames, request, inputWait ? "waiting" : "failed", err);
+      emitCommandFinished(frames, request, interruption == "cancel" ? "cancelled" :
+          interruption == "pause" ? "completed" : inputWait ? "waiting" : "failed",
+          interruption.empty() ? std::optional<Json>(err) : std::nullopt);
       return frames;
     }
     if (interruption == "stop") {
@@ -645,6 +689,7 @@ std::vector<Json> BackendService::connect(const Json& request) {
     liveState_ = nullptr; liveObservation_ = nullptr; history_.clear(); historyBytes_ = 0; eventLog_.clear(); eventBytes_ = 0;
     sequence_ = ordinal_ = stateRevision_ = 0;
     inspectionStore_.clear(); inspectionBytes_ = 0; inspectionCounter_ = 0;
+    stdoutJournal_.clear(); stderrJournal_.clear(); outputJournalConsistent_ = true; recordingOutputMarkers_.clear();
     executionLayout_ = nullptr;
     workspace_ = request.at("workspace");
   }
@@ -663,7 +708,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
          request.at("session").at("generation").get<std::uint64_t>() != sessionGeneration_))
       return {errorResponse(request, "STALE_CONTEXT", "request session does not match the live session", false)};
     if ((kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
-         kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
+         kind == "readModuleSnapshot" || kind == "readOutputJournal" || kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
         !sessionId_.empty() && request.at("session").is_null())
       return {errorResponse(request, "STALE_CONTEXT", "history belongs to the current debugging session", false)};
     // pause/stop/cancel may already have interrupted the active GDB command
@@ -686,13 +731,14 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         return frames;
       }
     }
-    if (shuttingDown_.load() && (kind == "build" || kind == "launch" || kind == "step" ||
+    if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
                                  kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
-                             kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
+                             kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" ||
+                             kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
                              kind == "setBreakpoints" || kind == "writeVariable";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
@@ -704,7 +750,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
                            liveObservation_.at("stop") == expected;
       if (!matches) return {errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false)};
     }
-    const bool longOperation = kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
+    const bool longOperation = kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
     std::optional<std::string> activeId;
     if (longOperation) {
       const auto requestId = string_at(request, "requestId");
@@ -747,11 +793,14 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       }
       catch (const std::exception& e) { artifact_.reset(); return {errorResponse(request, "BUILD_FAILED", e.what(), false)}; }
     }
+    if (kind == "probeRecorders") return {handleRecorderProbe(request)};
+    if (kind == "inspectModules" || kind == "readModuleSnapshot") return handleModules(request);
     if (kind == "launch") return handleLaunch(request, publish);
     if (kind == "traceInstructions") return handleTrace(request, publish);
-    if (kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" ||
+    if (kind == "seekRecording" || kind == "reverseInstruction") return handleRecordedExecution(request, publish);
+    if (kind == "readRecording" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" ||
         kind == "readMemoryCapture" || kind == "diffMemoryCaptures" ||
-        kind == "diffMemoryMaps" || kind == "readInstructionTrace") return handleInspection(request);
+        kind == "readOutputJournal" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") return handleInspection(request);
     if (kind == "appendInput" || kind == "closeInput") return {handleInput(request)};
     if (kind == "step" || kind == "continue" || kind == "pause" || kind == "stop") return handleExecution(request, kind, publish);
     if (kind == "listHistory" || kind == "readHistory") return {handleHistory(request)};
@@ -837,8 +886,8 @@ bool BackendService::control(const Json& request, bool waitForActive) {
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return false;
-  if (active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
-  if (active_->kind == "build" && kind != "cancel") return false;
+  if (active_->kind != "seekRecording" && active_->kind != "reverseInstruction" && active_->kind != "probeRecorders" && active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
+  if ((active_->kind == "build" || active_->kind == "probeRecorders") && kind != "cancel") return false;
   if (active_->kind == "launch" && kind == "pause") return false;
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session) return false;
   if (kind == "cancel" && request.at("command").at("targetRequestId") != active_->id) return false;
@@ -849,8 +898,8 @@ bool BackendService::control(const Json& request, bool waitForActive) {
   if (kind == "stop" || active_->interruption.empty() ||
       (kind == "cancel" && active_->interruption == "pause"))
     active_->interruption = kind;
-  if (active_->kind == "launch" || active_->kind == "build") active_->stop.request_stop();
-  if (active_->kind != "build") engine_->interrupt(kind == "stop" || active_->kind == "launch" ? 2 : 1);
+  if (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders") active_->stop.request_stop();
+  if (active_->kind != "build" && active_->kind != "probeRecorders") engine_->interrupt(kind == "stop" || active_->kind == "launch" ? 2 : 1);
   return true;
 }
 
@@ -870,7 +919,7 @@ void BackendService::interrupt(int mode) noexcept {
   if (mode >= 2) shuttingDown_.store(true);
   {
     std::lock_guard lock(controlMutex_);
-    if (active_ && (active_->kind == "launch" || active_->kind == "build")) active_->stop.request_stop();
+    if (active_ && (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders")) active_->stop.request_stop();
   }
   controlWake_.notify_all();
   if (engine_) engine_->interrupt(mode);

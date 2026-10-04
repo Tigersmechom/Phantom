@@ -281,6 +281,13 @@ struct GdbEngine::Impl {
   // handles it. A read command itself never needs to interrupt a stopped task.
   bool traceActive = false;
   bool lastExecutionInterrupted = false;
+  std::string recordingProfile = "native";
+  std::size_t maxRecordedInstructions = 200000;
+  bool recordingActive = false;
+  bool captureConsole = false;
+  std::string consoleOutput;
+  bool captureRecordingDiagnostics = false;
+  std::string recordingDiagnostics;
 
   static bool isInputRuntimeFrame(std::string_view function) {
     return function.find("__GI___libc_read") != std::string_view::npos ||
@@ -353,6 +360,16 @@ struct GdbEngine::Impl {
       (void)::close(inferiorPidFd); inferiorPidFd = -1;
     }
   }
+  void interruptExecution() noexcept {
+    // In synchronous record-full source stepping GDB can defer its own
+    // SIGINT indefinitely while following an endless single source line.
+    // Signal the exact owned inferior through its pidfd instead: ptrace
+    // reports a real SIGINT stop and GDB retains the recording. No PID lookup
+    // or process-wide/global debugger setting is involved.
+    if (recordingActive && inferiorPidFd >= 0 &&
+        ::syscall(SYS_pidfd_send_signal, inferiorPidFd, SIGINT, nullptr, 0) == 0) return;
+    if (process) process->interrupt();
+  }
   bool prepareTemp(const GdbLaunchRequest& request, GdbError& e) {
     std::string pattern = (std::filesystem::temp_directory_path() /
                            "phantom-gdb-XXXXXX").string();
@@ -378,6 +395,16 @@ struct GdbEngine::Impl {
       setError(e, "LAUNCH_FAILED", "cannot configure startup PTY"); cleanupTemp(); return false;
     }
     std::ofstream environment(tempDir / "environment", std::ios::binary);
+    if (request.recordingProfile == "gdb-record-full" &&
+        std::none_of(request.environment.begin(), request.environment.end(),
+                     [](const auto& item) { return item.first == "LC_ALL"; })) {
+      // The debugger's status parser uses English, but the target retains its
+      // original locale. GDB's inherited LC_ALL is removed before exec below.
+      if (const char* locale = std::getenv("LC_ALL")) {
+        environment << "LC_ALL=" << locale;
+        environment.put('\0');
+      }
+    }
     for (const auto& [name, value] : request.environment) {
       environment << name << '=' << value;
       environment.put('\0');
@@ -859,6 +886,8 @@ struct GdbEngine::Impl {
     };
     result.stdoutSnapshot = snapshot(stdoutOutput, stdoutTotalBytes);
     result.stderrSnapshot = snapshot(stderrOutput, stderrTotalBytes);
+    result.stdoutRaw = stdoutOutput;
+    result.stderrRaw = stderrOutput;
     if (!result.exited && result.location.is_null()) {
       // An interrupt inside a flush can observe bytes already written into
       // the FIFO while the native put pointers still include them. Until
@@ -948,6 +977,23 @@ struct GdbEngine::Impl {
       failClosed(e, "READ_FAILED", std::string("cannot parse GDB/MI record: ") + ex.what());
       return false;
     }
+    if (r.type == '~' && captureConsole) {
+      if (r.stream.size() > 1024u * 1024u - consoleOutput.size()) {
+        failClosed(e, "LIMIT_EXCEEDED", "GDB console response exceeds the bounded command capture");
+        return false;
+      }
+      consoleOutput += r.stream;
+    }
+    if ((r.type == '~' || r.type == '&') && captureRecordingDiagnostics) {
+      constexpr std::size_t diagnosticLimit = 4096;
+      if (r.stream.size() >= diagnosticLimit) recordingDiagnostics = r.stream.substr(r.stream.size() - diagnosticLimit);
+      else {
+        if (recordingDiagnostics.size() > diagnosticLimit - r.stream.size())
+          recordingDiagnostics.erase(0, recordingDiagnostics.size() - (diagnosticLimit - r.stream.size()));
+        recordingDiagnostics += r.stream;
+      }
+    }
+    if (r.type == '=' && r.klass == "record-stopped") recordingActive = false;
     if (r.type == '=' && r.klass == "thread-group-started") {
       const auto* pid = field(r.fields, "pid");
       if (pid && !pid->text.empty()) {
@@ -985,6 +1031,10 @@ struct GdbEngine::Impl {
   bool command(std::string_view commandText, bool waitStop, MiRecord& stop,
                GdbError& e, int preempt = 0) {
     e = {};
+    consoleOutput.clear();
+    captureConsole = commandText == "-interpreter-exec console \"info record\"";
+    captureRecordingDiagnostics = recordingActive && waitStop;
+    if (waitStop) recordingDiagnostics.clear();
     if (waitStop) lastExecutionInterrupted = false;
     // Callers may reuse the record for a finish followed by a source step.
     // A poll containing only the previous prompt must not let that old stop
@@ -1001,9 +1051,11 @@ struct GdbEngine::Impl {
     }
     // Control-thread calls only publish intent. The owning worker sends an
     // interrupt after ^running, so same-packet pause cannot signal idle GDB.
+    const bool reverseStep = commandText == "-exec-step-instruction --reverse";
+    const bool seekingRecord = commandText.starts_with("-interpreter-exec console \"record goto ");
     const bool recoverableStep = waitStop &&
         (commandText == "-exec-next" || commandText == "-exec-step" ||
-         commandText == "-exec-finish" || commandText == "-exec-step-instruction");
+         commandText == "-exec-finish" || commandText == "-exec-step-instruction" || reverseStep);
     bool recoveringStep = false;
     bool checkingInput = false;
     auto nextInputProbe = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
@@ -1028,16 +1080,17 @@ struct GdbEngine::Impl {
         int idle = 0;
         (void)control.compare_exchange_strong(idle, 1);
       }
-      if (waitStop && running && pendingInterrupt && !interruptSent) {
-        process->interrupt(); interruptSent = true;
+      if (((waitStop && running) || seekingRecord) && pendingInterrupt && !interruptSent) {
+        if (seekingRecord) process->interrupt(); else interruptExecution();
+        interruptSent = true;
         lastExecutionInterrupted = true;
       }
-      if (waitStop && running && !interruptSent && !pendingInterrupt &&
+      if (waitStop && !reverseStep && running && !interruptSent && !pendingInterrupt &&
           (recoverableStep || commandText == "-exec-continue") &&
           std::chrono::steady_clock::now() >= nextInputProbe) {
         nextInputProbe = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
         if (inputReadInProgress()) {
-          process->interrupt();
+          interruptExecution();
           interruptSent = true;
           checkingInput = true;
           interactiveContinue = false;
@@ -1092,7 +1145,7 @@ struct GdbEngine::Impl {
       // the caller to inspect or continue.  This is intentionally surfaced as
       // an incomplete step rather than pretending that a source transition
       // happened.
-      process->interrupt();
+      interruptExecution();
       recoveringStep = true;
       deadline = std::chrono::steady_clock::now() +
           std::min(options.commandTimeout, std::chrono::milliseconds(1000));
@@ -1554,6 +1607,95 @@ struct GdbEngine::Impl {
     return true;
   }
 
+  bool recordingSnapshot(nlohmann::json& result, GdbError& error) {
+    result = {{"profile", recordingProfile}, {"available", false}};
+    if (recordingProfile == "native") {
+      result["reason"] = "recording-not-requested";
+      return true;
+    }
+    if (!recordingActive) {
+      result["reason"] = "recording-not-active";
+      return true;
+    }
+    MiRecord response;
+    if (!command("-interpreter-exec console \"info record\"", false, response, error)) {
+      result["reason"] = "recording-state-unavailable";
+      return false;
+    }
+    const auto transcript = consoleOutput;
+    const auto counter = [&](std::string_view label) -> std::optional<std::uint64_t> {
+      const auto begin = transcript.find(label);
+      if (begin == std::string::npos) return std::nullopt;
+      const auto first = begin + label.size();
+      const auto end = transcript.find_first_not_of("0123456789", first);
+      if (end == first) return std::nullopt;
+      return parseUnsigned(std::string_view(transcript).substr(first, end - first));
+    };
+    const bool replay = transcript.find("\nReplay mode:\n") != std::string::npos;
+    const bool record = transcript.find("\nRecord mode:\n") != std::string::npos;
+    const bool empty = transcript.find("No instructions have been logged.") != std::string::npos;
+    const auto maximum = counter("Max logged instructions is ");
+    const auto first = empty ? std::optional<std::uint64_t>(0) : counter("Lowest recorded instruction number is ");
+    const auto last = empty ? std::optional<std::uint64_t>(0) : counter("Highest recorded instruction number is ");
+    const auto count = empty ? std::optional<std::uint64_t>(0) : counter("Log contains ");
+    const auto current = replay ? counter("Current instruction number is ") : last;
+    if (transcript.find("Active record target: record-full\n") == std::string::npos ||
+        replay == record || !maximum || *maximum != maxRecordedInstructions ||
+        !first || !last || !count || !current || *first > *last || *current > *last ||
+        *count > *maximum || (!empty && (*first == 0 || *count != *last - *first + 1)) ||
+        (*first > 1 && *current < *first)) {
+      result["reason"] = "unrecognized-recording-state";
+      error = {"READ_FAILED", "GDB returned an unrecognized record-full status", false};
+      return false;
+    }
+    result = {{"profile", recordingProfile}, {"available", true},
+        {"mode", replay ? "replay" : "record"}, {"currentInstruction", std::to_string(*current)},
+        {"firstInstruction", std::to_string(*first)}, {"lastInstruction", std::to_string(*last)},
+        {"earliestSeekableInstruction", std::to_string(*first > 1 ? *first : 0)},
+        {"recordedInstructions", *count}, {"maxRecordedInstructions", *maximum},
+        {"evicted", *first > 1},
+        {"coverage", {{"registers", "gdb-record-full"}, {"memory", "gdb-record-full"},
+                      {"externalEffects", "not-restored"}, {"instructionSupport", "target-dependent"},
+                      {"osState", "current-process"}, {"inputTransport", "not-restored"}}}};
+    return true;
+  }
+
+  // Console `record goto` emits no *stopped MI event. Independently verify
+  // that every live thread is stopped, then obtain its actual current frame.
+  // This also recovers record-full failures after an instruction unsupported
+  // by GDB, which may return ^error without any subsequent *stopped event.
+  bool verifiedStoppedRecord(MiRecord& stopped, std::string_view reason, GdbError& error) {
+    MiRecord threads;
+    if (!command("-thread-info", false, threads, error)) return false;
+    const auto* entries = field(threads.fields, "threads");
+    const auto thread = valText(field(threads.fields, "current-thread-id"));
+    if (!entries || entries->values.empty() || thread.empty()) {
+      error = {"READ_FAILED", "record operation did not leave a live stopped thread", true};
+      return false;
+    }
+    for (const auto& entry : entries->values) {
+      if (valText(field(*entry, "state")) != "stopped") {
+        failClosed(error, "READ_FAILED", "record operation left an unconfirmed running thread");
+        return false;
+      }
+    }
+    MiRecord frame;
+    if (!command("-stack-select-frame 0", false, frame, error) ||
+        !command("-stack-info-frame", false, frame, error)) return false;
+    const auto* value = field(frame.fields, "frame");
+    if (!value) {
+      error = {"READ_FAILED", "record operation returned no stopped frame", true};
+      return false;
+    }
+    stopped = {};
+    stopped.type = '*';
+    stopped.klass = "stopped";
+    stopped.fields = {{"reason", std::make_shared<MiValue>(MiValue::string_value(std::string(reason)))},
+                      {"thread-id", std::make_shared<MiValue>(MiValue::string_value(thread))},
+                      {"frame", std::make_shared<MiValue>(*value)}};
+    return true;
+  }
+
   bool makeStop(const MiRecord& stop, GdbStop& result, GdbError& e) {
     latestStop = stop;
     result = GdbStop{};
@@ -1599,6 +1741,16 @@ struct GdbEngine::Impl {
     // At an inferior stop its completed writes are already queued in the
     // kernel. Capture that backlog without a sleep or EOF heuristic.
     captureIo(result);
+    if (recordingProfile != "native") {
+      if (result.exited) {
+        recordingActive = false;
+        result.recording = {{"profile", recordingProfile}, {"available", false}, {"reason", "process-exited"}};
+      } else {
+        GdbError recordingError;
+        (void)recordingSnapshot(result.recording, recordingError);
+        if (!live.load()) { e = std::move(recordingError); return false; }
+      }
+    }
     result.raw = {{"reason", result.reason}, {"stack", result.stack}, {"location", result.location}};
     result.raw["exited"] = result.exited;
     if (result.exitCode) result.raw["exitCode"] = *result.exitCode;
@@ -1626,6 +1778,19 @@ struct GdbEngine::Impl {
   }
 
   bool finishExecutionStop(const MiRecord& stopped, GdbStop& result, GdbError& error) {
+    // GDB may reject an instruction or a memory-recording operation using
+    // diagnostics followed by *stopped,signal-name="0" rather than ^error.
+    // Signal zero is not an inferior signal. Preserve its verified stop but
+    // do not report a successfully completed source/instruction operation.
+    if (recordingActive && error.code.empty() &&
+        valText(field(stopped.fields, "reason")) == "signal-received" &&
+        valText(field(stopped.fields, "signal-name")) == "0") {
+      const bool unsupported = recordingDiagnostics.find("does not support") != std::string::npos ||
+                               recordingDiagnostics.find("not supported") != std::string::npos;
+      error = {unsupported ? "UNSUPPORTED" : "READ_FAILED",
+               "record-full could not record the next instruction" +
+                   (recordingDiagnostics.empty() ? std::string{} : ": " + displayUtf8(recordingDiagnostics)), false};
+    }
     const bool incompleteStep = error.code == "STEP_TIMEOUT";
     const bool inputCandidate = error.code == "INPUT_CHECK" || incompleteStep;
     // Single-stepping a blocking syscall may acknowledge our interrupt as an
@@ -1677,6 +1842,7 @@ struct GdbEngine::Impl {
     // behavior instead of only configuring the debugged program.
     po.environment.emplace_back("SHELL", "/bin/sh");
     po.environment.emplace_back("DEBUGINFOD_URLS", "");
+    if (request.recordingProfile == "gdb-record-full") po.environment.emplace_back("LC_ALL", "C");
     // MI belongs to an unbounded-duration conversation. Retaining already
     // consumed replies would eventually kill a healthy debugging session.
     // Process bounds each poll; command() bounds individual MI records.
@@ -1694,6 +1860,13 @@ struct GdbEngine::Impl {
         !setup("-gdb-set startup-with-shell on") || !setup("-gdb-set print pretty off") ||
         !setup("-gdb-set print elements 128") ||
         !setup("-interpreter-exec console " + miQuote("set inferior-tty " + ptyPath.string()))) return false;
+    if (request.recordingProfile == "gdb-record-full" &&
+        (!setup("-interpreter-exec console \"unset environment LC_ALL\"") ||
+         !setup("-gdb-set mi-async off") || !setup("-gdb-set non-stop off") ||
+         !setup("-interpreter-exec console \"set record full stop-at-limit off\"") ||
+         !setup("-interpreter-exec console \"set record full memory-query on\"") ||
+         !setup("-interpreter-exec console " + miQuote("set record full insn-number-max " +
+              std::to_string(request.maxRecordedInstructions))))) return false;
     // GDB runs exec-wrapper through its startup shell; quote both trusted
     // paths. Target environment is a private NUL-delimited file consumed by
     // the helper immediately before exec, so LD_*/BASH_ENV never affect GDB,
@@ -1715,6 +1888,17 @@ GdbEngine::~GdbEngine() { stop(); }
 bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbError& error,
                        std::stop_token cancellation) {
   stop();
+  result = {};
+  error = {};
+  if (request.recordingProfile != "native" && request.recordingProfile != "gdb-record-full") {
+    error = {"UNSUPPORTED", "unknown recording profile", false}; return false;
+  }
+  if (request.recordingProfile == "gdb-record-full" &&
+      (!request.stopAtEntry || !request.closeInputAfterWrite ||
+       request.maxRecordedInstructions == 0 || request.maxRecordedInstructions > 1000000)) {
+    error = {"INVALID_REQUEST", "record-full requires entry stop, finite initial stdin and a 1..1000000 instruction limit", false};
+    return false;
+  }
   impl_->launchCancellation = cancellation;
   struct ResetCancellation {
     std::stop_token& token;
@@ -1741,6 +1925,9 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   impl_->latestStop = {};
   impl_->registerNames.clear();
   impl_->traceActive = false;
+  impl_->recordingProfile = request.recordingProfile;
+  impl_->maxRecordedInstructions = request.maxRecordedInstructions;
+  impl_->recordingActive = false;
   impl_->sourceBundle = request.sourceBundle;
   if (!impl_->prepareTemp(request, error)) return false;
   if (!impl_->startGdb(request, error)) { stop(); return false; }
@@ -1750,6 +1937,23 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   }
   MiRecord stopped;
   if (!impl_->command("-exec-run", true, stopped, error)) { stop(); return false; }
+  if (request.recordingProfile == "gdb-record-full") {
+    if (impl_->inferiorPidFd < 0) {
+      error = {"LAUNCH_FAILED", "record-full requires pidfd support for reliable inferior interruption", false};
+      stop(); return false;
+    }
+    MiRecord started;
+    if (!impl_->command("-interpreter-exec console \"record full\"", false, started, error)) {
+      error.code = "LAUNCH_FAILED";
+      stop(); return false;
+    }
+    impl_->recordingActive = true;
+    nlohmann::json status;
+    if (!impl_->recordingSnapshot(status, error) || !status.value("available", false)) {
+      if (error.code.empty()) error = {"LAUNCH_FAILED", "record-full did not become active", false};
+      stop(); return false;
+    }
+  }
   if (!impl_->makeStop(stopped, result, error)) { stop(); return false; }
   result.processInstanceId = impl_->inferiorPid.empty() ? std::to_string(impl_->process->pid()) : impl_->inferiorPid;
   return true;
@@ -1758,6 +1962,9 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
 bool GdbEngine::appendInput(std::string_view id, std::string_view text,
                             nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  if (impl_->recordingProfile != "native") {
+    error = {"UNSUPPORTED", "record-full uses immutable finite initial stdin", false}; return false;
+  }
   if (id.empty()) { error = {"INVALID_REQUEST", "input id must not be empty", false}; return false; }
   std::lock_guard inputLock(impl_->inputMutex);
   if (!impl_->live.load() || impl_->control.load() >= 2) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
@@ -1795,6 +2002,9 @@ bool GdbEngine::appendInput(std::string_view id, std::string_view text,
 
 bool GdbEngine::closeInput(nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
+  if (impl_->recordingProfile != "native") {
+    error = {"UNSUPPORTED", "record-full uses immutable finite initial stdin", false}; return false;
+  }
   std::lock_guard inputLock(impl_->inputMutex);
   if (!impl_->live.load() || impl_->control.load() >= 2) { error = {"STALE_CONTEXT", "no live inferior", false}; return false; }
   impl_->closeInputAfterWrite = true;
@@ -1804,6 +2014,7 @@ bool GdbEngine::closeInput(nlohmann::json& result, GdbError& error) {
 }
 
 bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& error) {
+  result = {};
   if (!live()) { error = {"INVALID_REQUEST", "no live inferior", false}; return false; }
   const int preempt = impl_->control.exchange(0);
   std::string cmd;
@@ -1832,6 +2043,15 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
     // An unsupported finish (for example an inline frame) rejects before
     // running. Keep the waiting context usable for retry or Continue.
     if (recoverInputStep && impl_->live.load()) impl_->inputWaitActive = true;
+    if (impl_->recordingActive && live()) {
+      const auto executionError = error;
+      GdbError recoveryError;
+      if (impl_->verifiedStoppedRecord(stopped, "recording-error", recoveryError) &&
+          impl_->makeStop(stopped, result, recoveryError)) {
+        result.processInstanceId = impl_->inferiorPid;
+        error = executionError;
+      } else if (!live()) error = recoveryError;
+    }
     return false;
   }
   if (recoverInputStep && stepKind != "out" && error.code.empty()) {
@@ -1849,6 +2069,104 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
   }
   if (!impl_->settleInputInterrupt(stopped, error)) return false;
   return impl_->finishExecutionStop(stopped, result, error);
+}
+
+bool GdbEngine::readRecording(nlohmann::json& result, GdbError& error) {
+  if (!live()) { error = {"STALE_CONTEXT", "no live debugger", false}; return false; }
+  error = {};
+  return impl_->recordingSnapshot(result, error);
+}
+
+bool GdbEngine::reverseInstruction(GdbStop& result, GdbError& error) {
+  result = {};
+  impl_->traceActive = true;
+  struct Reset { bool& flag; ~Reset() { flag = false; } } reset{impl_->traceActive};
+  nlohmann::json status;
+  if (!readRecording(status, error)) return false;
+  if (!status.value("available", false)) {
+    error = {"UNSUPPORTED", "reverse instruction requires an active record-full profile", false}; return false;
+  }
+  const auto current = parseUnsigned(status.at("currentInstruction").get<std::string>());
+  const auto earliest = parseUnsigned(status.at("earliestSeekableInstruction").get<std::string>());
+  if (*current <= *earliest) {
+    error = {"INVALID_REQUEST", "already at the earliest retained instruction boundary", false}; return false;
+  }
+  const int control = impl_->control.exchange(0);
+  if (control >= 2) {
+    impl_->traceActive = false;
+    result = stopAndSnapshot();
+    error = {"CANCELLED", "reverse instruction stopped", true}; return false;
+  }
+  MiRecord stopped;
+  if (control == 1) {
+    if (impl_->verifiedStoppedRecord(stopped, "interrupted", error) && impl_->makeStop(stopped, result, error))
+      result.processInstanceId = impl_->inferiorPid;
+    if (error.code.empty()) error = {"CANCELLED", "reverse instruction interrupted before execution", true};
+    return false;
+  }
+  const bool executed = impl_->command("-exec-step-instruction --reverse", true, stopped, error);
+  if (!executed) {
+    if (!live()) return false;
+    const auto executionError = error;
+    GdbError recoveryError;
+    if (impl_->verifiedStoppedRecord(stopped, "recording-error", recoveryError) &&
+        impl_->makeStop(stopped, result, recoveryError)) result.processInstanceId = impl_->inferiorPid;
+    error = !live() ? recoveryError : executionError;
+    return false;
+  }
+  impl_->inputWaitActive = false;
+  return impl_->finishExecutionStop(stopped, result, error);
+}
+
+bool GdbEngine::seekRecording(std::uint64_t instruction, GdbStop& result, GdbError& error) {
+  result = {};
+  impl_->traceActive = true;
+  struct Reset { bool& flag; ~Reset() { flag = false; } } reset{impl_->traceActive};
+  nlohmann::json status;
+  if (!readRecording(status, error)) return false;
+  if (!status.value("available", false)) {
+    error = {"UNSUPPORTED", "record seek requires an active record-full profile", false}; return false;
+  }
+  const auto earliest = parseUnsigned(status.at("earliestSeekableInstruction").get<std::string>());
+  const auto last = parseUnsigned(status.at("lastInstruction").get<std::string>());
+  if (instruction < *earliest || instruction > *last) {
+    error = {"INVALID_REQUEST", "instruction boundary is outside the retained recording", false}; return false;
+  }
+  const int control = impl_->control.exchange(0);
+  if (control >= 2) {
+    impl_->traceActive = false;
+    result = stopAndSnapshot();
+    error = {"CANCELLED", "record seek stopped", true}; return false;
+  }
+  MiRecord response;
+  if (control == 1) {
+    if (impl_->verifiedStoppedRecord(response, "interrupted", error) && impl_->makeStop(response, result, error))
+      result.processInstanceId = impl_->inferiorPid;
+    if (error.code.empty()) error = {"CANCELLED", "record seek interrupted before execution", true};
+    return false;
+  }
+  // GDB rejects `record goto` at the existing cursor as "Already at target
+  // insn", including an empty log. Treat the verified no-op as successful.
+  const bool unchanged = status.at("currentInstruction") == std::to_string(instruction);
+  const bool moved = unchanged || impl_->command("-interpreter-exec console " +
+      miQuote("record goto " + std::to_string(instruction)), false, response, error);
+  if (!live()) return false;
+  const auto executionError = error;
+  GdbError recoveryError;
+  MiRecord stopped;
+  if (!impl_->verifiedStoppedRecord(stopped, moved ? "recording-seek" : "recording-error", recoveryError) ||
+      !impl_->makeStop(stopped, result, recoveryError)) {
+    error = recoveryError;
+    return false;
+  }
+  result.processInstanceId = impl_->inferiorPid;
+  impl_->inputWaitActive = false;
+  if (!moved) { error = executionError; return false; }
+  if (!result.recording.value("available", false) ||
+      result.recording.value("currentInstruction", "") != std::to_string(instruction)) {
+    error = {"READ_FAILED", "record seek did not reach the requested instruction boundary", true}; return false;
+  }
+  return true;
 }
 
 bool GdbEngine::pause(GdbStop& result, GdbError& error) {
@@ -2227,6 +2545,11 @@ bool GdbEngine::traceInstructions(std::size_t count,
     if (!impl_->command("-exec-step-instruction", true, stopped, executionError)) {
       trace["status"] = "failed";
       trace["terminationReason"] = executionError.code;
+      if (impl_->recordingActive && live()) {
+        GdbError recoveryError;
+        if (impl_->verifiedStoppedRecord(stopped, "recording-error", recoveryError)) lastStop = stopped;
+        else if (!live()) executionError = recoveryError;
+      }
       break;
     }
     const bool externallyInterrupted = impl_->lastExecutionInterrupted;
@@ -2284,6 +2607,10 @@ bool GdbEngine::traceInstructions(std::size_t count,
   const bool finished = impl_->finishExecutionStop(lastStop, finalStop, error);
   if (error.code == "INPUT_WAIT") trace["terminationReason"] = "input-wait";
   else if (error.code == "STEP_TIMEOUT") trace["terminationReason"] = "timeout";
+  else if (impl_->recordingActive && !finished && !error.code.empty()) {
+    trace["status"] = "failed";
+    trace["terminationReason"] = error.code;
+  }
   if (!finished && trace["status"] == "complete") {
     trace["status"] = "failed";
     trace["terminationReason"] = error.code;

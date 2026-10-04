@@ -214,16 +214,17 @@ and `StopObservationDTO.memoryMap:MemoryMapSnapshotDTO`, carrying availability,
 `source:'linux-proc-maps'`, `coverage:'complete'|'truncated'` and region
 metadata. This does not change `observation.coverage.memory` to captured:
 mapping metadata contains no memory bytes. The existing bounded `readMemory`
-command retains its `expectedStop` requirement. Runtime-module/vtable overlays,
-a durable output-effect journal, full replay recording and intervention
-gateways remain future work as described below.
+command retains its `expectedStop` requirement. Runtime ELF indexing, a bounded
+session output journal and opt-in GDB recording are implemented in the extension
+below. Automatic vtable overlays, durable recorder storage, verified replay of
+arbitrary observations and intervention gateways remain future work.
 
 | Gateway | Proposed data and invariants | Dependencies |
 | --- | --- | --- |
 | Virtual address space | Implemented maps, immutable explicit byte captures and paged map/capture differences; a future `MemoryReadPage` may expose broader partial islands. | Retention/coverage remain bounded. Full-process byte capture is not implied by a complete mapping list. |
-| Modules and C++ layout | `ModuleImage`: build-id, artifact hash, ELF kind/load bias/segments/sections. `MemoryOverlay`: region/module/object generation, extent, symbol/type/ABI, evidence; vtable address points, vptr, RTTI/VTT and inheritance relationships are optional typed overlays. | Main-artifact ELF headers are implemented; runtime module indexing, ELF sections/DWARF and ABI adapters remain. P2 is required for confirmed lifetime. |
-| OS diagnostics | Current `inspectProcess` exposes procfs, descriptors, smaps_rollup, kernel and personality evidence; broader `RuntimeEnvironment` adds debugger/library identities and recorder probes. | Per-section evidence rather than a distro assumption. Full smaps and physical-page indexing remain outside the current collector. |
-| Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ buffer probes first; journal persists separately from history eviction. Recorder effects need a replay policy before reverse execution is enabled. |
+| Modules and C++ layout | `ModuleImage`: build-id, artifact hash, ELF kind/load bias/segments/sections. `MemoryOverlay`: region/module/object generation, extent, symbol/type/ABI, evidence; vtable address points, vptr, RTTI/VTT and inheritance relationships are optional typed overlays. | Main-artifact ELF headers and runtime module indexing are implemented; ELF sections/DWARF and ABI adapters remain. P2 is required for confirmed lifetime. |
+| OS diagnostics | Current `inspectProcess` exposes procfs, descriptors, smaps_rollup, kernel and personality evidence; broader `RuntimeEnvironment` adds debugger/library identities and recorder probes. | The isolated scalar recorder probe is implemented. Per-section evidence rather than a distro assumption. Full smaps and physical-page indexing remain outside the current collector. |
+| Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
 | Runtime intervention | `InterventionRecord`: request/branch/expected stop, mechanism, requested edits, actual effects, cleanup status and resulting context. Execution requires an explicitly selected supported intervention profile. | P5 audit/branch foundations, ABI implementation, recorder compatibility and rollback/partial-failure tests. |
@@ -311,3 +312,36 @@ gateways are implemented. Next come a recorder/replay prototype, runtime
 ELF/vtable overlays and then runtime interventions. Probe
 Ubuntu versions through OS/ABI/capability evidence; a distro label alone does
 not establish support.
+
+
+## 2026-10-04: output journal, module snapshots and recorder gateways
+
+Runtime extensions live in `src/backend-runtime-contract.ts`, re-exported by
+`src/backend-contract.ts`. `inspectModules` requires the current session and
+`expectedStop`; `readModuleSnapshot` reads a retained immutable module snapshot
+without moving the process. Snapshot evidence explicitly belongs to current OS
+state. Module identity uses checked file metadata, not a claim of whole-file
+content hashing or C++ object lifetime.
+
+`readOutputJournal` reads exact bytes and explicit missing intervals in bounded
+pages. An optional history point identifies the selected output prefix; a
+missing proven prefix is null. Already delivered output never shrinks with
+history selection or reverse execution. See
+[`INSPECTION_GATEWAYS.md`](../../docs/INSPECTION_GATEWAYS.md) for limits.
+
+`probeRecorders` runs the shipped scalar fixture in separate owned processes.
+It supports cancellation, has no caller-selected executable paths and does not
+mutate the live session. Successful fixture replay is evidence for that fixture,
+not a promise of arbitrary program support. See
+[`RECORDING.md`](../../docs/RECORDING.md) for profiles and external-effect limits.
+
+
+Opt-in `launch.recordingProfile:gdb-record-full` adds live `readRecording`,
+`reverseInstruction` and `seekRecording`. These commands require `expectedStop`;
+seek positions are canonical unsigned 64-bit decimal strings, unrelated to
+history ordinals. Execution emits accepted/observation/state/commandFinished.
+Failed movement preserves a verified current stop; invalid bounds leave the
+prior observation unchanged. Retained history never mutates. Profile, finite
+input and instruction budget participate in the run fingerprint. Native stdin
+and stepping remain the default. The complete contract and limitations are in
+[`RECORDING.md`](../../docs/RECORDING.md).

@@ -4,7 +4,7 @@
 
 Основной backend: **отдельный процесс на Linux, C++20**, Clang/clangd, адаптер rr/GDB; нативный LLDB — дополнительный адаптер macOS. Существующие React/TypeScript, Electron и Three.js можно использовать выборочно: backend не зависит от текущей реализации интерфейса. Разработка интерфейса на Mac не требует переезда всей рабочей системы на Linux. Развёртывание описывает [`docs/LINUX_BACKEND.md` в ветке `backend/linux`](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md), состояние service и команды сборки — [`backend/README.md` в той же ветке](https://github.com/Tigersmechom/Phantom/blob/backend/linux/backend/README.md). Эти файлы доступны локально после checkout `backend/linux`; в `main` их может не быть. Текущий GDB engine не означает готовность recorder rr или подключение UI.
 
-Версия существующих DTO: **1**, [`src/backend-contract.ts`](../src/backend-contract.ts). Это **контракт будущей интеграции**, а не уже подключённый backend или новый доступный `window` API. Разделы 3–8 сохраняют точные инварианты v1; последующие разделы определяют программу и предлагаемые расширения. Пока изменение не внесено в DTO, runtime-валидаторы и fixtures, оно не является новым wire API. Использовать совместимую часть v1 независимо; необходимые общие изменения выносить отдельным patch с причиной, продолжая работу без ожидания необязательного подтверждения.
+Версия существующих DTO: **1**, [`src/backend-contract.ts`](../src/backend-contract.ts), расширенные runtime-типы — [`src/backend-runtime-contract.ts`](../src/backend-runtime-contract.ts). Контракт используется самостоятельным Linux NDJSON backend; подключение основного приложения и новый `window` API остаются отдельной интеграцией. Разделы 3–8 сохраняют точные инварианты v1; последующие разделы определяют программу и предлагаемые расширения. Пока изменение не внесено в DTO, runtime-валидаторы и fixtures, оно не является новым wire API. Использовать совместимую часть v1 независимо; необходимые общие изменения выносить отдельным patch с причиной, продолжая работу без ожидания необязательного подтверждения.
 
 ## Порядок работы — кратко
 
@@ -28,8 +28,13 @@
 
 Уточнение **04.10.2026**: реализованы собственный буфер `cout` после
 `sync_with_stdio(false)` в проверенном libstdc++ профиле, единый вывод и шлюз
-карты виртуальной памяти. Далее — проверяемый профиль адресов, запись изменений внутри шага и расширенные
-вмешательства. Подробный порядок, зависимости и приёмка — [§20](#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
+карты виртуальной памяти, ELF/ASLR-профиль, procfs diagnostics, регистры,
+memory captures/diff и ограниченная запись изменений между инструкциями.
+Реализованы журнал фактического вывода, снимки runtime ELF modules
+и изолированная проверка recorder. Отдельный ограниченный `gdb-record-full`
+профиль подключён к публичному service. Пакет прошёл 26/26 CTest в Debug и
+ASan/UBSan, проверку 819 реальных DTO и прежние проверки harness.
+Подробный порядок, зависимости и приёмка — [§20](#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
 ## 1. Что уже работает
 
@@ -62,6 +67,16 @@ Frontend целиком переносить не требуется; адапт
 [backend/README.md](../backend/README.md) и
 [frontend-compatibility.md](../backend/docs/frontend-compatibility.md).
 Этот checkpoint не означает завершение всей программы P0–P10 ниже.
+
+Новый пакет backend-шлюзов добавляет `readOutputJournal`,
+`inspectModules`/`readModuleSnapshot` и `probeRecorders`. Журнал сохраняет
+фактические bytes stdout/stderr отдельно от pending-буферов; modules связывает
+файловые mappings с проверенной ELF metadata и PT_LOAD load bias; probe
+проверяет настоящий record/replay служебного fixture без изменения live-сессии.
+Отдельный `gdb-record-full` профиль подключён к service и wire-контракту;
+полный прогон пакета: 26/26 CTest в Debug и ASan/UBSan, 819 реальных
+сообщений по TypeScript DTO, пять harness checks и четыре contract fixtures.
+Границы записи и примеры запросов: [RECORDING.md](RECORDING.md).
 
 Обновление **28 сентября 2026**: native engine распознаёт блокирующий stdin,
 сохраняет `waitingForInput` и возобновляет source-step после новой порции данных.
@@ -667,21 +682,31 @@ node_modules/готовые app/Unreal/recordings с пользовательс�
 ## 20. Дополнение 04.10.2026: память, вывод и расширенный GDB
 
 Это дополнение сохраняет P0–P10 и уточняет backend-шлюзы для frontend-агента.
-Все перечисленные ниже будущие DTO — предложения до синхронного изменения
-контракта, валидаторов, fixtures и capability. Статус текущего среза:
-несинхронизированный `cout` (Linux x86_64 / libstdc++), карта mappings и единый вывод **реализованы**.
-Следующий backend-срез добавляет проверяемый ELF/ASLR профиль, procfs diagnostics,
-регистры, сохраняемые memory captures/diff, map diff и ограниченную запись
-изменений на границах инструкций. Подробные принятые запросы и их ограничения —
-в [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md). rr/`record full`, verified
-rollback, автоматические vtable overlays и runtime injection остаются в плане.
+Будущие DTO остаются предложениями до синхронного изменения контракта,
+валидаторов, fixtures и capability. Несинхронизированный `cout`
+(Linux x86_64 / libstdc++), карта mappings, единый вывод, ELF/ASLR-профиль,
+procfs diagnostics, регистры, сохраняемые memory captures/diff, map diff и
+ограниченная запись изменений на границах инструкций **реализованы**.
+Новый пакет добавляет журнал вывода, runtime ELF modules и recorder probe;
+полная регрессия проходит. `gdb-record-full` подключён
+отдельным профилем с конечным stdin и ограниченным журналом инструкций.
+Подробные запросы и пределы — [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md)
+и [RECORDING.md](RECORDING.md). rr для пользовательских запусков, persistent
+checkpoints/verified rollback, автоматические vtable overlays и runtime
+injection остаются в плане.
 Assertions по согласованию с пользователем остаются на будущее.
 
 Проверки предшествующего output/maps-среза: 13/13 CTest Debug и 13/13 ASan; проверки frontend
 digest/controls, input races, output rendering, live HTTP→GDB и smoke lifecycle.
-Текущий inspection-срез: 18/18 зарегистрированных CTest прошли в Debug и ASan/UBSan;
+Предыдущий зафиксированный inspection-срез: 18/18 зарегистрированных CTest прошли в Debug и ASan/UBSan;
 477 реальных protocol frames проверены по TypeScript DTO, прежние пять harness checks
 и четыре contract fixture checks также проходят. Детали — [INSPECTION_GATEWAYS.md](./INSPECTION_GATEWAYS.md).
+Новый output/modules/recorder-пакет: **26/26 CTest Debug и 26/26 ASan/UBSan**,
+**819 реальных protocol frames** проверены по обоим TypeScript DTO-файлам.
+Пять harness checks и четыре contract fixture checks также проходят.
+Новые сценарии проверяют точные binary stdout/stderr и gaps, dlopen/dlclose/BSS,
+изоляцию и отмену probe, reverse/seek/eviction, недоступную инструкцию/munmap,
+таймаут шага, неизменяемую историю, неизвестную границу вывода и native regression.
 
 Memory gateway проходит реальную цепочку object→vptr→read-only vtable→code,
 `mmap`/`mprotect`/`munmap` и проверку неизменности истории. Это подтверждает
@@ -690,6 +715,16 @@ ABI подтверждён на установленной libstdc++13, не о�
 
 ### 20.1. `cout` и единое поле вывода — первый срез
 
+- Реализован `readOutputJournal`: append-only журнал фактически доставленных
+  stdout/stderr bytes с bounded retention, явными gaps и пагинацией. В
+  observation сохраняется `outputCursor`; выбор старой точки не удаляет
+  доставленный позднее вывод и не дописывает старые bytes повторно. Это
+  отдельный backend-шлюз; существующий renderer не объявляется его адаптером.
+  Для произвольной recording boundary без наблюдавшегося output prefix
+  `outputCursor.source` равен `unknown`, оба счётчика — `null`. Уже наблюдавшийся
+  prefix возвращается с `source:"recording-checkpoint"`; он не заменяется
+  полным нынешним stdout. `selectedThroughByte:null` означает неизвестную
+  границу, а не нулевой или полный вывод.
 - Чтение остановленного процесса без вызова `flush`, `rdbuf()` или других
   функций inferior. Для известных libstdc++ ABI читать собственный put-area
   `cout`; для glibc сохранять отдельное наблюдение C `stdout`. При неизвестной
@@ -736,8 +771,17 @@ ABI подтверждён на установленной libstdc++13, не о�
   Исторические bytes выдавать только из capture: нынешняя память не заполняет
   пробелы прошлого. Shared mappings могут меняться внешним процессом даже
   при остановленном inferior — покрытие согласованности должно это отражать.
-- Следующий слой связывает VMA с ELF load segments/sections, module build-id,
-  load bias, symbols/DWARF, затем с allocations/objects. Vtable/RTTI/VTT и
+- Реализованы `inspectModules` и `readModuleSnapshot`: неизменяемый bounded
+  снимок файловых mappings, device/inode identity, ELF headers/build-id,
+  PT_LOAD load bias/segments и фактические пересечения с VMA. Чтение идёт через
+  закреплённый descriptor с проверкой identity; путь сам по себе не считается
+  доказательством. Несколько load instances, denied/deleted/changed files,
+  gaps и truncation представлены явно. Anonymous BSS intersection показывает
+  покрытие адресов, а не владельца C++ allocation. Snapshot помечен
+  `evidenceScope:"current-os-state"`: `/proc` не превращается в исторический
+  kernel snapshot после обратного шага GDB.
+- Следующий слой добавляет ELF sections, symbols/DWARF и связь с
+  allocations/objects. Vtable/RTTI/VTT и
   vptr — отдельные ABI-aware overlays; vtable не обязана лежать в `.rodata`
   (возможна relocatable/RELRO data). Указатель объекта может указывать на
   address point внутри таблицы, а multiple/virtual inheritance требует
@@ -803,6 +847,31 @@ memory ranges между границами. До 256 попыток/8 диап�
 потоков не записывается. Это forward trace; replay и восстановление исходной
 позиции этим запросом не выполняются.
 
+Реализован отдельный `probeRecorders`: реальный record/replay служебного scalar
+fixture, точная проверка значения и PC, bounded время/вывод/временный trace и
+отмена изолированной группы процессов. Live-сессия не меняется; запрос не
+принимает пути запускаемых программ. На текущем runner GDB 15.1 проходит
+scalar round trip, rr 5.9.0 отказывает при `perf_event_paranoid=4`; настройки
+ядра не меняются. Обычный `cout` под GDB software recording достигал
+неподдерживаемой AVX-инструкции в glibc, поэтому успешный fixture не является
+гарантией записи всего приложения.
+
+Подключены `recordingProfile:"gdb-record-full"`, `readRecording`,
+`reverseInstruction` и `seekRecording` к service/контракту; полная регрессия
+пакета проходит в Debug и ASan/UBSan. `capabilities.recordingProfiles` объявляет поддержку явного
+профиля, а не возможность записать любые инструкции любого приложения.
+Профиль требует entry stop, конечный initial stdin и успешно открытый pidfd
+принадлежащего inferior для надёжного ограничения остановки; при отсутствии
+pidfd launch завершается `LAUNCH_FAILED`. Журнал по умолчанию хранит до 200 000
+инструкций, hard limit — 1 000 000; заполнение вытесняет старые записи.
+Профиль различает instruction cursor и
+observation history, сохраняет границы eviction и не обещает откат внешних
+эффектов или текущих `/proc` данных. Observation содержит
+`osEvidenceScope:"current-process"`, process/module inspection —
+`evidenceScope:"current-os-state"`. `restore:"none"` сохраняется: произвольный
+сохранённый observation не становится checkpoint. Детали:
+[RECORDING.md](RECORDING.md).
+
 - Два снимка показывают только разность границ: `x=1; x=2; x=0;` может вообще
   не изменить итоговый `x`. Полная история требует записи **до** этого
   интервала: rr replay с instruction/watchpoint queries, ограниченный
@@ -848,6 +917,13 @@ memory ranges между границами. До 256 попыток/8 диап�
 
 ### 20.6. Поставленные шлюзы для frontend-агента
 
+- `readOutputJournal`: retained committed stdout/stderr, bytes/cursor/gaps;
+  pending-буферы остаются отдельными наблюдениями и не заменяют external effects.
+- `inspectModules` / `readModuleSnapshot`: ELF metadata, проверенная identity,
+  load instances и immutable snapshot текущей ОС. Это база overlays для
+  **2D-карты**, без автоматической классификации vtable/RTTI/objects.
+- `probeRecorders`: проверка служебного fixture до launch или рядом с живой
+  сессией; настоящее доказательство записи/повтора или явная причина отказа.
 - `inspectProcess`: ограниченные `stat`/`status`/`personality`, exe/fd targets,
   `smaps_rollup`, kernel/page size; proc directory закреплён descriptor,
   start time проверяется до/после чтения, недоступные секции не скрываются.
@@ -862,14 +938,16 @@ memory ranges между границами. До 256 попыток/8 диап�
   значений на instruction boundaries. Capture/trace store ограничен 128 records
   и 16 MiB по умолчанию; eviction возвращает `HISTORY_EVICTED`.
 
-Живые запросы требуют `expectedStop`; исторические запросы не читают нынешний
-процесс. Адреса — hex strings, byte counts — bytes. Нового frontend renderer
+Чтения живого процесса требуют `expectedStop`; исторические запросы не читают
+нынешний процесс. `probeRecorders` не требует live-сессии или stop token.
+Адреса — hex strings, byte counts — bytes. Нового frontend renderer
 этот этап не включает. Контракт, примеры и точные пределы:
 [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
 
-Следующий порядок: **recorder/replay prototype 20.4 → runtime ELF/vtable/object
-overlays 20.2 → вмешательства 20.5**. Ограниченный instruction trace не заменяет
-recorder, а metadata основного ELF ещё не являются индексом загруженных modules.
+Следующий порядок: **завершение record-full регрессий 20.4 →
+symbols/DWARF и vtable/object overlays 20.2 → вмешательства 20.5**. Ограниченный
+instruction trace не заменяет recorder; runtime module metadata не доказывает
+семантическую принадлежность vtable или начало lifetime объекта.
 Каждый срез завершается обновлением DTO/fixtures, headless интеграционными
 тестами и описанием для frontend; продвинутые experiments не блокируют
 текущие cin/stepping/history. Этот порядок не объявляет P2/P4/P6 завершёнными.

@@ -273,18 +273,37 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
-  if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess") { only({"kind"}); return; }
+  if (kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
   if (kind == "build") { only({"kind","source","configuration","architecture"}); source_bundle(req(c,"source","command"),l); config(req(c,"configuration","command"),l); enum_string(req(c,"architecture","command"),"command.architecture",{"arm64","x86_64"}); return; }
   if (kind == "launch") {
-    only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy"});
+    only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy","recordingProfile","maxRecordedInstructions"});
     if(has(c,"addressPolicy")) enum_string(c["addressPolicy"],"command.addressPolicy",{"native","disable-aslr","require-fixed"}); id(req(c,"buildId","command"),"command.buildId",l); submitted(req(c,"input","command"),l);
+    if(has(c,"recordingProfile")) enum_string(c["recordingProfile"],"command.recordingProfile",{"native","gdb-record-full"});
+    const bool recorded = c.value("recordingProfile","native") == "gdb-record-full";
+    if(has(c,"maxRecordedInstructions")) {
+      if(!recorded) invalid("command.maxRecordedInstructions","requires gdb-record-full profile");
+      positive_uint(c["maxRecordedInstructions"],"command.maxRecordedInstructions",1000000);
+    }
+    if(recorded && !c.at("input").at("closeAfterWrite").get<bool>())
+      invalid("command.input.closeAfterWrite","record-full requires finite initial input");
     const auto& argv=req(c,"argv","command"); array_limit(argv,"command.argv",l.maxArguments); for(const auto& x: argv) { string_value(x,"command.argv",l.maxArgumentBytes,false); if(!mi_argument_safe(x.get<std::string>())) invalid("command.argv","arguments must not contain NUL or line breaks"); }
     const auto& env=req(c,"environment","command"); expect_object(env,"command.environment"); if(env.size()>l.maxArguments) limit("command.environment","too many variables"); std::size_t total=0;
     for(auto it=env.begin();it!=env.end();++it){ string_value(Json(it.key()),"command.environment.key",l.maxArgumentBytes); if(!environment_name(it.key())) invalid("command.environment.key","must be a POSIX environment name"); string_value(it.value(),"command.environment",l.maxArgumentBytes,false); if(it.key().find('\0') != std::string::npos || it.value().get<std::string>().find('\0') != std::string::npos) invalid("command.environment","must not contain NUL"); total += it.key().size()+it.value().get<std::string>().size(); }
-    if(total>l.maxEnvironmentBytes) limit("command.environment","environment exceeds limit"); boolean(req(c,"stopAtEntry","command"),"command.stopAtEntry"); return;
+    if(total>l.maxEnvironmentBytes) limit("command.environment","environment exceeds limit"); boolean(req(c,"stopAtEntry","command"),"command.stopAtEntry");
+    if(recorded && !c.at("stopAtEntry").get<bool>()) invalid("command.stopAtEntry","record-full requires an entry stop");
+    return;
+  }
+  if (kind == "seekRecording") {
+    only({"kind","instruction"}); const auto& instruction=req(c,"instruction","command");
+    string_value(instruction,"command.instruction",20);
+    const auto text=instruction.get<std::string>(); std::uint64_t value=0;
+    const auto parsed=std::from_chars(text.data(),text.data()+text.size(),value);
+    if(parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size() ||
+       (text.size()>1 && text.front()=='0')) invalid("command.instruction","expected canonical uint64 decimal string");
+    return;
   }
   if (kind == "step") { only({"kind","stepKind"}); enum_string(req(c,"stepKind","command"),"command.stepKind",{"over","into","out","instruction"}); return; }
   if (kind == "appendInput") { only({"kind","id","text"}); id(req(c,"id","command"),"command.id",l); string_value(req(c,"text","command"),"command.text",l.maxInputBytes,false); return; }
@@ -297,6 +316,19 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "writeVariable") { only({"kind","locator","expected","value"}); id(req(c,"locator","command"),"command.locator",l); validate_runtime_value(req(c,"expected","command"),l); validate_scalar_value(req(c,"value","command"),l); return; }
   if (kind == "disassemble") { only({"kind","buildId","target","maxInstructions"}); id(req(c,"buildId","command"),"command.buildId",l); const auto& t=req(c,"target","command"); expect_object(t,"command.target"); const auto tk=t.value("kind",""); if(tk=="pc"){exact_keys(t,{"kind","addressHex"},"command.target");string_value(req(t,"addressHex","command.target"),"command.target.addressHex",l.maxIdBytes);} else if(tk=="source"){exact_keys(t,{"kind","range"},"command.target");span(req(t,"range","command.target"),l);} else invalid("command.target.kind","unknown target"); positive_uint(req(c,"maxInstructions","command"),"command.maxInstructions",l.maxInstructions); return; }
   if (kind == "readMemory") { only({"kind","addressHex","byteCount"}); string_value(req(c,"addressHex","command"),"command.addressHex",l.maxIdBytes); positive_uint(req(c,"byteCount","command"),"command.byteCount",l.maxMemoryReadBytes); return; }
+  if (kind == "readModuleSnapshot") { only({"kind","snapshotId"}); id(req(c,"snapshotId","command"),"command.snapshotId",l); return; }
+  if (kind == "readOutputJournal") {
+    only({"kind","stream","fromByte","byteCount","point"});
+    enum_string(req(c,"stream","command"),"command.stream",{"stdout","stderr"});
+    safe_uint(req(c,"fromByte","command"),"command.fromByte");
+    positive_uint(req(c,"byteCount","command"),"command.byteCount",65536);
+    if(has(c,"point")) {
+      const auto& point=c["point"]; exact_keys(point,{"branchId","eventOrdinal"},"command.point");
+      id(req(point,"branchId","command.point"),"command.point.branchId",l);
+      safe_uint(req(point,"eventOrdinal","command.point"),"command.point.eventOrdinal");
+    }
+    return;
+  }
   if (kind == "readRegisters") {
     only({"kind","registers"}); if(has(c,"registers")) register_names(c["registers"]); return;
   }

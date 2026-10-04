@@ -129,6 +129,8 @@ def main():
             assert all(b['verified'] for b in bps['breakpoints']),bps
             client.execute({'kind':'continue'})
             before=client.observation
+            journal=client.good({'kind':'readOutputJournal','stream':'stdout','fromByte':0,'byteCount':64,'point':before['point']})
+            assert base64.b64decode(journal['segments'][0]['bytesBase64'])==b'kept\n',journal
             assert before["stdout"]["text"]=="kept\n",before
             address=variable(before,'cell')['addressHex']; assert address
             ranges=[{'addressHex':address,'byteCount':8}]

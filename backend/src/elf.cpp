@@ -65,24 +65,36 @@ std::uint64_t little(std::string_view bytes, std::size_t offset, unsigned width)
 
 class File {
  public:
-  explicit File(const std::filesystem::path& path, std::size_t maxBytes) {
+  explicit File(const std::filesystem::path& path, std::size_t maxBytes,
+                std::size_t metadataLimit, std::size_t* readCount)
+      : ownsFd_(true), metadataLimit_(metadataLimit), readCount_(readCount) {
     // O_NONBLOCK ensures an accidentally supplied FIFO cannot block this read.
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0)
       throw InspectionError(errno == EACCES || errno == EPERM ? "read-denied" : "file-unavailable",
                             "cannot open ELF artifact");
+    initialize(maxBytes);
+  }
+  explicit File(int fd, std::size_t maxBytes, std::size_t metadataLimit,
+                std::size_t* readCount)
+      : fd_(fd), metadataLimit_(metadataLimit), readCount_(readCount) {
+    initialize(maxBytes);
+  }
+  void initialize(std::size_t maxBytes) {
     struct stat st{};
     if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
-      ::close(fd_); fd_ = -1;
+      if (ownsFd_) ::close(fd_);
+      fd_ = -1;
       fail("not-regular-file", "ELF inspection requires a regular file");
     }
     size_ = static_cast<std::uint64_t>(st.st_size);
     if (size_ > maxBytes) {
-      ::close(fd_); fd_ = -1;
+      if (ownsFd_) ::close(fd_);
+      fd_ = -1;
       fail("file-limit", "ELF artifact exceeds the inspection file-size limit");
     }
   }
-  ~File() { if (fd_ >= 0) ::close(fd_); }
+  ~File() { if (ownsFd_ && fd_ >= 0) ::close(fd_); }
   File(const File&) = delete;
   File& operator=(const File&) = delete;
 
@@ -93,6 +105,8 @@ class File {
 
   std::string read(std::uint64_t offset, std::size_t count) const {
     extent(offset, count);
+    if (count > metadataLimit_ - metadataRead_)
+      fail("metadata-limit", "ELF metadata exceeds the inspection read limit");
     std::string data(count, '\0');
     std::size_t used = 0;
     while (used < count) {
@@ -102,13 +116,19 @@ class File {
       if (got < 0) fail("read-error", "cannot read ELF metadata");
       if (got == 0) fail("truncated", "ELF artifact changed or was truncated during inspection");
       used += static_cast<std::size_t>(got);
+      metadataRead_ += static_cast<std::size_t>(got);
+      if (readCount_) *readCount_ += static_cast<std::size_t>(got);
     }
     return data;
   }
 
  private:
   int fd_ = -1;
+  bool ownsFd_ = false;
   std::uint64_t size_ = 0;
+  std::size_t metadataLimit_ = 0;
+  mutable std::size_t metadataRead_ = 0;
+  std::size_t* readCount_ = nullptr;
 };
 
 std::string elfType(std::uint64_t type) {
@@ -266,15 +286,38 @@ nlohmann::json inspectElf(const std::filesystem::path& path, const ElfInspection
   const ElfInspectionLimits limits{std::min(requested.maxFileBytes, hard.maxFileBytes),
     std::min(requested.maxProgramHeaders, hard.maxProgramHeaders),
     std::min(requested.maxNoteBytes, hard.maxNoteBytes),
-    std::min(requested.maxBuildIdBytes, hard.maxBuildIdBytes)};
+    std::min(requested.maxBuildIdBytes, hard.maxBuildIdBytes),
+    std::min(requested.maxMetadataBytes, hard.maxMetadataBytes)};
   try {
-    const File file(path, limits.maxFileBytes);
+    const File file(path, limits.maxFileBytes, limits.maxMetadataBytes, nullptr);
     return inspect(file, limits);
   } catch (const InspectionError& error) {
     return unavailable(error.reason, error.what());
   }
 #else
   (void)path; (void)requested;
+  return unavailable("unsupported-platform", "ELF artifact inspection currently requires Linux");
+#endif
+}
+
+nlohmann::json inspectElfFd(int fd, const ElfInspectionLimits& requested,
+                           std::size_t* metadataBytesRead) {
+  if (metadataBytesRead) *metadataBytesRead = 0;
+#ifdef __linux__
+  const ElfInspectionLimits hard;
+  const ElfInspectionLimits limits{std::min(requested.maxFileBytes, hard.maxFileBytes),
+    std::min(requested.maxProgramHeaders, hard.maxProgramHeaders),
+    std::min(requested.maxNoteBytes, hard.maxNoteBytes),
+    std::min(requested.maxBuildIdBytes, hard.maxBuildIdBytes),
+    std::min(requested.maxMetadataBytes, hard.maxMetadataBytes)};
+  try {
+    const File file(fd, limits.maxFileBytes, limits.maxMetadataBytes, metadataBytesRead);
+    return inspect(file, limits);
+  } catch (const InspectionError& error) {
+    return unavailable(error.reason, error.what());
+  }
+#else
+  (void)fd; (void)requested;
   return unavailable("unsupported-platform", "ELF artifact inspection currently requires Linux");
 #endif
 }

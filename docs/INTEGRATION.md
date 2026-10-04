@@ -2,7 +2,7 @@
 
 phantom — Electron-приложение: сборка `release/phantom-darwin-arm64/phantom.app`, архив `release/phantom-macOS-arm64.zip`. `Start.command` открывает приложение с текущей папкой проекта. Первый проект `/Users/123/Desktop/my_idle` не изменён.
 
-Для отдельного backend-агента основной документ — **[BACKEND_HANDOFF.md](BACKEND_HANDOFF.md)**: текущие и предложенные API, DTO v1, границы наблюдений, IO/выражения, история, критерии приёмки и работа в отдельной копии с последующим merge. Типы `src/backend-contract.ts` пока являются контрактом будущего адаптера; существующий native bridge не объявлен LLDB-реализацией.
+Для отдельного backend-агента основной документ — **[BACKEND_HANDOFF.md](BACKEND_HANDOFF.md)**: текущие и предложенные API, DTO v1, границы наблюдений, IO/выражения, история, критерии приёмки и работа в отдельной копии с последующим merge. Типы `src/backend-contract.ts` и `src/backend-runtime-contract.ts` используются самостоятельным Linux NDJSON backend; подключение основного renderer требует адаптера. Существующий native bridge не объявлен LLDB-реализацией.
 
 ## Реализованная native-граница
 
@@ -31,9 +31,35 @@ phantom — Electron-приложение: сборка `release/phantom-darwin-
 
 `src/execution-types.ts` задаёт `ExpressionEvent`: готовые операнды, оператор, результат, цель и необязательные диапазоны исходника. Будущий backend передаёт `groups` в наблюдаемом порядке; порядок стадий внутри группы не предполагается. Renderer показывает предоставленный результат и не угадывает порядок вызовов, ассоциативность или вычисление произвольного C++ по тексту.
 
-## Следующий этап: отдельный Linux-бэкенд и адаптеры отладчиков
+## Самостоятельный Linux-бэкенд и подключение renderer
 
-**Актуальное направление:** отдельный Linux-first C++20-бэкенд в ветке `backend/linux`; общие приоритеты, исследования и зависимости описаны в [BACKEND_HANDOFF.md](BACKEND_HANDOFF.md). LLDB остаётся одним из адаптеров (особенно для native macOS), для записи/повтора исследуются rr/GDB, для вычислений и lifetimes — Clang/LLVM-инструментация. Сборка основы и проверка Linux-окружения описаны в [LINUX_BACKEND.md в backend/linux](https://github.com/Tigersmechom/Phantom/blob/backend/linux/docs/LINUX_BACKEND.md). Эта подготовка ещё не подключает реальный отладчик к UI. Codeforces, графы и многопоточность сохранены в поздних этапах.
+**Актуальная реализация:** отдельный Linux-first C++20-бэкенд с GDB/MI в ветке `backend/linux`; общие приоритеты, исследования и зависимости описаны в [BACKEND_HANDOFF.md](BACKEND_HANDOFF.md). Работают build/launch, source/instruction stepping, breakpoints, stack/variables, память/ASM, наблюдения истории, интерактивный stdin и наблюдение pending-буферов stdout/cout. [Диагностический harness](../tools/frontend-harness/README.md) уже использует реальный service; основной Electron renderer подключается отдельно. LLDB остаётся будущим адаптером, особенно для native macOS; Clang/LLVM-инструментация нужна для вычислений и lifetimes. Команды сборки — в [backend/README.md](../backend/README.md), окружение — в [LINUX_BACKEND.md](LINUX_BACKEND.md). Codeforces, графы и многопоточность сохранены в поздних этапах.
+
+Новые шлюзы для frontend-агента:
+
+- `readOutputJournal` возвращает журнал фактически доставленных stdout/stderr bytes с курсором выбранного observation, лимитом хранения и явными gaps. Pending-буферы хранятся отдельно; перемещение по истории не удаляет уже доставленный вывод.
+- `inspectModules` сохраняет immutable snapshot: файловые VMA, проверенная device/inode identity, ELF metadata/build-id, load bias и PT_LOAD intersections. `readModuleSnapshot` читает сохранённые данные. Будущая карта памяти должна быть **2D**; backend предоставляет данные, renderer выбирает их представление. Автоматическое распознавание vtable/RTTI и объектов остаётся следующей работой.
+- `probeRecorders` проверяет настоящий record/replay служебного fixture в изолированных процессах. Он доступен до launch, отменяется обычным `cancel` и не меняет живую сессию. Установленный rr не считается работоспособным без успешной записи/повтора.
+
+Output journal, modules и probe реализованы в новом пакете. Полный прогон:
+26/26 CTest в Debug и ASan/UBSan, 819 реальных protocol frames по TypeScript DTO,
+пять harness checks и четыре contract fixture checks — успешно. В public service подключён opt-in
+`recordingProfile:"gdb-record-full"` с `readRecording`, `reverseInstruction` и
+`seekRecording`. Профиль использует конечный initial stdin и ограниченный
+журнал инструкций; требует успешно открытый pidfd принадлежащего inferior.
+Лимит по умолчанию — 200 000 инструкций, максимум — 1 000 000; старые записи
+вытесняются при заполнении. `capabilities.recordingProfiles` объявляет
+поддержанный профиль запуска, а поддержка отдельных инструкций и syscall
+остаётся target-dependent. Профиль не откатывает внешние эффекты, input
+transport и текущие данные ОС: observation помечен
+`osEvidenceScope:"current-process"`, process/module inspection —
+`evidenceScope:"current-os-state"`. Неизвестный output prefix произвольной
+recording boundary имеет `outputCursor.source:"unknown"` и `null`-счётчики;
+наблюдавшийся prefix повторно используется как `recording-checkpoint`.
+`restore:"none"` сохраняется. rr для пользовательских программ,
+persistent checkpoints и replay-ветви этим этапом не объявляются готовыми.
+Подробные формы запросов и ограничения:
+[INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md), [RECORDING.md](RECORDING.md).
 
 `src/demo.ts` остаётся отдельным источником **демонстрационных** шагов, переменных и истории. Hover ASM также является макетом. Реальная компиляция в Basic не делает эти данные наблюдениями процесса.
 
@@ -41,12 +67,12 @@ phantom — Electron-приложение: сборка `release/phantom-darwin-
 
 При подключении:
 
-1. Разделять живую остановку процесса и просматриваемое наблюдение истории. «Назад» читает запись; `restore` восстанавливает процесс отдельной операцией.
+1. Разделять живую остановку процесса и просматриваемое наблюдение истории. `readHistory` читает запись; `reverseInstruction`/`seekRecording` в поддерживаемом профиле перемещают текущий процесс внутри retained log и создают новые stop tokens. Полный `restoreExecution` остаётся отдельной capability.
 2. Передавать точные 64-битные значения строками. Изменение переменной подтверждать записью в процесс и повторным чтением, а не анимацией.
 3. Привязывать сессию к версии исходника, бинарнику, флагам и архитектуре. ARM64/x86-64 уже выбирают реальную сборку; отладочные данные должны относиться к тому же артефакту.
 4. Получать hover ASM по исходной строке и DWARF line table. Старый API отдаёт инструкции вокруг PC; произвольная строка требует расширения backend. Пустые строки и комментарии могут не иметь инструкций.
-5. Заменить таймер demo подтверждёнными остановками LLDB. Слежение камеры должно получать их идентификаторы, не выводить исполнение из номера строки.
-6. При развитии редактора подключить Monaco/clangd для семантики и навигации; 3D остаётся отдельным представлением текста и токенов.
+5. Заменить таймер demo подтверждёнными остановками backend. Слежение камеры должно получать их идентификаторы, не выводить исполнение из номера строки.
+6. При развитии редактора подключить Monaco/clangd для семантики и навигации; 3D остаётся отдельным представлением текста и токенов, карта виртуальной памяти — 2D.
 
 ### Assertions как точки остановки
 

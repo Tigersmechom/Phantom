@@ -10,6 +10,12 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/service_recording.cpp
+  src/service_probe.cpp
+  src/service_modules.cpp
+  src/recorder_probe.cpp
+  src/module_map.cpp
+  src/output_journal.cpp
   src/elf.cpp
   src/process_inspection.cpp
   src/service_inspection.cpp
@@ -39,7 +45,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_executable(phantom-io-wrapper src/io_wrapper.cpp)
-add_dependencies(phantom-backend phantom-io-wrapper)
+add_executable(phantom-recorder-probe fixtures/recorder-probe.cpp)
+target_compile_options(phantom-recorder-probe PRIVATE -g -O0 -fno-omit-frame-pointer -fno-sanitize=all)
+target_link_options(phantom-recorder-probe PRIVATE -fno-sanitize=all)
+add_dependencies(phantom-backend phantom-io-wrapper phantom-recorder-probe)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(phantom-io-wrapper PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -70,18 +79,33 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-  foreach(module IN ITEMS elf process-inspection)
+  add_library(phantom-module-map-library SHARED fixtures/module-map-library.cpp)
+  target_compile_options(phantom-module-map-library PRIVATE -g -fno-sanitize=all)
+  target_link_options(phantom-module-map-library PRIVATE -fno-sanitize=all)
+  foreach(module IN ITEMS elf process-inspection output-journal recorder-probe module-map)
     string(REPLACE "-" "_" test_file "${module}")
     add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
     target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
-    add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>")
+    if(module STREQUAL "recorder-probe")
+      add_dependencies(phantom-${module}-test phantom-recorder-probe)
+      add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>" "$<TARGET_FILE:phantom-recorder-probe>")
+    elseif(module STREQUAL "module-map")
+      add_dependencies(phantom-${module}-test phantom-module-map-library)
+      target_link_libraries(phantom-${module}-test PRIVATE ${CMAKE_DL_LIBS})
+      add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>" "$<TARGET_FILE:phantom-module-map-library>")
+    else()
+      add_test(NAME ${module} COMMAND "$<TARGET_FILE:phantom-${module}-test>")
+    endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure output_journal recorder_probe recording)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   endforeach()
+  add_test(NAME modules-integration COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/modules_integration.py" "$<TARGET_FILE:phantom-backend>" "$<TARGET_FILE:phantom-module-map-library>")
+  set_tests_properties(modules-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   add_executable(phantom-memory-map-test tests/memory_map_test.cpp)
   target_link_libraries(phantom-memory-map-test PRIVATE phantom-core)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -93,6 +117,16 @@ if(BUILD_TESTING)
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/memory_gateway_integration.py"
       "$<TARGET_FILE:phantom-backend>")
   set_tests_properties(memory-gateway-integration PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  add_executable(phantom-recording-test-fixture fixtures/recording-test.cpp)
+  target_compile_options(phantom-recording-test-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fno-sanitize=all)
+  target_link_options(phantom-recording-test-fixture PRIVATE -fno-sanitize=all)
+  add_executable(phantom-gdb-recording-test tests/gdb_recording_test.cpp)
+  target_link_libraries(phantom-gdb-recording-test PRIVATE phantom-core)
+  add_dependencies(phantom-gdb-recording-test phantom-recording-test-fixture phantom-io-wrapper)
+  add_test(NAME gdb-recording COMMAND "$<TARGET_FILE:phantom-gdb-recording-test>"
+    "$<TARGET_FILE:phantom-recording-test-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/recording-test.cpp")
+  set_tests_properties(gdb-recording PROPERTIES TIMEOUT 90)
   add_executable(phantom-gdb-test-fixture fixtures/gdb-test.cpp)
   target_compile_options(phantom-gdb-test-fixture PRIVATE -g -O0 -fno-omit-frame-pointer)
   # This target is the inferior, not the code under test. LeakSanitizer cannot
@@ -145,7 +179,7 @@ if(BUILD_TESTING)
     add_test(NAME frontend-contract
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_contract_test.py"
         "$<TARGET_FILE:phantom-backend>" --tsc "${PHANTOM_TYPESCRIPT_EXECUTABLE}")
-    set_tests_properties(frontend-contract PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+    set_tests_properties(frontend-contract PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   endif()
   add_test(NAME transport
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/transport_test.py"

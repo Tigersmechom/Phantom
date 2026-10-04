@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "recorderProbe", "recordingProfiles", "recordingCursor",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -112,7 +112,7 @@ def main() -> int:
                 caps["limits"],
                 {"maxOutputBytes", "maxHistoryBytes", "maxResidentSnapshots", "maxVariablesPerPage",
                  "maxStringBytes", "maxMemoryReadBytes", "maxInstructionsPerRequest", "maxTraceInstructions",
-                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes",
+                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions",
                  "commandTimeoutMs", "replayTimeoutMs"},
                 "ResourceLimitsDTO",
             )
@@ -221,7 +221,7 @@ def main() -> int:
             observation = event_frames[0]["payload"]["observation"]
             require_keys(
                 observation,
-                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage", "memoryMap", "executionLayout"},
+                {"id", "point", "stop", "processInstanceId", "buildId", "sourceBundleId", "reason", "location", "threadId", "stack", "input", "stdout", "stderr", "expressions", "coverage", "memoryMap", "executionLayout", "outputCursor", "osEvidenceScope"},
                 "StopObservationDTO",
             )
             layout = observation["executionLayout"]

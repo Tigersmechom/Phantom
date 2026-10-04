@@ -1,3 +1,6 @@
+import type { ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+export type * from './backend-runtime-contract';
+
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
 export const BACKEND_PROTOCOL_VERSION = 1 as const;
 export type BackendProtocolVersion = typeof BACKEND_PROTOCOL_VERSION;
@@ -253,6 +256,33 @@ export interface OutputSnapshotDTO {
   /** Actual std::cout buffer, or an explicit unsupported/custom-rdbuf reason. */
   coutBuffered?: RuntimeBufferSnapshotDTO;
 }
+/** Physical output effects survive reverse execution and stop-history eviction. */
+export interface OutputCursorDTO {
+  source: 'transport' | 'recording-checkpoint' | 'unknown';
+  stdoutThroughByte: number | null;
+  stderrThroughByte: number | null;
+}
+export type OutputJournalSegmentDTO =
+  | { kind: 'bytes'; fromByte: number; throughByte: number; bytesBase64: string }
+  | { kind: 'gap'; fromByte: number; throughByte: number; reason: 'not-retained' };
+export interface OutputJournalDTO {
+  kind: 'outputJournal';
+  stream: 'stdout' | 'stderr';
+  processInstanceId: string;
+  branchId: string;
+  consistent: boolean;
+  selectedPoint: HistoryPointDTO | null;
+  selectedThroughByte: number | null;
+  fromByte: number;
+  throughByte: number;
+  totalBytes: number;
+  retainedFromByte: number;
+  retainedBytes: number;
+  retentionHasGaps: boolean;
+  coverage: 'complete' | 'partial';
+  hasMore: boolean;
+  segments: OutputJournalSegmentDTO[];
+}
 export interface MemoryRegionDTO {
   /** Virtual interval [start,end); strings retain the full native address. */
   startAddressHex: string;
@@ -495,7 +525,7 @@ export interface StopObservationDTO {
   processInstanceId: string;
   buildId: string;
   sourceBundleId: string;
-  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'input-wait' | 'step-timeout' | 'mutation' | 'exit';
+  reason: 'entry' | 'step' | 'breakpoint' | 'pause' | 'signal' | 'input-wait' | 'step-timeout' | 'recording-error' | 'recording-seek' | 'reverse-step' | 'mutation' | 'exit';
   /** Actual PC location before the next instruction, not proof this statement has completed. */
   location: SourceSpanDTO | null;
   threadId: string | null;
@@ -506,6 +536,10 @@ export interface StopObservationDTO {
   /** VMA metadata at this stop, not resident bytes or C++ allocation identity. */
   memoryMap?: MemoryMapSnapshotDTO;
   executionLayout?: ExecutionLayoutDTO;
+  outputCursor?: OutputCursorDTO;
+  recording?: RecordingStatusDTO;
+  /** Procfs data belongs to the actual OS process, including during replay. */
+  osEvidenceScope?: 'current-process';
   expressions: ExpressionTraceDTO[];
   coverage: { variables: 'complete' | 'partial'; expressions: 'none' | 'partial' | 'observed'; memory: 'none' | 'partial' };
 }
@@ -532,6 +566,9 @@ export interface ResourceLimitsDTO {
   maxTraceMemoryBytes: number;
   maxCaptureBytes: number;
   maxInspectionStoreBytes: number;
+  maxOutputJournalBytesPerStream: number;
+  maxOutputJournalReadBytes: number;
+  maxRecordedInstructions: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
 }
@@ -560,6 +597,11 @@ export interface BackendCapabilitiesDTO {
   instructionTrace: 'instruction-boundaries' | 'none';
   memoryCapture: boolean;
   memoryMapDiff: boolean;
+  outputJournal: boolean;
+  moduleInspection: 'linux-proc-maps-elf' | 'none';
+  recorderProbe: boolean;
+  recordingProfiles: RecordingProfileDTO[];
+  recordingCursor: boolean;
   eventReplay: boolean;
   limits: ResourceLimitsDTO;
 }
@@ -575,7 +617,7 @@ export interface BackendErrorDTO {
 export type BackendCommandDTO =
   | { kind: 'capabilities' }
   | { kind: 'build'; source: SourceBundleDTO; configuration: BuildConfigurationDTO; architecture: ArchitectureDTO }
-  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean; addressPolicy?: AddressPolicyDTO }
+  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean; addressPolicy?: AddressPolicyDTO; recordingProfile?: RecordingProfileDTO; maxRecordedInstructions?: number }
   | { kind: 'appendInput'; id: string; text: string }
   | { kind: 'closeInput' }
   | { kind: 'step'; stepKind: 'over' | 'into' | 'out' | 'instruction' }
@@ -591,7 +633,14 @@ export type BackendCommandDTO =
   | { kind: 'writeVariable'; locator: string; expected: RuntimeValueDTO; value: ScalarValueDTO }
   | { kind: 'disassemble'; buildId: string; target: { kind: 'pc'; addressHex: string } | { kind: 'source'; range: SourceSpanDTO }; maxInstructions: number }
   | { kind: 'readMemory'; addressHex: string; byteCount: number }
+  | { kind: 'readOutputJournal'; stream: 'stdout' | 'stderr'; fromByte: number; byteCount: number; point?: HistoryPointDTO }
   | { kind: 'inspectProcess' }
+  | { kind: 'inspectModules' }
+  | { kind: 'readModuleSnapshot'; snapshotId: string }
+  | { kind: 'probeRecorders' }
+  | { kind: 'readRecording' }
+  | { kind: 'seekRecording'; instruction: string }
+  | { kind: 'reverseInstruction' }
   | { kind: 'readRegisters'; registers?: string[] }
   /** Executes instructions. Produces observation/state/trace-recorded/commandFinished events. */
   | { kind: 'traceInstructions'; count: number; registers?: string[]; memoryRanges: MemoryRangeRequestDTO[] }
@@ -613,6 +662,10 @@ export interface BackendRequestDTO {
   command: BackendCommandDTO;
 }
 export type BackendResultDTO =
+  | OutputJournalDTO
+  | { kind: 'moduleSnapshot'; snapshot: ModuleSnapshotDTO }
+  | { kind: 'recorderProbe'; probe: RecorderProbeDTO }
+  | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }
   | { kind: 'accepted' }
   | { kind: 'input'; input: InputStateDTO }
@@ -626,7 +679,7 @@ export type BackendResultDTO =
   | { kind: 'breakpoints'; breakpoints: BreakpointDTO[] }
   | { kind: 'asm'; architecture: ArchitectureDTO; instructions: InstructionDTO[]; truncated: boolean }
   | { kind: 'memory'; addressHex: string; bytesBase64: string; unreadableBytes: number }
-  | (InspectionContextDTO & { kind: 'processInspection'; inspection: ProcessInspectionDTO })
+  | (InspectionContextDTO & { kind: 'processInspection'; evidenceScope: 'current-os-state'; inspection: ProcessInspectionDTO })
   | (InspectionContextDTO & { kind: 'registers'; architecture: ArchitectureDTO; registers: RegisterValueDTO[] })
   | { kind: 'memoryCapture'; capture: MemoryCaptureDTO }
   | MemoryCaptureDiffDTO

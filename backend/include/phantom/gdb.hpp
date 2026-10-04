@@ -62,6 +62,10 @@ struct GdbLaunchRequest {
   bool stopAtEntry = true;
   // Explicit request to GDB, not proof the kernel accepted ADDR_NO_RANDOMIZE.
   bool disableRandomization = true;
+  // Explicit opt-in. Software recording is bounded and only covers machine
+  // state supported by GDB; it cannot undo files, pipes or other OS effects.
+  std::string recordingProfile = "native";
+  std::size_t maxRecordedInstructions = 200000;
   GdbSourceBundle sourceBundle;
 };
 
@@ -91,6 +95,11 @@ struct GdbStop {
   // unavailable status rather than guessing.
   nlohmann::json stdoutBufferedSnapshot = nlohmann::json::object();
   nlohmann::json stderrSnapshot = nlohmann::json::object();
+  // Exact retained transport bytes for the service's append-only effect
+  // journal. These are deliberately not part of the public text snapshot.
+  std::string stdoutRaw;
+  std::string stderrRaw;
+  nlohmann::json recording = nullptr;
   // All mapped virtual regions, captured while the inferior is stopped.
   // Contents remain separately bounded readMemory requests at this stop.
   nlohmann::json memoryMap = nullptr;
@@ -152,6 +161,11 @@ class GdbEngine {
                          const nlohmann::json& memoryRanges,
                          GdbStop& finalStop, nlohmann::json& trace,
                          GdbError& error);
+
+  bool readRecording(nlohmann::json& result, GdbError& error);
+  bool reverseInstruction(GdbStop& result, GdbError& error);
+  bool seekRecording(std::uint64_t instruction, GdbStop& result,
+                     GdbError& error);
 
   // Variable writes and conditions are deliberately not implemented until a
   // non-evaluating, typed assignment policy is available.  Calling these

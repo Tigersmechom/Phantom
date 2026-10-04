@@ -145,3 +145,23 @@ Linux toolchain и результаты rr probe сохранены в `.phantom
 обычным GDB запуском. Expression/lifetime instrumentation требует совместимого
 Clang/LLVM toolchain, immutable event schema и coverage gaps — эти функции не
 должны появляться в capabilities до наличия соответствующих доказательств.
+
+
+## Запись исполнения и дополнительные шлюзы
+
+Опциональный launch-профиль `gdb-record-full` поддерживает `readRecording`,
+`reverseInstruction` и `seekRecording`. Native остаётся профилем по умолчанию.
+Это реальное восстановление поддерживаемых GDB регистров/памяти внутри
+сохранённого журнала; внешние эффекты и состояние ядра ОС не откатываются.
+Неподдерживаемые инструкции, включая некоторые в стандартной библиотеке,
+дают ошибку с фактической остановкой. Профиль требует конечного начального
+ввода и работающего pidfd; интерактивный ввод сохраняется в native.
+
+`probeRecorders` проверяет маленькую поставляемую программу отдельно от текущей
+сессии. `inspectModules` связывает ELF-сегменты с `/proc/<pid>/maps`,
+`readModuleSnapshot` читает сохранённые снимки. `readOutputJournal` возвращает
+точные байты stdout/stderr и явно отмеченные пропуски хранения. Эти шлюзы
+предназначены для frontend-интеграции; 2D renderer карты памяти сюда не входит.
+
+Контракты и примеры: [RECORDING.md](../docs/RECORDING.md) и
+[INSPECTION_GATEWAYS.md](../docs/INSPECTION_GATEWAYS.md).

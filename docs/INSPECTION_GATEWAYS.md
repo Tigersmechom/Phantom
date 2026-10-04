@@ -105,8 +105,8 @@ Both observations must still exist and contain complete map snapshots. Each
 change has `kind:added|removed|changed` and `before`/`after` regions. Exact
 interval endpoints define a match: splitting or merging a VMA appears as
 removed/added regions, not a claim about allocation or object lifetimes.
-`start`, `totalChanges`, `hasMore` page the result. Runtime ELF load bias,
-symbol/DWARF lookup and automatic vtable/RTTI overlays are future work; existing
+`start`, `totalChanges`, `hasMore` page the result. Runtime ELF load bias is available through `inspectModules` below.
+Symbol/DWARF lookup and automatic vtable/RTTI overlays remain future work; existing
 `readMemory` can already follow an object address through its vptr into a table.
 
 ## Immutable byte captures and differences
@@ -182,9 +182,9 @@ instruction trace, not rr/`record full`, verified rollback or runtime injection.
 
 ## Verification of this slice
 
-The 18 registered CTest checks pass in Debug and ASan/UBSan builds. The shared
-contract check validates 477 real request/response/event frames, including the
-new gateways. The existing five frontend-harness checks and four contract
+The 26 registered CTest checks pass in Debug and ASan/UBSan builds. The shared
+contract check validates 819 real request/response/event frames, including output,
+module, recorder probe and recorded-navigation gateways. The existing five frontend-harness checks and four contract
 fixture checks also pass.
 
 Regression coverage includes malformed/oversized ELF and proc metadata,
@@ -194,4 +194,55 @@ wait/resume, Pause/Stop/cancel, signals/exit, unmapped-page boundaries, retained
 I/O, map lifecycle, paging/eviction, stale sessions/stops and a deterministic
 GDB failure during the final trace snapshot. These checks validate the installed
 Linux/GDB/runtime combination; they do not establish a cross-distribution ABI
-matrix or verified replay.
+matrix or verified restore of arbitrary observations.
+
+
+## Runtime ELF modules for the 2D memory view
+
+```json
+{"kind":"inspectModules"}
+{"kind":"readModuleSnapshot","snapshotId":"modules-1"}
+```
+
+The live command requires `expectedStop`. Its immutable `moduleSnapshot`
+includes mapped file identity, ELF program headers, load instances and load
+bias, and intersections of `PT_LOAD` segments with actual VMAs. A module can
+have several load instances. Anonymous BSS tails are linked only by segment
+geometry. Unassigned ranges remain explicit; a path alone does not prove an
+ELF image or module membership. Negative load bias is possible for manually
+mapped ET_EXEC files. Hex and decimal addresses/identities remain strings.
+
+Collection pins process identity, verifies opened device/inode and stable file
+metadata, bounds total ELF reads to 8 MiB and modules to 128, and reports partial
+coverage. It never executes a target file. Deleted, denied, malformed or changed
+files retain their available map evidence and explicit failure reason. The
+snapshot shares the bounded inspection store with memory/trace captures and
+remains readable after unload or exit, until eviction or a new session.
+`evidenceScope:current-os-state` explicitly separates procfs evidence from a
+restored GDB instruction position. Symbols, DWARF objects and automatic vtable
+recognition are additional layers, not inferred from mapping names.
+
+## Exact output journal
+
+```json
+{"kind":"readOutputJournal","stream":"stdout","fromByte":0,"byteCount":65536}
+```
+
+This session-scoped read works after process exit. `segments` contain exact
+`bytesBase64` or explicit `gap` intervals. Embedded NUL and invalid UTF-8 survive
+unchanged. Transport output is appended once; repeated stops, history reads and
+reverse execution do not erase or duplicate flushed output. Retention is
+bounded by `maxOutputJournalBytesPerStream` and 256 segments per stream. Bytes
+lost from the transport tail between observations are gaps, never invented
+characters. This is a retained session journal, not a durable disk archive.
+
+An optional `point` selects a retained observation. `selectedThroughByte`
+indicates its known output prefix; `null` means no proven prefix exists for
+that execution position. Physical `totalBytes` still describes all output
+already received. `observation.outputCursor` explains whether the prefix came
+from transport, a known recording checkpoint, or is unknown. Pending C/C++
+stream buffers remain in the selected observation and are not appended to the
+journal until they actually reach the output transport.
+
+Recorder commands and their separate external-effect limits are documented in
+[RECORDING.md](RECORDING.md).

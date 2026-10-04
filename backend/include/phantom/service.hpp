@@ -1,6 +1,7 @@
 #pragma once
 
 #include "phantom/gdb.hpp"
+#include "phantom/output_journal.hpp"
 #include "phantom/validation.hpp"
 
 #include <condition_variable>
@@ -21,6 +22,8 @@ struct ServiceOptions {
   std::string backendVersion = "0.1.0";
   ValidationLimits limits{};
   std::filesystem::path ioWrapper;
+  std::filesystem::path recorderProbeFixture;
+  std::string gdbPath = "gdb";
 };
 
 // The service is intentionally transport-agnostic. One caller owns the
@@ -66,6 +69,9 @@ class BackendService final {
                  std::optional<std::string> signal = std::nullopt);
   Json defaultInput() const;
   Json handleBuild(const Json& request);
+  Json handleRecorderProbe(const Json& request);
+  std::vector<Json> handleRecordedExecution(const Json& request, const FrameSink& publish);
+  std::vector<Json> handleModules(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
   Json handleInput(const Json& request);
@@ -113,6 +119,10 @@ class BackendService final {
   std::uint64_t ordinal_ = 0;
   std::uint64_t stateRevision_ = 0;
   Json executionLayout_ = nullptr;
+  OutputJournal stdoutJournal_, stderrJournal_;
+  bool outputJournalConsistent_ = true;
+  // Proven transport prefixes at observed instruction boundaries only.
+  std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> recordingOutputMarkers_;
   struct InspectionEntry { std::string id; Json value; std::size_t bytes; };
   std::vector<InspectionEntry> inspectionStore_;
   std::size_t inspectionBytes_ = 0;

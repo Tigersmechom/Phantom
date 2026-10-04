@@ -72,10 +72,36 @@ std::vector<Json> BackendService::handleInspection(const Json& request) {
     return Json{{"point", liveObservation_.at("point")}, {"stop", liveObservation_.at("stop")},
                 {"processInstanceId", processInstanceId_}};
   };
+  if (kind == "readOutputJournal") {
+    if (sessionId_.empty()) return {errorResponse(request,"STALE_CONTEXT","output journal requires a debugging session")};
+    const auto stream = command.at("stream").get<std::string>();
+    auto result = (stream == "stdout" ? stdoutJournal_ : stderrJournal_).read(
+        command.at("fromByte").get<std::uint64_t>(),command.at("byteCount").get<std::size_t>());
+    result["kind"] = "outputJournal"; result["stream"] = stream;
+    result["processInstanceId"] = processInstanceId_; result["branchId"] = "main";
+    result["consistent"] = outputJournalConsistent_;
+    result["selectedPoint"] = nullptr; result["selectedThroughByte"] = nullptr;
+    if (command.contains("point")) {
+      const Json* observation = nullptr;
+      for (const auto& entry : history_) if (entry.observation.at("point") == command.at("point")) {
+        observation = &entry.observation; break;
+      }
+      if (!observation) return {errorResponse(request,"HISTORY_EVICTED","selected output observation is unavailable or evicted")};
+      result["selectedPoint"] = command.at("point");
+      result["selectedThroughByte"] = observation->at("outputCursor").at(stream == "stdout" ? "stdoutThroughByte" : "stderrThroughByte");
+    }
+    return {okResponse(request,std::move(result))};
+  }
+  if (kind == "readRecording") {
+    Json recording; GdbError error;
+    if (!engine_->readRecording(recording,error)) return engineError(request,error);
+    auto result = context(); result["kind"] = "recording"; result["recording"] = std::move(recording);
+    return {okResponse(request,std::move(result))};
+  }
   if (kind == "inspectProcess") {
     const auto pid = engine_->inferiorPid();
     if (!pid) return {errorResponse(request, "READ_FAILED", "owned inferior PID is unavailable")};
-    auto result = context(); result["kind"] = "processInspection";
+    auto result = context(); result["kind"] = "processInspection"; result["evidenceScope"] = "current-os-state";
     result["inspection"] = inspectOwnedProcess(*pid);
     return {okResponse(request, std::move(result))};
   }

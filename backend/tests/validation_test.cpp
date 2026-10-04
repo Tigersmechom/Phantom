@@ -81,6 +81,69 @@ int main() {
   assert(!validation_fails(append));
   append["command"] = {{"kind", "closeInput"}};
   assert(!validation_fails(append));
+  // Recording is explicit, finite-input-only, and never changes the native
+  // profile's defaults through a stray log-size option.
+  Json recorded = launch;
+  recorded["command"]["recordingProfile"] = "gdb-record-full";
+  assert(validation_fails(recorded, "INVALID_REQUEST"));
+  recorded["command"]["input"]["closeAfterWrite"] = true;
+  assert(!validation_fails(recorded));
+  recorded["command"]["stopAtEntry"] = false;
+  assert(validation_fails(recorded, "INVALID_REQUEST"));
+  recorded["command"]["stopAtEntry"] = true;
+  for (const auto& bound : Json::array({1, 1000000})) {
+    recorded["command"]["maxRecordedInstructions"] = bound;
+    assert(!validation_fails(recorded));
+  }
+  for (const auto& bound : Json::array({0, -1, 1000001, 1.5, "32", false})) {
+    recorded["command"]["maxRecordedInstructions"] = bound;
+    assert(validation_fails(recorded));
+  }
+  recorded["command"]["maxRecordedInstructions"] = 32;
+  recorded["command"]["recordingProfile"] = "native";
+  assert(validation_fails(recorded, "INVALID_REQUEST"));
+  recorded["command"].erase("maxRecordedInstructions");
+  assert(!validation_fails(recorded));
+  recorded["command"]["recordingProfile"] = "rr";
+  assert(validation_fails(recorded, "INVALID_REQUEST"));
+  Json gateway = append;
+  for (const auto* kind : {"readRecording", "reverseInstruction", "inspectModules"}) {
+    gateway["command"] = {{"kind", kind}};
+    assert(!validation_fails(gateway));
+    auto missingStop = gateway;
+    missingStop.erase("expectedStop");
+    assert(validation_fails(missingStop, "INVALID_REQUEST"));
+    gateway["command"]["pid"] = 1;
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  // Cursors are full-width integers represented as canonical decimal text;
+  // they must not pass through JavaScript's floating-point number domain.
+  gateway["command"] = {{"kind", "seekRecording"}, {"instruction", "0"}};
+  for (const auto* cursor : {"0", "1", "9007199254740992", "18446744073709551615"}) {
+    gateway["command"]["instruction"] = cursor;
+    assert(!validation_fails(gateway));
+  }
+  for (const auto& cursor : Json::array({"", "00", "01", "-1", "+1", " 1", "1 ", "0x1", "1.0", "1e3",
+                                        "1\n-exec-continue", "18446744073709551616", 1, false})) {
+    gateway["command"]["instruction"] = cursor;
+    assert(validation_fails(gateway));
+  }
+  gateway["command"]["instruction"] = "0";
+  gateway.erase("expectedStop");
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway["command"] = {{"kind", "probeRecorders"}};
+  assert(!validation_fails(gateway));
+  for (const auto* executable : {"executable", "gdbPath", "rrPath"}) {
+    auto injected = gateway;
+    injected["command"][executable] = "/tmp/untrusted-recorder";
+    assert(validation_fails(injected, "INVALID_REQUEST"));
+  }
+  gateway["command"] = {{"kind", "readModuleSnapshot"}, {"snapshotId", "modules-1"}};
+  assert(!validation_fails(gateway));
+  for (const auto& invalidId : Json::array({"", 1, nullptr})) {
+    gateway["command"]["snapshotId"] = invalidId;
+    assert(validation_fails(gateway));
+  }
   // A configured smaller budget must be advertised and rejected before
   // accepting an asynchronous trace, not discovered after acceptance.
   phantom::ValidationLimits small;
