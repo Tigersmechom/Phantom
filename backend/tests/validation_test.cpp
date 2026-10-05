@@ -249,6 +249,73 @@ int main() {
   assert(validation_fails(gateway,"INVALID_REQUEST"));
   gateway["command"] = editCommand; gateway["command"]["pid"] = 1;
   assert(validation_fails(gateway,"INVALID_REQUEST"));
+  const Json batchRange = {{"addressHex","0x10"},{"expectedBytesHex","00ff"},{"replacementBytesHex","12AB"}};
+  const Json batchCommand = {{"kind","writeMemoryBatch"},{"profile","native-private-memory-batch-v1"},
+    {"edits",Json::array({batchRange})}};
+  gateway["command"] = batchCommand;
+  assert(!validation_fails(gateway));
+  auto missingBatchStop = gateway; missingBatchStop.erase("expectedStop");
+  assert(validation_fails(missingBatchStop,"INVALID_REQUEST"));
+  for (const auto& edits : Json::array({nullptr,false,1,"ranges",Json::object(),Json::array()})) {
+    gateway["command"] = batchCommand; gateway["command"]["edits"] = edits;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto& edit : Json::array({nullptr,true,3,"0x10",Json::array(),Json::object()})) {
+    gateway["command"] = batchCommand; gateway["command"]["edits"] = Json::array({edit});
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"addressHex","expectedBytesHex","replacementBytesHex"}) {
+    gateway["command"] = batchCommand; gateway["command"]["edits"][0].erase(key);
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"kind","profile","pid","expression","snapshotId"}) {
+    gateway["command"] = batchCommand; gateway["command"]["edits"][0][key] = "extra";
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* profile : {"auto","native-private-memory-v1","native-dwarf-scalar-v2"}) {
+    gateway["command"] = batchCommand; gateway["command"]["profile"] = profile;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto& bytes : Json::array({"","0","GG"," 00","00\n","0x00",0,false,nullptr})) {
+    for (const auto* key : {"expectedBytesHex","replacementBytesHex"}) {
+      gateway["command"] = batchCommand; gateway["command"]["edits"][0][key] = bytes;
+      assert(validation_fails(gateway));
+    }
+  }
+  gateway["command"] = batchCommand; gateway["command"]["edits"][0]["replacementBytesHex"] = "00";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  for (const auto* address : {"0x10","0x000010","0x11","0x0F"}) {
+    gateway["command"] = batchCommand;
+    auto other = batchRange; other["addressHex"] = address;
+    gateway["command"]["edits"].push_back(other);
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* address : {"0x12","0x0E"}) {
+    gateway["command"] = batchCommand;
+    auto other = batchRange; other["addressHex"] = address;
+    gateway["command"]["edits"].push_back(other);
+    assert(!validation_fails(gateway)); // Adjacency and descending request order are valid.
+  }
+  for (const auto& address : Json::array({"0x","&x","0x+1","0x10\n-exec-continue","0xfffffffffffffffe",
+                                       "0xffffffffffffffff","0x10000000000000000",-1,nullptr})) {
+    gateway["command"] = batchCommand; gateway["command"]["edits"][0]["addressHex"] = address;
+    assert(validation_fails(gateway));
+  }
+  gateway["command"] = batchCommand; gateway["command"]["edits"][0]["addressHex"] = "0xfffffffffffffffd";
+  assert(!validation_fails(gateway)); // Exclusive end still fits uint64.
+  gateway["command"] = batchCommand; gateway["command"]["edits"] = Json::array();
+  for (unsigned i = 0; i < 8; ++i) {
+    auto range = batchRange; range["addressHex"] = "0x"+std::to_string(100+i*100);
+    range["expectedBytesHex"] = std::string(64,'0'); range["replacementBytesHex"] = std::string(64,'f');
+    gateway["command"]["edits"].push_back(range);
+  }
+  assert(!validation_fails(gateway)); // Exactly eight ranges and 256 total bytes.
+  gateway["command"]["edits"].push_back(batchRange);
+  assert(validation_fails(gateway,"LIMIT_EXCEEDED"));
+  gateway["command"]["edits"].erase(8);
+  gateway["command"]["edits"][7]["expectedBytesHex"] = std::string(66,'0');
+  gateway["command"]["edits"][7]["replacementBytesHex"] = std::string(66,'f');
+  assert(validation_fails(gateway,"LIMIT_EXCEEDED"));
   gateway.erase("expectedStop"); gateway["command"] = {{"kind","listBranches"}};
   assert(!validation_fails(gateway));
   gateway["command"] = {{"kind","listMemoryInterventions"},{"start",0},{"count",128}};
@@ -326,6 +393,17 @@ int main() {
   phantom::ValidationLimits small;
   small.maxInstructions = 16;
   small.maxMemoryReadBytes = 32;
+  gateway["command"] = batchCommand;
+  gateway["command"]["edits"][0]["expectedBytesHex"] = std::string(32,'0');
+  gateway["command"]["edits"][0]["replacementBytesHex"] = std::string(32,'f');
+  auto secondRange = gateway["command"]["edits"][0]; secondRange["addressHex"] = "0x20";
+  gateway["command"]["edits"].push_back(secondRange);
+  gateway["expectedStop"] = {{"stopId","stop-1"},{"stateRevision",1}};
+  phantom::validate_request(gateway,small);
+  gateway["command"]["edits"][1]["expectedBytesHex"] = std::string(34,'0');
+  gateway["command"]["edits"][1]["replacementBytesHex"] = std::string(34,'f');
+  try { phantom::validate_request(gateway,small); assert(false); }
+  catch (const ValidationError& e) { assert(e.code == "LIMIT_EXCEEDED"); }
   Json trace = append;
   trace["command"] = {{"kind","traceInstructions"},{"count",16},{"memoryRanges",Json::array()}};
   phantom::validate_request(trace, small);
@@ -346,6 +424,8 @@ int main() {
     assert(budgets.at("maxTraceInstructions") == 16);
     assert(budgets.at("maxTraceMemoryBytes") == 32);
     assert(budgets.at("maxCaptureBytes") == 32);
+    assert(budgets.at("maxMemoryBatchRanges") == 8);
+    assert(budgets.at("maxMemoryBatchBytes") == 32);
   }
   std::filesystem::remove_all(directory);
   std::cout << "validation tests passed\n";

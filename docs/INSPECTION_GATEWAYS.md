@@ -33,6 +33,7 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `inspectScalarStorage` / `writeScalarStorage` | Required | Capture authoritative scalar type/storage; compare and edit through a retained snapshot. |
 | `readScalarStorage` | No | Read an immutable scalar storage snapshot. |
 | `writeMemory` | Required | Compare, write and verify bounded native storage bytes; retain intervention provenance. |
+| `writeMemoryBatch` | Required | Preflight disjoint ranges, apply in request order and retain partial/final evidence as one intervention. |
 | `readMemoryIntervention` / `listMemoryInterventions` / `listBranches` | No | Read session intervention audits and branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
@@ -513,12 +514,105 @@ operations before writing; IDs are never silently evicted. Comparison
 conflicts/no-ops also occupy records. A successful new launch or workspace
 change clears the ledger and branches. Export needed audits before that.
 
-Multi-range transactions, register writes, runtime code
-injection and branching inside recorded execution remain separate work.
+Register writes, runtime code injection and branching inside recorded execution
+remain separate work. Bounded multi-range byte edits are described below.
 The MI write command and recorder side effects are described in the official
 [GDB data manipulation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
 and [record/replay](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html)
 manuals.
+
+## Batched memory interventions
+
+`capabilities.memoryWriteBatch = "native-private-memory-batch-v1"` enables
+`writeMemoryBatch` with a current session and `expectedStop`. For example:
+
+```json
+{
+  "kind": "writeMemoryBatch",
+  "profile": "native-private-memory-batch-v1",
+  "edits": [
+    {"addressHex":"0x1000","expectedBytesHex":"01000000","replacementBytesHex":"02000000"},
+    {"addressHex":"0x2000","expectedBytesHex":"00","replacementBytesHex":"01"}
+  ]
+}
+```
+
+The example addresses must be replaced with addresses captured from the current
+stopped process. Each edit requires equal nonempty expected/replacement bytes.
+Limits are `maxMemoryBatchRanges` (8) and `maxMemoryBatchBytes` (256, or a smaller
+configured memory-read limit). Addresses are parsed numerically: overlapping
+ranges, including differently spelled aliases of the same address, are rejected.
+Adjacent ranges and descending addresses are allowed; execution preserves request
+order. Each range must fit entirely in one current `rw-p` VMA. Ranges may occupy
+different private mappings. All mapping policies are checked before any write.
+Native execution, one stopped thread and an ordinary stopped phase are required;
+record-full and input waits are rejected just as for single-range writes.
+
+The operation has three phases:
+
+1. **Preflight:** read and compare all ranges before sending any write. A failed
+   read or mismatched expected byte aborts at that range with zero writes.
+2. **Execution:** compare each range again, then use the existing checked single
+   write/readback path. No-op ranges are also rechecked. The first conflict,
+   rejected/partial write, read failure or missing GDB acknowledgement stops all
+   later writes. An error acknowledgement stops the batch even if readback found
+   the requested bytes. Earlier effects are retained and no rollback is attempted.
+3. **Final sampling:** after any attempted write, read every requested range,
+   including no-ops and skipped ranges, while GDB remains alive. A read error does
+   not suppress evidence from other ranges unless the debugger died. This can
+   reveal changes to an earlier range since its immediate write/readback.
+
+The result remains `{kind:"memoryIntervention",intervention,throughSequence}`.
+Discriminate by `intervention.profile`: batches have `mappings[]` aligned with
+request order instead of the singleton `mapping`. `report.items[]` contains each
+item's `index`, address, size, expected/replacement bytes and three independent
+evidence records:
+
+- `preflight`: bytes, `matchesExpected`, and an optional read error.
+- `execution`: the existing complete single-range report, including whether a
+  write was attempted/acknowledged and immediate readback.
+- `final`: later bytes, `matchesExpected`, `matchesReplacement`, and a read error.
+
+A null phase means it was not reached. A phase record may itself contain null
+bytes or a proven prefix; its comparisons stay null unless the read was complete,
+error-free and GDB was alive. Do not replace missing immediate readback with the
+later final sample: they describe different moments. A complete mismatch has
+`matchesExpected:false` or `matchesReplacement:false`; it is not a read error.
+
+| `report.outcome` | Meaning |
+| --- | --- |
+| `preflight-failed` | Initial comparison failed; no write was attempted. |
+| `unchanged` | All execution comparisons passed and every range was a no-op. |
+| `interrupted` | An execution failed; inspect individual effects and skipped items. |
+| `verification-failed` | Execution completed, but a final sample failed or differed. |
+| `verified` | Execution completed and all final samples matched replacements. |
+
+`failureIndex` identifies the first failure encountered. Later failures during
+final sampling do not replace an earlier execution failure, even if the later
+failure has a smaller item index. `writeAttempted` is true if any item may have
+submitted a write. `atomic:false` and `rollbackAttempted:false` are explicit:
+this is sequential observation, not a transaction or simultaneous snapshot.
+External writes and ABA changes remain possible. See
+[GDB memory commands](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
+and the kernel's [procfs mapping documentation](https://www.kernel.org/doc/html/latest/filesystems/proc.html).
+
+The entire batch consumes **one** shared audit record. Any attempted write
+creates **one** lineage branch and one refreshed stop/observation, regardless of
+how many items ran. Post-write context failure still closes the debugger and
+preserves the report separately from `contextStatus`. Preflight failures and
+all-no-op batches create no branch. Historical snapshots/captures are immutable;
+physical output remains process-wide and queued stdin/EOF is not delivered by
+the operation. Single-range and typed operations retain their existing shapes.
+
+The same 4096-byte request limit, 32 KiB reservation, bounded non-evicting ledger
+and whole-request retry identity apply. New preflight/final read messages are
+bounded both in UTF-8 bytes and serialized JSON size so escaping cannot overflow
+the audit reservation. `readMemoryIntervention`, `listMemoryInterventions` and
+`listBranches` expose raw, typed and batch interventions together. A retry after
+a partial failure, changed stop or dead debugger returns the original audit
+without another write. Backend restart/new-session durability is not implied.
+This is a raw-storage gateway; typed multi-value assignment and object lifetime
+remain separate work.
 
 ## Typed scalar storage
 

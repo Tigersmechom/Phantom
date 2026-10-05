@@ -101,6 +101,12 @@ protocol capabilities.
   immutable audit, lineage branches и повтор запроса без повторной записи
   доступны через протокол. Только один остановленный поток, без record-full.
   [Контракт и границы](../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
+- `writeMemoryBatch` проверяет до восьми непересекающихся участков (256 байтов
+  суммарно), затем меняет их по порядку до первого сбоя. В отчёте сохраняются
+  предварительное сравнение, каждая запись и итоговое чтение всех участков.
+  Один пакет создаёт одну запись аудита и одну ветвь при попытке изменения;
+  атомарность и автоматический откат не обещаются.
+  [Пакетный профиль](../docs/INSPECTION_GATEWAYS.md#batched-memory-interventions).
 - `inspectScalarStorage` / `writeScalarStorage` связывают проверенные GDB-типы
   целых и bool с точными storage bytes и общей историей вмешательств. Явный
   профиль `native-dwarf-scalar-v2` добавляет float/double через точные биты,

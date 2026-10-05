@@ -121,6 +121,7 @@ Json BackendService::capabilities() const {
       {"moduleSymbols", "elf-section-symbol-tables"}, {"variableLayout", "gdb-python-dwarf"}, {"recorderProbe", true},
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
+      {"memoryWriteBatch", "native-private-memory-batch-v1"},
       {"scalarStorage", "native-dwarf-scalar-v1"},
       {"scalarStorageProfiles", {"native-dwarf-scalar-v1", "native-dwarf-scalar-v2"}},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
@@ -138,6 +139,7 @@ Json BackendService::capabilities() const {
                    {"maxOutputJournalBytesPerStream", std::min<std::size_t>(4 * 1024 * 1024,options_.limits.maxWireBytes/4)},
                    {"maxOutputJournalReadBytes", 65536}, {"maxRecordedInstructions", 1000000},
                    {"maxMemoryWriteBytes", std::min<std::size_t>(256, options_.limits.maxMemoryReadBytes)}, {"maxMemoryInterventions", maxInterventions},
+                   {"maxMemoryBatchRanges", 8}, {"maxMemoryBatchBytes", std::min<std::size_t>(256, options_.limits.maxMemoryReadBytes)},
                    {"maxInterventionStoreBytes", std::min<std::size_t>(4 * 1024 * 1024, options_.limits.maxWireBytes)},
                    {"commandTimeoutMs", 30000}, {"replayTimeoutMs", 30000}}},
   };
@@ -754,14 +756,14 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     }
     if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
-                                 kind == "writeScalarStorage" || kind == "writeMemory" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
+                                 kind == "writeScalarStorage" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
                              kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" ||
                              kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" ||
                              kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
-                             kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory" ||
+                             kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory" || kind == "writeMemoryBatch" ||
                              kind == "inspectScalarStorage" || kind == "writeScalarStorage";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
@@ -822,7 +824,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "inspectVariableLayout" || kind == "readVariableLayout") return handleVariableLayout(request);
     if (kind == "inspectVtable" || kind == "readVtableSnapshot") return handleVtable(request);
     if (kind == "inspectScalarStorage" || kind == "readScalarStorage" || kind == "writeScalarStorage") return handleScalarStorage(request);
-    if (kind == "writeMemory" || kind == "readMemoryIntervention" || kind == "listMemoryInterventions" || kind == "listBranches")
+    if (kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemoryIntervention" || kind == "listMemoryInterventions" || kind == "listBranches")
       return handleMemoryIntervention(request);
     if (kind == "launch") return handleLaunch(request, publish);
     if (kind == "traceInstructions") return handleTrace(request, publish);

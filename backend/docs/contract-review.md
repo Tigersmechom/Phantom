@@ -228,7 +228,7 @@ native storage edits and intervention lineage are implemented below (2026-10-05)
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native raw-memory and typed integer/bool/float storage profiles. | Multi-range edits, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
+| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native single/batched raw-memory and typed integer/bool/float storage profiles. | Typed batches, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -448,3 +448,31 @@ bytes, never substitutes the requested value after partial/missing readback,
 and retains once-only handling on retries. C++ lifetime, language assignment,
 long double/extended formats, qualifiers/atomic types and record-full writes
 are not implied. See the [v2 examples and gates](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
+
+## 2026-10-05: bounded multi-range memory intervention
+
+`writeMemoryBatch{profile:"native-private-memory-batch-v1",edits}` is advertised
+through optional `memoryWriteBatch`, `maxMemoryBatchRanges` and
+`maxMemoryBatchBytes` capabilities/limits. Each item contains address and equal
+nonempty expected/replacement bytes. Validation rejects overlaps/aliases,
+overflow, more than eight ranges or more than 256 total bytes (also respecting
+the configured memory-read limit). Native/current-stop/thread/VMA gates match
+single-range edits; the full mapping pass precedes any mutation.
+
+`MemoryInterventionDTO` now discriminates the batch variant by profile, with
+`mappings[]` and `MemoryBatchReportDTO`. The former singleton variants keep
+`mapping` and their original report. A batch retains initial preflight,
+fresh per-item compare/write/readback and final all-range samples separately.
+All ranges must pass preflight; execution stops at the first failure/missing
+acknowledgement. After any attempted write, final reads include skipped and
+no-op ranges while GDB is alive. Missing/partial evidence is never invented.
+Earlier observed effects remain visible; rollback and atomicity are false.
+
+One batch has one ledger ID, one lineage branch and one refreshed stop after
+any write attempt. Shared once-only request handling survives stale stops and
+debugger death; no-op/conflict batches consume an audit entry without forking.
+Serialized read-error bounds keep the full report inside the existing 32 KiB
+reservation with its request and envelope. Old history, physical output,
+single/typed writes and queued input retain their existing semantics.
+Complete outcomes, null semantics and examples:
+[batch gateway](../../docs/INSPECTION_GATEWAYS.md#batched-memory-interventions).

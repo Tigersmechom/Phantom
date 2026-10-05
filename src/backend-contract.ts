@@ -1,4 +1,4 @@
-import type { ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -570,6 +570,8 @@ export interface ResourceLimitsDTO {
   maxOutputJournalReadBytes: number;
   maxRecordedInstructions: number;
   maxMemoryWriteBytes: number;
+  maxMemoryBatchRanges?: number;
+  maxMemoryBatchBytes?: number;
   maxMemoryInterventions: number;
   maxInterventionStoreBytes: number;
   commandTimeoutMs: number;
@@ -586,6 +588,7 @@ export interface BackendCapabilitiesDTO {
   hitCountBreakpoints: boolean;
   variableWrite: boolean;
   memoryWrite: 'native-private-memory-v1' | 'none';
+  memoryWriteBatch?: 'native-private-memory-batch-v1' | 'none';
   scalarStorage: 'native-dwarf-scalar-v1' | 'none';
   /** Absent on legacy servers; float bits require an explicit v2 inspection. */
   scalarStorageProfiles?: ScalarStorageProfileDTO[];
@@ -645,6 +648,7 @@ export type BackendCommandDTO =
   | { kind: 'disassemble'; buildId: string; target: { kind: 'pc'; addressHex: string } | { kind: 'source'; range: SourceSpanDTO }; maxInstructions: number }
   /** Compare and write raw storage, native/single-thread only. Events are emitted once. */
   | { kind: 'writeMemory'; profile: 'native-private-memory-v1'; addressHex: string; expectedBytesHex: string; replacementBytesHex: string }
+  | { kind: 'writeMemoryBatch'; profile: 'native-private-memory-batch-v1'; edits: MemoryBatchEditDTO[] }
   | { kind: 'inspectScalarStorage'; locator: string; profile?: ScalarStorageProfileDTO }
   | { kind: 'readScalarStorage'; snapshotId: string }
   | { kind: 'writeScalarStorage'; profile: 'native-dwarf-scalar-v1'; snapshotId: string; value: ScalarStorageValueV1DTO }

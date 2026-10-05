@@ -1,16 +1,21 @@
 #include "phantom/service.hpp"
 #include "phantom/memory_edit.hpp"
+#include "phantom/memory_batch.hpp"
 #include "phantom/memory_map.hpp"
 #include "phantom/scalar_codec.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace phantom {
 namespace {
 std::uint64_t addressValue(const std::string& text) {
+  if (!text.starts_with("0x") || text.size() <= 2 || text.size() > 18)
+    throw std::runtime_error("invalid address");
   std::uint64_t value = 0;
   const auto parsed = std::from_chars(text.data()+2,text.data()+text.size(),value,16);
   if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size()) throw std::runtime_error("invalid address");
@@ -26,6 +31,7 @@ std::string hexBytes(std::string_view raw) {
   return result;
 }
 std::string rawHex(std::string_view text) {
+  if (text.size() % 2) throw std::runtime_error("invalid byte encoding");
   std::string raw;
   for (std::size_t i=0; i<text.size(); i+=2) {
     unsigned value = 0;
@@ -81,6 +87,37 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   if (interventions_.size() >= maxInterventions || interventions_.size() >= budget/interventionReservation ||
       request.dump().size() > 4096)
     return {errorResponse(request,"LIMIT_EXCEEDED","intervention audit retention budget is exhausted or request identity is too large")};
+  const bool batch = kind == "writeMemoryBatch";
+  std::vector<MemoryBatchEdit> edits;
+  const auto append = [&](const Json& item) {
+    edits.push_back({addressValue(item.at("addressHex")),
+      rawHex(item.at("expectedBytesHex").get<std::string>()),
+      rawHex(item.at("replacementBytesHex").get<std::string>())});
+  };
+  if (batch) {
+    const auto& items = command.at("edits");
+    if (!items.is_array() || items.empty() || items.size() > 8)
+      return {errorResponse(request,"INVALID_REQUEST","memory batches require 1..8 ranges")};
+    for (const auto& item : items) append(item);
+  } else append(command);
+  std::size_t byteCount = 0;
+  for (std::size_t index = 0; index < edits.size(); ++index) {
+    const auto& edit = edits[index];
+    if (edit.expectedRaw.empty() || edit.expectedRaw.size() != edit.replacementRaw.size() ||
+        edit.address > std::numeric_limits<std::uint64_t>::max() - edit.expectedRaw.size())
+      return {errorResponse(request,"INVALID_REQUEST","memory edits require equal nonempty buffers and a non-overflowing range")};
+    if (edit.expectedRaw.size() > 256 - byteCount)
+      return {errorResponse(request,"LIMIT_EXCEEDED","memory edits are limited to 256 bytes in total")};
+    byteCount += edit.expectedRaw.size();
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      const auto& other = edits[previous];
+      if (edit.address < other.address + other.expectedRaw.size() &&
+          other.address < edit.address + edit.expectedRaw.size())
+        return {errorResponse(request,"INVALID_REQUEST","memory batch ranges must be disjoint")};
+    }
+  }
+  if (byteCount > options_.limits.maxMemoryReadBytes)
+    return {errorResponse(request,"LIMIT_EXCEEDED","memory edits exceed the configured memory read limit")};
   GdbError error;
   if (!engine_->prepareMemoryWrite(error)) return engineError(request,error);
   const auto pid = engine_->inferiorPid();
@@ -88,19 +125,22 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   const auto maps = readLinuxMemoryMap(*pid);
   if (!sameCompleteMaps(liveObservation_.value("memoryMap",Json::object()),maps))
     return {errorResponse(request,"READ_FAILED","complete current mappings must match the observed stop")};
-  const auto address = addressValue(command.at("addressHex"));
-  const auto expected = rawHex(command.at("expectedBytesHex").get<std::string>());
-  const auto replacement = rawHex(command.at("replacementBytesHex").get<std::string>());
-  Json mapping = nullptr;
-  for (const auto& region : maps.at("regions")) {
-    if (region.at("permissions") == "rw-p" && address >= addressValue(region.at("startAddressHex")) &&
-        address + expected.size() <= addressValue(region.at("endAddressHex"))) {
-      mapping = {{"startAddressHex",region.at("startAddressHex")},{"endAddressHex",region.at("endAddressHex")},
-                 {"permissions",region.at("permissions")}};
-      break;
+  Json mappings = Json::array();
+  // Validate every mapping before the batch helper can read or mutate any
+  // range. Preserve request order for the subsequent audit and execution.
+  for (const auto& edit : edits) {
+    Json mapping = nullptr;
+    for (const auto& region : maps.at("regions")) {
+      if (region.at("permissions") == "rw-p" && edit.address >= addressValue(region.at("startAddressHex")) &&
+          edit.address + edit.expectedRaw.size() <= addressValue(region.at("endAddressHex"))) {
+        mapping = {{"startAddressHex",region.at("startAddressHex")},{"endAddressHex",region.at("endAddressHex")},
+                   {"permissions",region.at("permissions")}};
+        break;
+      }
     }
+    if (mapping.is_null()) return {errorResponse(request,"INVALID_REQUEST","memory edits require one readable writable private non-executable mapping per range")};
+    mappings.push_back(std::move(mapping));
   }
-  if (mapping.is_null()) return {errorResponse(request,"INVALID_REQUEST","memory edits require one readable writable private non-executable mapping")};
 
   // Reserve the bounded ledger slot before the callback can submit any write.
   // This ledger is separate from the evictable history/inspection caches.
@@ -109,8 +149,10 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   Json audit = {{"id",id},{"requestId",request.at("requestId")},{"profile",request.at("command").at("profile")},
     {"processInstanceId",processInstanceId_},{"beforePoint",liveObservation_.at("point")},
     {"beforeStop",liveObservation_.at("stop")},{"afterPoint",nullptr},{"afterStop",nullptr},
-    {"branchId",nullptr},{"contextStatus","unchanged"},{"mapping",std::move(mapping)},
+    {"branchId",nullptr},{"contextStatus","unchanged"},
     {"refreshError",nullptr},{"report",nullptr}};
+  if (batch) audit["mappings"] = std::move(mappings);
+  else audit["mapping"] = std::move(mappings.front());
   const auto reader = [&](std::uint64_t start, std::size_t count) -> MemoryEditRead {
     Json result; GdbError readError;
     if (!engine_->readMemory(addressText(start),count,result,readError))
@@ -124,7 +166,8 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
     const bool acknowledged = engine_->writeMemoryBytes(addressText(start),hexBytes(raw),attempted,writeError);
     return {attempted,acknowledged,engine_->live(),writeError.code,writeError.message};
   };
-  audit["report"] = compareAndWriteMemory(address,expected,replacement,reader,writer);
+  audit["report"] = batch ? compareAndWriteMemoryBatch(edits,reader,writer) :
+      compareAndWriteMemory(edits.front().address,edits.front().expectedRaw,edits.front().replacementRaw,reader,writer);
   if (preparedScalar.is_object()) {
     audit["scalar"] = preparedScalar.at("scalar");
     const auto& type = audit.at("scalar").at("target").at("scalar");

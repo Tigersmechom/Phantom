@@ -451,6 +451,49 @@ export interface MemoryInterventionBaseDTO {
   };
 }
 
+/** Ordered, disjoint byte ranges. No C++ type or lifetime is asserted. */
+export interface MemoryBatchEditDTO {
+  addressHex: string;
+  expectedBytesHex: string;
+  replacementBytesHex: string;
+}
+export interface MemoryBatchReadDTO {
+  /** Full bytes or a proven contiguous prefix; null means no byte evidence. */
+  bytesHex: string | null;
+  /** Compared only after a complete, error-free read from a live debugger. */
+  matchesExpected: boolean | null;
+  error: { code: string; message: string } | null;
+}
+export interface MemoryBatchReportDTO {
+  byteCount: number;
+  atomic: false;
+  rollbackAttempted: false;
+  writeAttempted: boolean;
+  debuggerAlive: boolean;
+  preflightPassed: boolean;
+  outcome: 'preflight-failed' | 'unchanged' | 'verified' | 'interrupted' | 'verification-failed';
+  /** First failure encountered; later final-read failures do not replace an
+   *  execution failure, even at a smaller item index. Null on success. */
+  failureIndex: number | null;
+  items: (MemoryBatchEditDTO & {
+    index: number;
+    byteCount: number;
+    /** Null means this range was not sampled in that phase. */
+    preflight: MemoryBatchReadDTO | null;
+    /** Fresh compare/write/readback, distinct from the earlier preflight. */
+    execution: MemoryInterventionBaseDTO['report'] | null;
+    /** Sampled after the execution loop, including skipped/no-op ranges.
+     *  Only attempted mutations trigger this sweep; no atomic snapshot claim. */
+    final: (MemoryBatchReadDTO & { matchesReplacement: boolean | null }) | null;
+  })[];
+}
+export interface MemoryBatchInterventionDTO extends Omit<MemoryInterventionBaseDTO, 'mapping' | 'report'> {
+  profile: 'native-private-memory-batch-v1';
+  /** One mapping per item, in request order. Mappings may repeat. */
+  mappings: MemoryInterventionBaseDTO['mapping'][];
+  report: MemoryBatchReportDTO;
+}
+
 /** Typed storage edits do not claim a live C++ object or language assignment. */
 export type ScalarStorageProfileDTO = 'native-dwarf-scalar-v1' | 'native-dwarf-scalar-v2';
 export type ScalarStorageValueV1DTO =
@@ -511,8 +554,8 @@ export interface ScalarStorageInterventionDTO<
   beforeValue: V | null;
   afterValue: V | null;
 }
-export type MemoryInterventionDTO = MemoryInterventionBaseDTO & (
+export type MemoryInterventionDTO = (MemoryInterventionBaseDTO & (
   | { profile: 'native-private-memory-v1'; scalar?: never }
   | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO<ScalarStorageValueV1DTO, ScalarStorageTypeV1DTO> }
   | { profile: 'native-dwarf-scalar-v2'; scalar: ScalarStorageInterventionDTO }
-);
+)) | MemoryBatchInterventionDTO;

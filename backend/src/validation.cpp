@@ -56,6 +56,31 @@ void enum_string(const Json& j, std::string_view p, std::initializer_list<std::s
 }
 void array_limit(const Json& j, std::string_view p, std::size_t n) { expect_array(j,p); if (j.size() > n) limit(std::string(p), "array exceeds configured limit"); }
 
+std::pair<std::uint64_t,std::uint64_t> memory_edit_range(const Json& range,
+    const std::string& path, const ValidationLimits& limits) {
+  const auto& address = req(range,"addressHex",path);
+  string_value(address,path+".addressHex",18);
+  const auto& text = address.get_ref<const std::string&>();
+  if (!text.starts_with("0x") || text.size() <= 2) invalid(path+".addressHex","expected hexadecimal 0x address");
+  std::uint64_t start = 0;
+  const auto parsed = std::from_chars(text.data()+2,text.data()+text.size(),start,16);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size()) invalid(path+".addressHex","invalid address");
+  for (const auto* key : {"expectedBytesHex", "replacementBytesHex"}) {
+    const auto& bytes = req(range,key,path); string_value(bytes,path+"."+key,512);
+    const auto& hex = bytes.get_ref<const std::string&>();
+    if (hex.size() % 2 || !std::all_of(hex.begin(),hex.end(),[](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'); }))
+      invalid(path+"."+key,"expected nonempty even-length hex bytes");
+  }
+  const auto count = range.at("expectedBytesHex").get_ref<const std::string&>().size()/2;
+  if (range.at("replacementBytesHex").get_ref<const std::string&>().size() != count*2)
+    invalid(path+".replacementBytesHex","replacement must have the same length as expected bytes");
+  if (start > std::numeric_limits<std::uint64_t>::max() - count)
+    invalid(path+".addressHex","memory range overflows uint64");
+  if (count > limits.maxMemoryReadBytes) limit(path+".expectedBytesHex","exceeds configured memory read limit");
+  return {start,start+count};
+}
+
 void memory_ranges(const Json& ranges, std::string_view path, std::size_t budget) {
   array_limit(ranges, path, 8);
   std::vector<std::pair<std::uint64_t,std::uint64_t>> intervals;
@@ -273,7 +298,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeMemory" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
@@ -358,26 +383,28 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "writeMemory") {
     only({"kind","profile","addressHex","expectedBytesHex","replacementBytesHex"});
     enum_string(req(c,"profile","command"),"command.profile",{"native-private-memory-v1"});
-    const auto& address = req(c,"addressHex","command");
-    string_value(address,"command.addressHex",18);
-    const auto& text = address.get_ref<const std::string&>();
-    if (!text.starts_with("0x") || text.size() <= 2) invalid("command.addressHex","expected hexadecimal 0x address");
-    std::uint64_t value = 0;
-    const auto parsed = std::from_chars(text.data()+2,text.data()+text.size(),value,16);
-    if (parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size()) invalid("command.addressHex","invalid address");
-    for (const auto* key : {"expectedBytesHex", "replacementBytesHex"}) {
-      const auto& bytes = req(c,key,"command"); string_value(bytes,std::string("command.")+key,512);
-      const auto& hex = bytes.get_ref<const std::string&>();
-      if (hex.size() % 2 || !std::all_of(hex.begin(),hex.end(),[](unsigned char ch) {
-          return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'); }))
-        invalid(std::string("command.")+key,"expected nonempty even-length hex bytes");
+    memory_edit_range(c,"command",l);
+    return;
+  }
+  if (kind == "writeMemoryBatch") {
+    only({"kind","profile","edits"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-private-memory-batch-v1"});
+    const auto& edits = req(c,"edits","command");
+    array_limit(edits,"command.edits",8);
+    if (edits.empty()) invalid("command.edits","at least one memory range is required");
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> intervals;
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < edits.size(); ++i) {
+      const auto path = "command.edits["+std::to_string(i)+"]";
+      exact_keys(edits[i],{"addressHex","expectedBytesHex","replacementBytesHex"},path);
+      const auto [start,end] = memory_edit_range(edits[i],path,l);
+      for (const auto& [a,b] : intervals)
+        if (start < b && a < end) invalid(path,"memory edit ranges overlap");
+      intervals.emplace_back(start,end);
+      total += end-start;
+      if (total > std::min<std::size_t>(256,l.maxMemoryReadBytes))
+        limit("command.edits","total memory batch byte limit exceeded");
     }
-    const auto count = c.at("expectedBytesHex").get_ref<const std::string&>().size()/2;
-    if (c.at("replacementBytesHex").get_ref<const std::string&>().size() != count*2)
-      invalid("command.replacementBytesHex","replacement must have the same length as expected bytes");
-    if (value > std::numeric_limits<std::uint64_t>::max() - count)
-      invalid("command.addressHex","memory range overflows uint64");
-    if (count > l.maxMemoryReadBytes) limit("command.expectedBytesHex","exceeds configured memory read limit");
     return;
   }
   if (kind == "readMemoryIntervention") {
