@@ -24,8 +24,8 @@ const buffer = (text, association='cout-unsynchronized', stream='cout') => ({
   writeWindowCapacityBytes:8191,writeWindowRemainingBytes:8191-Buffer.byteLength(text),
   storageCapacityBytes:8192,mode:'full',flushPolicy:'buffer-full-or-explicit',
 });
-const show = (stdout, processInstanceId='run-1', ordinal=1) => context.__phantomHarnessDebug.applyObservation({
-  stdout, processInstanceId,buildId:'binary',point:{branchId:'main',eventOrdinal:ordinal},
+const show = (stdout, processInstanceId='run-1', ordinal=1, branchId='main') => context.__phantomHarnessDebug.applyObservation({
+  stdout, processInstanceId,buildId:'binary',point:{branchId,eventOrdinal:ordinal},
   stop:{stopId:`stop-${ordinal}`,stateRevision:ordinal},reason:'step',stack:[],
 });
 const out = (text, extra={}) => ({text,totalBytes:Buffer.byteLength(text),retainedFromByte:0,truncated:false,...extra});
@@ -48,9 +48,17 @@ assert.equal(elements.get('stdout').textContent,'sent\nmore\n');
 show(out('sent\n',{coutBuffered:buffer('more\n')}) ,'run-1',1);
 assert.equal(elements.get('stdout').textContent,'sent\nmore\n','history selection does not erase emitted bytes');
 assert.match(elements.get('output-note').textContent,/более поздней остановки/);
+show(out('sent\nmore\nbranch\n',{coutBuffered:buffer('current pending')}) ,'run-1',3,'branch-1');
+assert.equal(elements.get('stdout').textContent,'sent\nmore\nbranch\n');
+show(out('sent\n',{coutBuffered:buffer('old')}) ,'run-1',1,'main');
+assert.equal(elements.get('stdout').textContent,'sent\nmore\nbranch\n',
+  'selecting a parent branch cannot erase physical output already emitted in the same process');
+assert.match(pending(),/>old<\/span>/,'pending bytes follow the selected historical stop');
+assert.ok(!pending().includes('current pending'),'historical pending bytes can shrink across branches');
+assert.match(elements.get('output-note').textContent,/более поздней остановки/);
 show(out('',{coutBuffered:buffer('new')}) ,'run-2',1);
 assert.equal(elements.get('stdout').textContent,'','new process resets terminal view');
 show(out('',{coutBuffered:{available:false,reason:'cout-custom-streambuf-unsupported'}}),'run-2',2);
 assert.equal(pending(),'');
 assert.match(elements.get('output-note').textContent,/cout-custom-streambuf-unsupported/);
-console.log('PASS output UI: aliases, independent buffers, escaping, flush, historical pending, process reset');
+console.log('PASS output UI: aliases, independent buffers, escaping, flush, historical pending across branches, process reset');

@@ -30,6 +30,8 @@ import symbols_integration
 import vtable_integration
 import memory_edit_integration
 import memory_edit_failure_integration
+import scalar_storage_integration
+import scalar_storage_failure_integration
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -114,6 +116,9 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         scenarios.append((symbols_integration, [str(executable.parent / "libphantom-module-symbols-library.so")]))
     if capabilities.get("variableLayout") == "gdb-python-dwarf":
         scenarios.append((layout_integration, []))
+    if capabilities.get("scalarStorage") == "native-dwarf-scalar-v1":
+        scenarios.append((scalar_storage_integration, []))
+        scenarios.append((scalar_storage_failure_integration, []))
     if capabilities.get("memoryWrite") == "native-private-memory-v1":
         scenarios.append((memory_edit_integration, []))
         scenarios.append((memory_edit_failure_integration, []))

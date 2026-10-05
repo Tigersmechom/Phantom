@@ -1080,12 +1080,54 @@ ID eviction. Новый launch/workspace очищает ledger. Ограниче
 
 Точный wire-контракт, порядок событий, ограничения и примеры:
 [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
-Следующий срез — типизированные scalar edits с авторитетной DWARF metadata
-поверх проверяемых storage bytes; затем отдельные bounded register/runtime
-interventions и их ветвление. P5 целиком этим срезом не завершён.
+Типизированное продолжение с авторитетной DWARF metadata поставлено в §20.10;
+далее — отдельные bounded register/runtime interventions и их ветвление. P5 целиком этим срезом не завершён.
 
 Проверки среза 20.9: **37/37 CTest Debug и 37/37 ASan/UBSan**, 3168 реальных
 протокольных кадров через TypeScript 5.9.3, пять проверок harness и четыре
 Node contract-теста. Отдельно проверены partial write, `^error` после реального
 изменения, отказ readback, смерть GDB при write/refresh, replay запроса после
 exit, старые captures/history, многопоточность, границы VMA и заполненный FIFO.
+
+### 20.10. Типизированное изменение скалярного storage — 05.10.2026
+
+Добавлены `inspectScalarStorage`, `readScalarStorage`, `writeScalarStorage`
+и capability `scalarStorage: native-dwarf-scalar-v1`. Снимок связывает
+выпущенный root locator, текущую остановку, точные metadata типа/адреса и raw
+bytes. Запись сначала повторно получает metadata, затем проверяет ожидаемые
+байты через общий механизм 20.9. Старый `writeVariable` не переопределяется:
+без доказанного lifetime это изменение storage, а не утверждение о C++
+assignment или выполненной инициализации.
+
+Поддержаны целые 8/16/32/64 бит и bool, точные границы signed/unsigned,
+канонические десятичные строки и строгая проверка ширины/знака. Для typedef,
+char и `-funsigned-char` источником служит GDB type metadata, а не форматтер
+значения/название типа. Const/volatile/_Atomic/std::atomic, enum, pointer,
+reference, aggregate, float, extended integer, register-only/optimized-out и
+неоднозначные locators не разрешают запись. Отсутствие необходимых GDB Python
+APIs, в том числе `Type.is_signed`, оставляет target unavailable. Профиль
+подтверждает x86-64/little-endian, требует native, один stopped thread и не
+работает в waitingForInput. Объектный lifetime остаётся unknown.
+
+Audit хранит ID и metadata исходного typed snapshot, ожидаемые байты и
+запрошенное/наблюдаемое значения; partial readback не подменяется requested value. Некорректное
+представление bool сохраняет байт с value:null и допускает явное исправление
+через сравнение raw bytes. Повтор запроса после смены stop, exit или вытеснения
+исходного inspection snapshot возвращает прежний результат без второй записи.
+Старая история и typed snapshots неизменны; raw/typed правки используют общую
+ветвь происхождения и ledger. Метаданные и запись не доставляют stdin/EOF.
+
+Следующие отдельные задачи P5: exact float32/64 storage, согласованные
+многоэлементные изменения с видимыми частичными результатами, bounded register/
+runtime interventions и совместимое с recorder ветвление. Сопоставление storage
+с объектным lifetime относится к P2; этот срез не объявляет P2/P5 завершёнными.
+Wire-примеры и ограничения: [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md#typed-scalar-storage).
+
+Проверки 20.10: **41/41 Debug и 41/41 ASan/UBSan**, 4220 реальных кадров через
+TypeScript 5.9.3, пять harness-проверок и четыре Node contract-теста. Помимо
+границ всех integer widths и bool проверены qualifiers, _Atomic, оптимизация,
+register-only, nested frames/shadowing, повреждённые GDB metadata, внешняя
+запись в /proc/PID/mem между snapshot и edit, partial write, отсутствие
+readback, смерть GDB, dedup после eviction и сохранность stdin. В harness
+исправлена идентичность committed stdout: переключение ветвей одного процесса
+не уменьшает уже сброшенный вывод; pending меняется вместе с выбранным снимком.

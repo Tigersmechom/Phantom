@@ -30,6 +30,8 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readVariableLayout` | No | Read a retained variable layout. |
 | `inspectVtable` | Required | Decode a selected vptr slot under an explicitly requested ABI profile. |
 | `readVtableSnapshot` | No | Read a retained vptr/header/word capture. |
+| `inspectScalarStorage` / `writeScalarStorage` | Required | Capture authoritative scalar type/storage; compare and edit through a retained snapshot. |
+| `readScalarStorage` | No | Read an immutable scalar storage snapshot. |
 | `writeMemory` | Required | Compare, write and verify bounded native storage bytes; retain intervention provenance. |
 | `readMemoryIntervention` / `listMemoryInterventions` / `listBranches` | No | Read session intervention audits and branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
@@ -517,3 +519,80 @@ The MI write command and recorder side effects are described in the official
 [GDB data manipulation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
 and [record/replay](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html)
 manuals.
+
+## Typed scalar storage
+
+`capabilities.scalarStorage = "native-dwarf-scalar-v1"` adds a typed layer over
+the checked memory intervention. It supports integer storage of 8/16/32/64
+bits and one-byte `bool` on the verified x86-64 little-endian target. It does
+not assert that a C++ object's lifetime has begun. The legacy `writeVariable`
+command and `variableWrite:false` stay unchanged.
+
+1. `inspectScalarStorage{locator}` inspects an unambiguous root locator emitted
+   at this stop, including roots from paged `readVariables` in another frame.
+   It returns `{kind:"scalarStorage",snapshot}` with immutable point/stop/PID,
+   authoritative type metadata, address, exact bytes and decoded scalar value.
+2. `writeScalarStorage{profile:"native-dwarf-scalar-v1",snapshotId,value}`
+   requires that snapshot's current session and `expectedStop`. The backend
+   resolves the locator again, compares type/address metadata, encodes the
+   requested value, then uses the shared memory compare/write/readback path.
+3. `readScalarStorage{snapshotId}` reads the retained snapshot without a live
+   process. Snapshots share the existing 128-entry inspection cache; eviction
+   yields `HISTORY_EVICTED`. The intervention audit and request dedup ledger
+   retain their own copy of typed provenance independently of that cache.
+
+For example, after obtaining an `int` snapshot called `scalar-1`:
+
+```json
+{
+  "kind": "writeScalarStorage",
+  "profile": "native-dwarf-scalar-v1",
+  "snapshotId": "scalar-1",
+  "value": {"kind":"integer","decimal":"-2147483648","bits":32,"signed":true}
+}
+```
+
+For a bool snapshot use `{"kind":"boolean","value":true}`. Integer decimal
+strings are canonical: no leading plus/zeros, whitespace, exponent or `-0`.
+Width and signedness must exactly match the inspected metadata; there are no
+implicit C++ conversions or truncation. Signed/unsigned ranges are checked
+without floating-point conversion, including `INT64_MIN` and `UINT64_MAX`.
+`storage.value` and the intervention's before/after values use the same exact
+representation. A noncanonical bool byte such as `02` has complete available
+storage but `value:null` and reason `invalid-scalar-representation`; replacing
+it with `00` or `01` still compares its original raw bytes.
+
+Both live scalar inspection and writing require native execution, exactly one
+confirmed stopped thread, and phase `stopped` outside an input wait. Const,
+volatile, atomic, reference, pointer, enum, aggregate, float and unsupported
+extended integer types are rejected. A register-only or optimized-out value
+has no writable memory storage. Unknown/ambiguous/unissued locators are not
+resolved by guessing. Type names are labels, never assignment expressions or
+an authority for signedness.
+
+The engine uses trusted GDB Python type APIs and compares unqualified types
+against built-in scalar types. This also rejects `_Atomic int`, which GDB can
+report with integer type code/name and whose qualifier is not removed by
+`Type.unqualified()`. `Type.is_signed`, other required metadata, the target
+architecture and byte order must be available; older GDB versions may return
+an unavailable target instead of guessing. Capability advertises the profile,
+not a guarantee that every GDB/build/variable supplies this evidence.
+[Type API](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Types-In-Python.html),
+[value/address API](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Values-From-Inferior.html).
+
+The result remains `memoryIntervention`, now with profile
+`native-dwarf-scalar-v1` and a `scalar` section containing the original snapshot
+ID, locator, verified target metadata, requested value and observed before/
+after scalar values. A missing or partial readback leaves `afterValue:null`;
+requested values never substitute for observed effects. Events, once-only
+request handling, branch creation, readback errors, failed-context cleanup and
+ledger bounds match raw memory edits. A retry still succeeds after the source
+snapshot is evicted, because the original request's result is already saved.
+
+Inspecting/refreshing metadata does not execute the inferior or feed queued
+stdin/EOF. An edit invalidates other snapshots from the previous stop, including
+when the PC is unchanged. Raw and typed edits share the same branch ancestry.
+An externally changed value at the same stop causes a byte conflict, not an
+unconditional overwrite. C++ assignment semantics, object initialization,
+alternate-future restoration, floating-point edits and language side effects
+remain outside this storage profile.

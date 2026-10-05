@@ -92,10 +92,11 @@ function escapeHtml(text) {
 function renderOutput(observation) {
   const snapshot = observation.stdout || {text:'',totalBytes:0,retainedFromByte:0};
   // A historical cursor can shrink pending bytes, but cannot undo bytes
-  // already emitted by this run. Keep this bounded terminal view separate
-  // from the immutable stdout snapshot stored in each Observation.
+  // already emitted by this process, including across intervention branches.
+  // Keep this bounded terminal view separate from the immutable stdout
+  // snapshot stored in each Observation.
   const key = JSON.stringify([sessionEpoch, session?.id, session?.generation,
-    observation.processInstanceId, observation.buildId, observation.point?.branchId]);
+    observation.processInstanceId, observation.buildId]);
   if (!committedOutput || committedOutput.key !== key || snapshot.totalBytes > committedOutput.snapshot.totalBytes ||
       (snapshot.totalBytes === committedOutput.snapshot.totalBytes && snapshot.retainedFromByte < committedOutput.snapshot.retainedFromByte))
     committedOutput = {key, snapshot};

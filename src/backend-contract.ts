@@ -1,4 +1,4 @@
-import type { MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { ScalarStorageSnapshotDTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -586,6 +586,7 @@ export interface BackendCapabilitiesDTO {
   hitCountBreakpoints: boolean;
   variableWrite: boolean;
   memoryWrite: 'native-private-memory-v1' | 'none';
+  scalarStorage: 'native-dwarf-scalar-v1' | 'none';
   interventionBranches: boolean;
   inputTracking: InputStateDTO['tracking'];
   interactiveInput: boolean;
@@ -642,6 +643,9 @@ export type BackendCommandDTO =
   | { kind: 'disassemble'; buildId: string; target: { kind: 'pc'; addressHex: string } | { kind: 'source'; range: SourceSpanDTO }; maxInstructions: number }
   /** Compare and write raw storage, native/single-thread only. Events are emitted once. */
   | { kind: 'writeMemory'; profile: 'native-private-memory-v1'; addressHex: string; expectedBytesHex: string; replacementBytesHex: string }
+  | { kind: 'inspectScalarStorage'; locator: string }
+  | { kind: 'readScalarStorage'; snapshotId: string }
+  | { kind: 'writeScalarStorage'; profile: 'native-dwarf-scalar-v1'; snapshotId: string; value: ScalarStorageValueDTO }
   | { kind: 'readMemoryIntervention'; interventionId: string }
   | { kind: 'listMemoryInterventions'; start: number; count: number }
   | { kind: 'listBranches' }
@@ -683,6 +687,7 @@ export interface BackendRequestDTO {
 export type BackendResultDTO =
   /** Write response includes final event sequence; duplicate request returns this response without emitting events again. */
   | { kind: 'memoryIntervention'; intervention: MemoryInterventionDTO; throughSequence?: number }
+  | { kind: 'scalarStorage'; snapshot: ScalarStorageSnapshotDTO }
   | { kind: 'memoryInterventions'; items: MemoryInterventionDTO[]; start: number; total: number; hasMore: boolean }
   | { kind: 'branches'; currentBranchId: string; branches: InterventionBranchDTO[] }
   | OutputJournalDTO

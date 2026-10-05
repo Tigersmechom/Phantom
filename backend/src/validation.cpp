@@ -273,7 +273,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "writeMemory" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeMemory" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
@@ -313,6 +313,31 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "restoreExecution") { only({"kind","point","strategy"}); unsupported("command.strategy","verified replay is capability-gated"); }
   if (kind == "setBreakpoints") { only({"kind","documentId","revisionId","breakpoints"}); id(req(c,"documentId","command"),"command.documentId",l); id(req(c,"revisionId","command"),"command.revisionId",l); const auto& bs=req(c,"breakpoints","command"); array_limit(bs,"command.breakpoints",l.maxBreakpoints); for(const auto& b:bs) breakpoint(b,l); return; }
   if (kind == "readVariables") { only({"kind","reference","start","count"}); id(req(c,"reference","command"),"command.reference",l); safe_uint(req(c,"start","command"),"command.start"); positive_uint(req(c,"count","command"),"command.count",l.maxPageSize); return; }
+  if (kind == "inspectScalarStorage") {
+    only({"kind","locator"}); string_value(req(c,"locator","command"),"command.locator",272); return;
+  }
+  if (kind == "readScalarStorage") {
+    only({"kind","snapshotId"}); id(req(c,"snapshotId","command"),"command.snapshotId",l); return;
+  }
+  if (kind == "writeScalarStorage") {
+    only({"kind","profile","snapshotId","value"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-dwarf-scalar-v1"});
+    id(req(c,"snapshotId","command"),"command.snapshotId",l);
+    const auto& value = req(c,"value","command");
+    enum_string(req(value,"kind","command.value"),"command.value.kind",{"integer","boolean"});
+    if (value.at("kind") == "integer") {
+      string_value(req(value,"decimal","command.value"),"command.value.decimal",20);
+      const auto& decimal = value.at("decimal").get_ref<const std::string&>();
+      const auto digits = std::string_view(decimal).substr(decimal.front() == '-' ? 1 : 0);
+      if (digits.empty() || (digits.front() == '0' && decimal != "0"))
+        invalid("command.value.decimal","expected canonical decimal integer");
+      const auto& bits = req(value,"bits","command.value");
+      safe_uint(bits,"command.value.bits",64);
+      if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
+        invalid("command.value.bits","only 8, 16, 32 and 64 bit integers are supported");
+    }
+    validate_scalar_value(value,l); return;
+  }
   if (kind == "writeMemory") {
     only({"kind","profile","addressHex","expectedBytesHex","replacementBytesHex"});
     enum_string(req(c,"profile","command"),"command.profile",{"native-private-memory-v1"});

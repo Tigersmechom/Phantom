@@ -75,3 +75,10 @@ state и не считать пропущенную команду успешн�
 редактирования в этот стенд пока не добавлены; типизированная запись переменных
 остаётся выключена. Формы запросов, получение audit и ограничения приведены в
 [INSPECTION_GATEWAYS.md](../../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
+
+Через протокол также доступны `inspectScalarStorage` / `writeScalarStorage`:
+целые 8/16/32/64 бит и bool с проверкой настоящего GDB-типа, адреса и исходных
+байтов. Начните с inspection текущего locator и используйте полученный
+snapshotId; пример — в [контракте](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
+Кнопок этой операции в стенде пока нет. Это typed storage-профиль с lifetime
+unknown; старый `writeVariable` остаётся выключен.

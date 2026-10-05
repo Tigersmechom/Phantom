@@ -75,7 +75,8 @@ class BackendService final {
   std::vector<Json> handleModuleSymbols(const Json& request);
   std::vector<Json> handleVariableLayout(const Json& request);
   std::vector<Json> handleVtable(const Json& request);
-  std::vector<Json> handleMemoryIntervention(const Json& request);
+  std::vector<Json> handleMemoryIntervention(const Json& request, const Json& preparedScalar = nullptr);
+  std::vector<Json> handleScalarStorage(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);
   Json handleInput(const Json& request);

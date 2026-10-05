@@ -121,6 +121,7 @@ Json BackendService::capabilities() const {
       {"moduleSymbols", "elf-section-symbol-tables"}, {"variableLayout", "gdb-python-dwarf"}, {"recorderProbe", true},
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
+      {"scalarStorage", "native-dwarf-scalar-v1"},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
@@ -726,7 +727,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       }
     }
     if ((kind == "listBranches" || kind == "listMemoryInterventions" || kind == "readMemoryIntervention" || kind == "listHistory" || kind == "readHistory" || kind == "replayEvents" ||
-         kind == "readModuleSymbols" || kind == "readVariableLayout" || kind == "readVtableSnapshot" ||
+         kind == "readScalarStorage" || kind == "readModuleSymbols" || kind == "readVariableLayout" || kind == "readVtableSnapshot" ||
          kind == "readModuleSnapshot" || kind == "readOutputJournal" || kind == "readMemoryCapture" || kind == "diffMemoryCaptures" || kind == "diffMemoryMaps" || kind == "readInstructionTrace") &&
         !sessionId_.empty() && request.at("session").is_null())
       return {errorResponse(request, "STALE_CONTEXT", "history belongs to the current debugging session", false)};
@@ -752,14 +753,15 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     }
     if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
-                                 kind == "writeMemory" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
+                                 kind == "writeScalarStorage" || kind == "writeMemory" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
     const bool liveCommand = kind == "step" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "appendInput" || kind == "closeInput" ||
                              kind == "readVariables" || kind == "readMemory" || kind == "disassemble" ||
                              kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" ||
                              kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" ||
                              kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
-                             kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory";
+                             kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory" ||
+                             kind == "inspectScalarStorage" || kind == "writeScalarStorage";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
     if (liveCommand && !engine_->live())
@@ -818,6 +820,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "inspectModuleSymbols" || kind == "readModuleSymbols") return handleModuleSymbols(request);
     if (kind == "inspectVariableLayout" || kind == "readVariableLayout") return handleVariableLayout(request);
     if (kind == "inspectVtable" || kind == "readVtableSnapshot") return handleVtable(request);
+    if (kind == "inspectScalarStorage" || kind == "readScalarStorage" || kind == "writeScalarStorage") return handleScalarStorage(request);
     if (kind == "writeMemory" || kind == "readMemoryIntervention" || kind == "listMemoryInterventions" || kind == "listBranches")
       return handleMemoryIntervention(request);
     if (kind == "launch") return handleLaunch(request, publish);

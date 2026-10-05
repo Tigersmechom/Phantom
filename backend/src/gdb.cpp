@@ -4,6 +4,7 @@
 #include "phantom/mi.hpp"
 #include "phantom/process.hpp"
 #include "variable_layout_script.hpp"
+#include "scalar_storage_script.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1665,6 +1666,40 @@ struct GdbEngine::Impl {
     }
   }
 
+  bool resolveIssuedRootLocator(std::string_view locator, unsigned& level,
+                                std::string_view& name, GdbError& error) {
+    if (!locator.starts_with("frame:") || locator.size() > 272) {
+      error = {"INVALID_REQUEST", "expected an emitted root variable locator", false}; return false;
+    }
+    const auto separator = locator.find(':', 6);
+    if (separator == std::string_view::npos) {
+      error = {"INVALID_REQUEST", "expected frame:<level>:<variable> locator", false}; return false;
+    }
+    const auto levelText = locator.substr(6, separator - 6);
+    level = 0;
+    const auto parsed = std::from_chars(levelText.data(), levelText.data() + levelText.size(), level);
+    name = locator.substr(separator + 1);
+    if (levelText.empty() || parsed.ec != std::errc{} || parsed.ptr != levelText.data() + levelText.size() ||
+        level > 4095 || (levelText.size() > 1 && levelText.front() == '0') || name.size() > 256 ||
+        !validEnvironmentName(name)) {
+      error = {"INVALID_REQUEST", "only canonical root variable locators with an ASCII identifier are supported", false};
+      return false;
+    }
+    const auto issued = issuedLayoutLocators.find(std::string(locator));
+    const std::size_t matches = issued == issuedLayoutLocators.end() ? 0 : issued->second;
+    if (matches == 0 && layoutLocatorLimitReached) {
+      error = {"LIMIT_EXCEEDED", "per-stop layout locator retention is limited to 4096 variables", false};
+      return false;
+    }
+    if (matches != 1) {
+      error = {matches == 0 ? "READ_FAILED" : "UNSUPPORTED",
+               matches == 0 ? "variable locator was not emitted at this stop" :
+                              "variable locator is ambiguous across shadowed declarations", false};
+      return false;
+    }
+    return true;
+  }
+
   bool recordingSnapshot(nlohmann::json& result, GdbError& error) {
     result = {{"profile", recordingProfile}, {"available", false}};
     if (recordingProfile == "native") {
@@ -2421,35 +2456,9 @@ bool GdbEngine::inspectVariableLayout(std::string_view locator, nlohmann::json& 
                                       GdbError& error) {
   error = {};
   if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
-  if (!locator.starts_with("frame:") || locator.size() > 272) {
-    error = {"INVALID_REQUEST", "expected an emitted root variable locator", false}; return false;
-  }
-  const auto separator = locator.find(':', 6);
-  if (separator == std::string_view::npos) {
-    error = {"INVALID_REQUEST", "expected frame:<level>:<variable> locator", false}; return false;
-  }
-  const auto levelText = locator.substr(6, separator - 6);
   unsigned level = 0;
-  const auto parsed = std::from_chars(levelText.data(), levelText.data() + levelText.size(), level);
-  const auto name = locator.substr(separator + 1);
-  if (levelText.empty() || parsed.ec != std::errc{} || parsed.ptr != levelText.data() + levelText.size() ||
-      level > 4095 || (levelText.size() > 1 && levelText.front() == '0') || name.size() > 256 ||
-      !validEnvironmentName(name)) {
-    error = {"INVALID_REQUEST", "only canonical root variable locators with an ASCII identifier are supported", false};
-    return false;
-  }
-  const auto issued = impl_->issuedLayoutLocators.find(std::string(locator));
-  const std::size_t matches = issued == impl_->issuedLayoutLocators.end() ? 0 : issued->second;
-  if (matches == 0 && impl_->layoutLocatorLimitReached) {
-    error = {"LIMIT_EXCEEDED", "per-stop layout locator retention is limited to 4096 variables", false};
-    return false;
-  }
-  if (matches != 1) {
-    error = {matches == 0 ? "READ_FAILED" : "UNSUPPORTED",
-             matches == 0 ? "variable locator was not emitted at this stop" :
-                            "variable locator is ambiguous across shadowed declarations", false};
-    return false;
-  }
+  std::string_view name;
+  if (!impl_->resolveIssuedRootLocator(locator, level, name, error)) return false;
   MiRecord features;
   if (!impl_->command("-list-features", false, features, error)) return false;
   bool pythonAvailable = false;
@@ -2483,6 +2492,79 @@ bool GdbEngine::inspectVariableLayout(std::string_view locator, nlohmann::json& 
     error = {"READ_FAILED", "GDB returned malformed variable layout metadata", false}; return false;
   }
   result = std::move(layout);
+  return true;
+}
+
+bool GdbEngine::inspectScalarStorage(std::string_view locator, nlohmann::json& result,
+                                     GdbError& error) {
+  error = {};
+  result = nullptr;
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  if (!impl_->prepareMemoryWrite(error)) return false;
+  unsigned level = 0;
+  std::string_view name;
+  if (!impl_->resolveIssuedRootLocator(locator, level, name, error)) return false;
+  MiRecord features;
+  if (!impl_->command("-list-features", false, features, error)) return false;
+  bool pythonAvailable = false;
+  if (const auto* supported = field(features.fields, "features"))
+    for (const auto& feature : supported->values)
+      pythonAvailable = pythonAvailable || feature->text == "python";
+  if (!pythonAvailable) {
+    error = {"UNSUPPORTED", "this GDB does not advertise Python support", false}; return false;
+  }
+  std::string script(detail::scalarStorageScript);
+  script += "\n_phantom_scalar_storage(" + std::to_string(level) + "," +
+      nlohmann::json(name).dump() + "," + nlohmann::json(locator).dump() + ")\n";
+  const auto python = "python exec(" + nlohmann::json(script).dump() + ")";
+  MiRecord ignored;
+  if (!impl_->command("-interpreter-exec console " + miQuote(python), false, ignored, error, 0, true)) {
+    if (error.message.find("Python scripting is not supported") != std::string::npos)
+      error = {"UNSUPPORTED", "this GDB was built without Python support", false};
+    return false;
+  }
+  constexpr std::string_view prefix = "PHANTOM_SCALAR_STORAGE_V1:";
+  const auto malformed = [&] {
+    error = {"READ_FAILED", "GDB returned invalid scalar storage metadata", false};
+    return false;
+  };
+  const auto& console = impl_->consoleOutput;
+  if (!console.starts_with(prefix) || console.size() > prefix.size() + 4096 + 1) return malformed();
+  auto target = nlohmann::json::parse(console.substr(prefix.size()), nullptr, false);
+  try {
+    if (!target.is_object() || target.size() != 8 ||
+        target.at("source") != "gdb-python-dwarf" || target.at("locator") != locator ||
+        target.at("lifetime") != "unknown" || !target.at("available").is_boolean() ||
+        (!target.at("typeName").is_null() && (!target.at("typeName").is_string() ||
+          target.at("typeName").get_ref<const std::string&>().size() > 256)) ||
+        (!target.at("reason").is_null() && (!target.at("reason").is_string() ||
+          target.at("reason").get_ref<const std::string&>().size() > 64))) return malformed();
+    const auto& scalar = target.at("scalar");
+    if (!scalar.is_null()) {
+      if (!scalar.is_object() || scalar.size() != 6 || !scalar.at("byteSize").is_number_integer() ||
+          !scalar.at("bits").is_number_integer() || scalar.at("byteOrder") != "little") return malformed();
+      const auto& byteSize = scalar.at("byteSize");
+      if (byteSize != 1 && byteSize != 2 && byteSize != 4 && byteSize != 8) return malformed();
+      const auto size = byteSize.get<unsigned>();
+      if (scalar.at("bits") != size * 8) return malformed();
+      if (scalar.at("kind") == "boolean") {
+        if (size != 1 || !scalar.at("signed").is_null() || scalar.at("representation") != "boolean-01") return malformed();
+      } else if (scalar.at("kind") == "integer") {
+        if (!scalar.at("signed").is_boolean() || scalar.at("representation") !=
+            (scalar.at("signed").get<bool>() ? "twos-complement" : "unsigned-binary")) return malformed();
+      } else return malformed();
+    }
+    if (target.at("available").get<bool>()) {
+      if (scalar.is_null() || !target.at("reason").is_null() || !target.at("addressHex").is_string()) return malformed();
+      const auto& addressText = target.at("addressHex").get_ref<const std::string&>();
+      if (!addressText.starts_with("0x") || addressText.size() < 3 || addressText.size() > 18 ||
+          addressText.find_first_not_of("0123456789abcdef", 2) != std::string::npos ||
+          (addressText.size() > 3 && addressText[2] == '0')) return malformed();
+      const auto address = parseAddress(addressText);
+      if (!address || *address > std::numeric_limits<std::uint64_t>::max() - scalar.at("byteSize").get<unsigned>()) return malformed();
+    } else if (!target.at("addressHex").is_null() || !target.at("reason").is_string()) return malformed();
+  } catch (const nlohmann::json::exception&) { return malformed(); }
+  result = std::move(target);
   return true;
 }
 

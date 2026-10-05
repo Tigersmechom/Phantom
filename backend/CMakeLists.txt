@@ -10,6 +10,8 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/service_scalar_storage.cpp
+  src/scalar_codec.cpp
   src/service_memory_edit.cpp
   src/memory_edit.cpp
   src/service_vtable.cpp
@@ -98,7 +100,7 @@ if(BUILD_TESTING)
   add_library(phantom-module-map-library SHARED fixtures/module-map-library.cpp)
   target_compile_options(phantom-module-map-library PRIVATE -g -fno-sanitize=all)
   target_link_options(phantom-module-map-library PRIVATE -fno-sanitize=all)
-  foreach(module IN ITEMS memory-edit elf elf-symbols module-symbols vtable process-inspection output-journal recorder-probe module-map)
+  foreach(module IN ITEMS scalar-codec memory-edit elf elf-symbols module-symbols vtable process-inspection output-journal recorder-probe module-map)
     string(REPLACE "-" "_" test_file "${module}")
     add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
     target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
@@ -122,7 +124,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure memory_edit memory_edit_failure output_journal recorder_probe recording layout vtable)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure memory_edit memory_edit_failure scalar_storage scalar_storage_failure output_journal recorder_probe recording layout vtable)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -183,6 +185,18 @@ if(BUILD_TESTING)
     "$<TARGET_FILE:phantom-gdb-test-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/gdb-test.cpp")
   set_tests_properties(gdb-engine PROPERTIES TIMEOUT 30)
+  add_library(phantom-scalar-storage-optimized OBJECT fixtures/scalar-storage-optimized.cpp)
+  target_compile_options(phantom-scalar-storage-optimized PRIVATE -g -O2 -fno-omit-frame-pointer -fno-pie -fno-sanitize=all)
+  add_executable(phantom-scalar-storage-fixture fixtures/scalar-storage.cpp $<TARGET_OBJECTS:phantom-scalar-storage-optimized>)
+  target_compile_options(phantom-scalar-storage-fixture PRIVATE -g -O0 -fno-omit-frame-pointer -fno-pie -fno-sanitize=all)
+  target_link_options(phantom-scalar-storage-fixture PRIVATE -no-pie -fno-sanitize=all)
+  add_executable(phantom-gdb-scalar-storage-test tests/gdb_scalar_storage_test.cpp)
+  target_link_libraries(phantom-gdb-scalar-storage-test PRIVATE phantom-core)
+  add_dependencies(phantom-gdb-scalar-storage-test phantom-scalar-storage-fixture phantom-io-wrapper)
+  add_test(NAME gdb-scalar-storage COMMAND "$<TARGET_FILE:phantom-gdb-scalar-storage-test>"
+    "$<TARGET_FILE:phantom-scalar-storage-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/scalar-storage.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/scalar-storage-optimized.cpp")
+  set_tests_properties(gdb-scalar-storage PROPERTIES TIMEOUT 90)
   add_executable(phantom-gdb-memory-write-test tests/gdb_memory_write_test.cpp)
   target_link_libraries(phantom-gdb-memory-write-test PRIVATE phantom-core)
   add_dependencies(phantom-gdb-memory-write-test phantom-gdb-test-fixture phantom-io-wrapper)

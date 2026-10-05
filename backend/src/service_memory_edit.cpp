@@ -1,6 +1,7 @@
 #include "phantom/service.hpp"
 #include "phantom/memory_edit.hpp"
 #include "phantom/memory_map.hpp"
+#include "phantom/scalar_codec.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -54,9 +55,9 @@ bool sameCompleteMaps(const Json& before, const Json& after) {
 }
 }
 
-std::vector<Json> BackendService::handleMemoryIntervention(const Json& request) {
+std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, const Json& preparedScalar) {
   if (sessionId_.empty()) return {errorResponse(request,"STALE_CONTEXT","interventions require an established session")};
-  const auto& command = request.at("command");
+  const auto& command = preparedScalar.is_object() ? preparedScalar.at("memoryCommand") : request.at("command");
   const auto kind = command.at("kind").get<std::string>();
   if (kind == "listBranches") return {okResponse(request,{{"kind","branches"},
     {"currentBranchId",currentBranchId_},{"branches",branches_}})};
@@ -105,7 +106,7 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request) 
   // This ledger is separate from the evictable history/inspection caches.
   interventions_.reserve(maxInterventions);
   const auto id = "intervention-" + std::to_string(interventions_.size()+1);
-  Json audit = {{"id",id},{"requestId",request.at("requestId")},{"profile","native-private-memory-v1"},
+  Json audit = {{"id",id},{"requestId",request.at("requestId")},{"profile",request.at("command").at("profile")},
     {"processInstanceId",processInstanceId_},{"beforePoint",liveObservation_.at("point")},
     {"beforeStop",liveObservation_.at("stop")},{"afterPoint",nullptr},{"afterStop",nullptr},
     {"branchId",nullptr},{"contextStatus","unchanged"},{"mapping",std::move(mapping)},
@@ -124,6 +125,16 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request) 
     return {attempted,acknowledged,engine_->live(),writeError.code,writeError.message};
   };
   audit["report"] = compareAndWriteMemory(address,expected,replacement,reader,writer);
+  if (preparedScalar.is_object()) {
+    audit["scalar"] = preparedScalar.at("scalar");
+    const auto& type = audit.at("scalar").at("target").at("scalar");
+    for (const auto* phase : {"before", "after"}) {
+      const auto field = std::string(phase) + "BytesHex";
+      const auto& bytes = audit.at("report").at(field);
+      const auto value = bytes.is_string() ? decodeScalarStorage(type,rawHex(bytes.get<std::string>())) : std::nullopt;
+      audit["scalar"][std::string(phase)+"Value"] = value ? *value : Json(nullptr);
+    }
+  }
   std::vector<Json> events;
   const auto requestId = request.at("requestId").get<std::string>();
   const bool attempted = audit.at("report").at("writeAttempted").get<bool>();

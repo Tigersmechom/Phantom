@@ -409,3 +409,18 @@ restoration of a previous process. History uses full point identity; the output
 journal remains process-wide. Counters stay monotonic across forks. The ledger
 has bounded non-evicting reservations separate from inspection caches. Details
 and error semantics: [inspection gateways](../../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
+
+## 2026-10-05: authoritative scalar storage edits
+
+`scalarStorage: native-dwarf-scalar-v1` exposes inspect/read/write scalar
+storage commands without changing legacy `writeVariable`. Retained snapshot
+IDs bind expected type, address and bytes to the exact current stop. Writes
+re-resolve GDB metadata and share the raw edit audit/branch/dedup path. New
+`ScalarStorageValueDTO` carries canonical integer strings with exact matching
+width/sign, or bool. No implicit C++ conversion or lifetime claim is made.
+
+`MemoryInterventionDTO` is discriminated by raw versus scalar profile; scalar
+reports require the original typed target, requested value and actual decoded
+before/after values. A partial read or invalid bool representation stays null.
+Unavailable metadata/storage never becomes an editable value. See the
+[scalar gateway](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).

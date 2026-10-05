@@ -101,6 +101,10 @@ protocol capabilities.
   immutable audit, lineage branches и повтор запроса без повторной записи
   доступны через протокол. Только один остановленный поток, без record-full.
   [Контракт и границы](../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
+- `inspectScalarStorage` / `writeScalarStorage` связывают проверенные GDB-типы
+  целых и bool с точными storage bytes и общей историей вмешательств. Тип,
+  адрес и исходные байты проверяются повторно; lifetime остаётся unknown.
+  [Типизированный профиль](../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
   expression traces, source disassembly и verified restore выключены и отвечают
   `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес

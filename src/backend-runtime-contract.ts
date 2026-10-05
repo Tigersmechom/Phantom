@@ -417,10 +417,9 @@ export interface InterventionBranchDTO {
   interventionId: string | null;
 }
 /** An in-memory audit retained until the next successful launch/workspace change. */
-export interface MemoryInterventionDTO {
+export interface MemoryInterventionBaseDTO {
   id: string;
   requestId: string;
-  profile: 'native-private-memory-v1';
   processInstanceId: string;
   beforePoint: HistoryPointDTO;
   beforeStop: StopRefDTO;
@@ -451,3 +450,51 @@ export interface MemoryInterventionDTO {
     errors: { phase: 'read-before' | 'write' | 'read-after'; code: string; message: string }[];
   };
 }
+
+/** Typed storage edits do not claim a live C++ object or language assignment. */
+export type ScalarStorageValueDTO =
+  | { kind: 'integer'; decimal: string; bits: 8 | 16 | 32 | 64; signed: boolean }
+  | { kind: 'boolean'; value: boolean };
+export type ScalarStorageTypeDTO =
+  | { kind: 'integer'; byteSize: 1 | 2 | 4 | 8; bits: 8 | 16 | 32 | 64;
+      signed: boolean; byteOrder: 'little'; representation: 'twos-complement' | 'unsigned-binary' }
+  | { kind: 'boolean'; byteSize: 1; bits: 8; signed: null;
+      byteOrder: 'little'; representation: 'boolean-01' };
+export interface ScalarStorageTargetDTO {
+  available: boolean;
+  source: 'gdb-python-dwarf';
+  locator: string;
+  lifetime: 'unknown';
+  reason: string | null;
+  typeName: string | null;
+  scalar: ScalarStorageTypeDTO | null;
+  addressHex: string | null;
+}
+export interface ScalarStorageSnapshotDTO {
+  id: string;
+  type: 'scalarStorageSnapshot';
+  profile: 'native-dwarf-scalar-v1';
+  point: HistoryPointDTO;
+  stop: StopRefDTO;
+  processInstanceId: string;
+  target: ScalarStorageTargetDTO;
+  storage: {
+    /** True means complete bytes; invalid bool representation still has bytes. */
+    available: boolean;
+    bytesHex: string | null;
+    value: ScalarStorageValueDTO | null;
+    reason: string | null;
+  };
+}
+export interface ScalarStorageInterventionDTO {
+  snapshotId: string;
+  locator: string;
+  target: ScalarStorageTargetDTO;
+  requestedValue: ScalarStorageValueDTO;
+  beforeValue: ScalarStorageValueDTO | null;
+  afterValue: ScalarStorageValueDTO | null;
+}
+export type MemoryInterventionDTO = MemoryInterventionBaseDTO & (
+  | { profile: 'native-private-memory-v1'; scalar?: never }
+  | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO }
+);

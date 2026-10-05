@@ -256,6 +256,36 @@ int main() {
   gateway["command"]["count"] = 129; assert(validation_fails(gateway));
   gateway["command"] = {{"kind","readMemoryIntervention"},{"interventionId","intervention-1"}};
   assert(!validation_fails(gateway));
+  gateway["expectedStop"] = {{"stopId","stop-1"},{"stateRevision",1}};
+  gateway["command"] = {{"kind","inspectScalarStorage"},{"locator","frame:0:value"}};
+  assert(!validation_fails(gateway));
+  auto noScalarStop = gateway; noScalarStop.erase("expectedStop");
+  assert(validation_fails(noScalarStop,"INVALID_REQUEST"));
+  const Json scalarCommand = {{"kind","writeScalarStorage"},{"profile","native-dwarf-scalar-v1"},
+    {"snapshotId","scalar-1"},{"value",{{"kind","integer"},{"decimal","-9223372036854775808"},{"bits",64},{"signed",true}}}};
+  gateway["command"] = scalarCommand;
+  assert(!validation_fails(gateway));
+  noScalarStop = gateway; noScalarStop.erase("expectedStop");
+  assert(validation_fails(noScalarStop,"INVALID_REQUEST"));
+  for (const auto& value : Json::array({"-0","00","-01","+1","-","1.0","1e1"," 1","1 ","１", "184467440737095516150",1,nullptr})) {
+    gateway["command"] = scalarCommand; gateway["command"]["value"]["decimal"] = value;
+    assert(validation_fails(gateway));
+  }
+  for (const auto& bits : Json::array({0,1,7,65,128,32.0,true,"32"})) {
+    gateway["command"] = scalarCommand; gateway["command"]["value"]["bits"] = bits;
+    assert(validation_fails(gateway));
+  }
+  gateway["command"] = scalarCommand; gateway["command"]["value"] = {{"kind","boolean"},{"value",true}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["value"]["value"] = 1; assert(validation_fails(gateway));
+  gateway["command"] = scalarCommand; gateway["command"]["value"]["kind"] = "float";
+  assert(validation_fails(gateway));
+  gateway["command"] = scalarCommand; gateway["command"]["profile"] = "native-private-memory-v1";
+  assert(validation_fails(gateway));
+  gateway["command"] = scalarCommand; gateway["command"]["addressHex"] = "0x1234";
+  assert(validation_fails(gateway));
+  gateway.erase("expectedStop"); gateway["command"] = {{"kind","readScalarStorage"},{"snapshotId","scalar-1"}};
+  assert(!validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before
   // accepting an asynchronous trace, not discovered after acceptance.
   phantom::ValidationLimits small;
