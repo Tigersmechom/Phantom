@@ -67,6 +67,9 @@ struct GdbLaunchRequest {
   std::string recordingProfile = "native";
   std::size_t maxRecordedInstructions = 200000;
   GdbSourceBundle sourceBundle;
+  // Immutable artifact identity supplied by the owning build service. Older
+  // direct engine callers may omit it, but live runtime helpers then refuse.
+  std::string binarySha256;
 };
 
 struct GdbError {
@@ -185,6 +188,13 @@ class GdbEngine {
   // needs independent readback and an immutable service audit.
   bool writeRegisterValue(std::string_view name, std::string_view valueHex,
                           bool& attempted, GdbError& error);
+  // Explicit bounded runtime transaction, only for the trusted opt-in helper
+  // manifest from the immutable build. No caller code or syscall arguments.
+  // After a possible mutation, any unverified state/signal/cancellation closes
+  // the debugger and inferior; report remains suitable for the service audit.
+  bool executeRuntimeHelper(const nlohmann::json& manifest,
+                            nlohmann::json& report, GdbError& error,
+                            std::stop_token cancellation = {});
   // Independently re-check the stop, capture without target execution or
   // input delivery, and replace issued variable handles for this new state.
   bool refreshStoppedSnapshot(GdbStop& result, GdbError& error);

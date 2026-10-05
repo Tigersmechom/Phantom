@@ -6,6 +6,10 @@
 #include "phantom/register_edit.hpp"
 #include "variable_layout_script.hpp"
 #include "scalar_storage_script.hpp"
+#include "runtime_helper_script.hpp"
+#include "phantom/runtime_helper.hpp"
+#include "phantom/validation.hpp"
+#include "phantom/sha256.hpp"
 
 #include <algorithm>
 #include <array>
@@ -314,6 +318,13 @@ struct GdbEngine::Impl {
   std::string consoleOutput;
   bool captureRecordingDiagnostics = false;
   std::string recordingDiagnostics;
+  bool runtimeHelperActive = false;
+  bool runtimeHelperMutation = false;
+  bool runtimeHelperCancelled = false;
+  Deadline runtimeHelperDeadline = Deadline::max();
+  std::stop_token runtimeHelperCancellation;
+  std::string runtimeHelperScriptToken;
+  std::string binarySha256;
 
   static bool isInputRuntimeFrame(std::string_view function) {
     return function.find("__GI___libc_read") != std::string_view::npos ||
@@ -423,8 +434,7 @@ struct GdbEngine::Impl {
       setError(e, "LAUNCH_FAILED", "cannot configure startup PTY"); cleanupTemp(); return false;
     }
     std::ofstream environment(tempDir / "environment", std::ios::binary);
-    if (request.recordingProfile == "gdb-record-full" &&
-        std::none_of(request.environment.begin(), request.environment.end(),
+    if (std::none_of(request.environment.begin(), request.environment.end(),
                      [](const auto& item) { return item.first == "LC_ALL"; })) {
       // The debugger's status parser uses English, but the target retains its
       // original locale. GDB's inherited LC_ALL is removed before exec below.
@@ -1037,7 +1047,9 @@ struct GdbEngine::Impl {
     }
     if (r.type == '*' && r.klass == "stopped") { stopped = std::move(r); return waitStop; }
     if (r.type == '*' && (r.klass == "exited" || r.klass == "exited-normally")) { stopped = std::move(r); return waitStop; }
-    if (r.type != '^' || r.token != wantToken) return false;
+    const bool runtimeScriptError = runtimeHelperActive && runtimeHelperMutation &&
+        r.token == runtimeHelperScriptToken && r.klass == "error";
+    if (r.type != '^' || (r.token != wantToken && !runtimeScriptError)) return false;
     // The caller uses the same record object for command acknowledgements
     // such as `stack=[...]`, `variables=[...]`, and `memory=[...]`.  Preserve
     // the parsed result before signalling completion; previously only async
@@ -1074,10 +1086,21 @@ struct GdbEngine::Impl {
     const auto token = nextToken++;
     std::string tokenText = std::to_string(token);
     try {
-      const auto wireCommand = tokenText + std::string(commandText) + "\n";
+      auto wireCommand = tokenText + std::string(commandText) + "\n";
+      if (runtimeHelperActive && runtimeHelperMutation &&
+          commandText == "-interpreter-exec console \"python _phantom_runtime_helper_execute()\"") {
+        // A Python script which resumes the inferior produces ^running on
+        // its first stepi, but GDB does not subsequently emit ^done for that
+        // token. Queue a read-only MI barrier behind the complete script and
+        // wait for its own acknowledgement. Internal prompts/stops and the
+        // proof alone are insufficient evidence that the script has returned.
+        runtimeHelperScriptToken = tokenText;
+        tokenText = std::to_string(nextToken++);
+        wireCommand += tokenText + "-list-features\n";
+      }
       if (attempted) *attempted = true;
-      process->write(wireCommand,
-                     std::chrono::steady_clock::now() + options.commandTimeout);
+      process->write(wireCommand, std::min(runtimeHelperDeadline,
+                     std::chrono::steady_clock::now() + options.commandTimeout));
     } catch (const std::exception& ex) {
       failClosed(e, "INTERNAL", ex.what()); return false;
     }
@@ -1085,7 +1108,7 @@ struct GdbEngine::Impl {
     // interrupt after ^running, so same-packet pause cannot signal idle GDB.
     const bool reverseStep = commandText == "-exec-step-instruction --reverse";
     const bool seekingRecord = commandText.starts_with("-interpreter-exec console \"record goto ");
-    const bool recoverableStep = waitStop &&
+    const bool recoverableStep = !runtimeHelperActive && waitStop &&
         (commandText == "-exec-next" || commandText == "-exec-step" ||
          commandText == "-exec-finish" || commandText == "-exec-step-instruction" || reverseStep);
     bool recoveringStep = false;
@@ -1094,20 +1117,31 @@ struct GdbEngine::Impl {
     bool pendingInterrupt = preempt == 1;
     bool interruptSent = false;
     bool done = false, running = false;
-    bool interactiveContinue = commandText == "-exec-continue" && inputRemainsOpen();
+    bool interactiveContinue = !runtimeHelperActive && commandText == "-exec-continue" && inputRemainsOpen();
     auto deadline = interactiveContinue ? std::chrono::steady_clock::time_point::max() :
         std::chrono::steady_clock::now() + (recoverableStep ? options.stepTimeout : options.commandTimeout);
+    deadline = std::min(deadline, runtimeHelperDeadline);
     while (std::chrono::steady_clock::now() < deadline) {
       if (interactiveContinue && !inputRemainsOpen()) {
         interactiveContinue = false;
         deadline = std::chrono::steady_clock::now() + options.commandTimeout;
       }
       const int mode = control.exchange(0);
+      if (runtimeHelperActive && (runtimeHelperCancellation.stop_requested() || mode >= 1)) {
+        runtimeHelperCancelled = true;
+        if (runtimeHelperMutation || mode >= 2) {
+          failClosed(e, "CANCELLED", "runtime helper interrupted; debugger and inferior closed", false);
+          return false;
+        }
+        // Preparation only reads state. Finish its outstanding MI response
+        // before returning cancellation; never leave a stale acknowledgement
+        // behind or inject SIGINT into the stopped user's process.
+      }
       if (preempt >= 2 || mode >= 2 || launchCancellation.stop_requested()) {
         process->terminate(); live = false;
         setError(e, "CANCELLED", "debugger stopped", true); return false;
       }
-      pendingInterrupt = pendingInterrupt || mode == 1;
+      pendingInterrupt = pendingInterrupt || (!runtimeHelperActive && mode == 1);
       if (traceActive && !waitStop && mode == 1) {
         int idle = 0;
         (void)control.compare_exchange_strong(idle, 1);
@@ -1117,7 +1151,7 @@ struct GdbEngine::Impl {
         interruptSent = true;
         lastExecutionInterrupted = true;
       }
-      if (waitStop && !reverseStep && running && !interruptSent && !pendingInterrupt &&
+      if (!runtimeHelperActive && waitStop && !reverseStep && running && !interruptSent && !pendingInterrupt &&
           (recoverableStep || commandText == "-exec-continue") &&
           std::chrono::steady_clock::now() >= nextInputProbe) {
         nextInputProbe = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
@@ -2095,7 +2129,9 @@ struct GdbEngine::Impl {
     // behavior instead of only configuring the debugged program.
     po.environment.emplace_back("SHELL", "/bin/sh");
     po.environment.emplace_back("DEBUGINFOD_URLS", "");
-    if (request.recordingProfile == "gdb-record-full") po.environment.emplace_back("LC_ALL", "C");
+    // Signal-policy parsing, like recorder status, uses GDB's C locale. The
+    // target's original locale is restored through the wrapper environment.
+    po.environment.emplace_back("LC_ALL", "C");
     // MI belongs to an unbounded-duration conversation. Retaining already
     // consumed replies would eventually kill a healthy debugging session.
     // Process bounds each poll; command() bounds individual MI records.
@@ -2112,10 +2148,10 @@ struct GdbEngine::Impl {
         !setup("-gdb-set may-call-functions off") || !setup("-gdb-set overload-resolution off") ||
         !setup("-gdb-set startup-with-shell on") || !setup("-gdb-set print pretty off") ||
         !setup("-gdb-set print elements 128") ||
-        !setup("-interpreter-exec console " + miQuote("set inferior-tty " + ptyPath.string()))) return false;
+        !setup("-interpreter-exec console " + miQuote("set inferior-tty " + ptyPath.string())) ||
+        !setup("-interpreter-exec console \"unset environment LC_ALL\"")) return false;
     if (request.recordingProfile == "gdb-record-full" &&
-        (!setup("-interpreter-exec console \"unset environment LC_ALL\"") ||
-         !setup("-gdb-set mi-async off") || !setup("-gdb-set non-stop off") ||
+        (!setup("-gdb-set mi-async off") || !setup("-gdb-set non-stop off") ||
          !setup("-interpreter-exec console \"set record full stop-at-limit off\"") ||
          !setup("-interpreter-exec console \"set record full memory-query on\"") ||
          !setup("-interpreter-exec console " + miQuote("set record full insn-number-max " +
@@ -2182,6 +2218,7 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   impl_->maxRecordedInstructions = request.maxRecordedInstructions;
   impl_->recordingActive = false;
   impl_->sourceBundle = request.sourceBundle;
+  impl_->binarySha256 = request.binarySha256;
   if (!impl_->prepareTemp(request, error)) return false;
   if (!impl_->startGdb(request, error)) { stop(); return false; }
   if (request.stopAtEntry) {
@@ -2788,6 +2825,202 @@ bool GdbEngine::writeMemoryBytes(std::string_view addressHex, std::string_view b
     return false;
   }
   return true;
+}
+
+bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
+    nlohmann::json& report, GdbError& error, std::stop_token cancellation) {
+  using Json = nlohmann::json;
+  error = {};
+  report = {{"profile", "linux-x86_64-scratch-v1"}, {"writeAttempted", false},
+    {"executionAttempted", false}, {"debuggerAlive", live()}, {"cancelled", false},
+    {"outcome", "rejected"}, {"phase", "prepare"}, {"evidence", nullptr}, {"error", nullptr}};
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  bool attempted = false;
+  struct RuntimeScope {
+    Impl& owner;
+    explicit RuntimeScope(Impl& value, std::stop_token token) : owner(value) {
+      owner.runtimeHelperActive = true;
+      owner.runtimeHelperMutation = false;
+      owner.runtimeHelperCancelled = false;
+      owner.runtimeHelperCancellation = token;
+      owner.runtimeHelperScriptToken.clear();
+      owner.runtimeHelperDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    }
+    ~RuntimeScope() {
+      owner.runtimeHelperActive = false;
+      owner.runtimeHelperMutation = false;
+      owner.runtimeHelperCancellation = {};
+      owner.runtimeHelperScriptToken.clear();
+      owner.runtimeHelperDeadline = Deadline::max();
+    }
+  } runtime(*impl_, cancellation);
+  const auto failed = [&](std::string code, std::string message) {
+    if (attempted && impl_->live.load()) {
+      impl_->failClosed(error, code, message + "; runtime state unverified, debugger and inferior closed", false);
+    } else error = {std::move(code), std::move(message), false};
+    report["writeAttempted"] = attempted;
+    report["executionAttempted"] = attempted;
+    report["debuggerAlive"] = impl_->live.load();
+    report["cancelled"] = cancellation.stop_requested() || impl_->runtimeHelperCancelled || error.code == "CANCELLED";
+    report["outcome"] = attempted ? "failed" : "rejected";
+    auto messageBytes = displayUtf8(error.message);
+    if (messageBytes.size() > 1024) messageBytes = displayUtf8(messageBytes.substr(0, 1021)) + "...";
+    report["error"] = {{"code", error.code}, {"message", std::move(messageBytes)}};
+    return false;
+  };
+  const auto proof = [&](std::string_view prefix, std::size_t maximum) {
+    const auto& output = impl_->consoleOutput;
+    std::optional<std::string_view> record;
+    for (std::size_t start = 0; start < output.size();) {
+      const auto end = output.find('\n', start);
+      const auto line = std::string_view(output).substr(start,
+          end == std::string::npos ? output.size()-start : end-start);
+      if (line.starts_with(prefix)) {
+        if (record || end == std::string::npos) throw std::runtime_error("duplicate or incomplete runtime proof");
+        record = line.substr(prefix.size());
+      }
+      if (end == std::string::npos) break;
+      start = end+1;
+    }
+    if (!record || record->size() > maximum) throw std::runtime_error("runtime proof unavailable or oversized");
+    ValidationLimits limits;
+    limits.maxWireBytes = maximum; limits.maxDepth = 2; limits.maxNodes = 64;
+    limits.maxObjectMembers = 32; limits.maxArrayElements = 0; limits.maxStringBytes = 128;
+    return parse_wire_json(*record, limits);
+  };
+  try {
+    if (cancellation.stop_requested()) return failed("CANCELLED", "runtime helper cancelled before preparation");
+    if (!live()) return failed("STALE_CONTEXT", "runtime helper requires a live stopped process");
+    if (impl_->inputWaitActive || impl_->recordingProfile != "native")
+      return failed("UNSUPPORTED", "runtime helper requires a native stop outside input wait");
+    if (valText(field(impl_->latestStop.fields, "reason")) == "signal-received" ||
+        !valText(field(impl_->latestStop.fields, "signal-name")).empty())
+      return failed("UNSUPPORTED", "runtime helper cannot consume an existing signal stop");
+    if (impl_->inferiorPidFd < 0)
+      return failed("UNSUPPORTED", "runtime helper requires an owned inferior pidfd");
+    if (impl_->binarySha256.size() != 64 ||
+        impl_->binarySha256.find_first_not_of("0123456789abcdef") != std::string::npos)
+      return failed("UNSUPPORTED", "runtime helper requires immutable executable identity");
+    int pid = 0;
+    const auto parsedPid = std::from_chars(impl_->inferiorPid.data(),
+        impl_->inferiorPid.data()+impl_->inferiorPid.size(), pid);
+    if (parsedPid.ec != std::errc{} || parsedPid.ptr != impl_->inferiorPid.data()+impl_->inferiorPid.size() || pid <= 0)
+      return failed("READ_FAILED", "runtime inferior identity is invalid");
+
+    // Read the current process image through one descriptor. Hash and ELF
+    // verifier consume the same bounded bytes; no executable path/symbol
+    // supplied by the protocol participates in address resolution.
+    const int descriptor = ::open(("/proc/"+impl_->inferiorPid+"/exe").c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return failed("UNSUPPORTED", "current executable identity is unavailable");
+    struct CloseFile { int descriptor; ~CloseFile() { (void)::close(descriptor); } } close{descriptor};
+    struct stat information{};
+    constexpr std::size_t maximumImage = 256u * 1024u * 1024u;
+    if (::fstat(descriptor, &information) != 0 || !S_ISREG(information.st_mode) ||
+        information.st_size <= 0 || static_cast<std::uint64_t>(information.st_size) > maximumImage)
+      return failed("UNSUPPORTED", "current executable exceeds the supported image limit");
+    std::string bytes(static_cast<std::size_t>(information.st_size), '\0');
+    for (std::size_t offset = 0; offset < bytes.size();) {
+      if (cancellation.stop_requested()) return failed("CANCELLED", "runtime helper cancelled during image verification");
+      if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)
+        return failed("TIMEOUT", "runtime helper image verification deadline exhausted");
+      const auto size = ::pread(descriptor, bytes.data()+offset,
+          std::min<std::size_t>(65536, bytes.size()-offset), static_cast<off_t>(offset));
+      if (size < 0 && errno == EINTR) continue;
+      if (size <= 0) return failed("READ_FAILED", "current executable bytes could not be read completely");
+      offset += static_cast<std::size_t>(size);
+    }
+    if (sha256_hex(bytes) != impl_->binarySha256)
+      return failed("STALE_CONTEXT", "current executable differs from the immutable launched artifact");
+    Json actualManifest;
+    try { actualManifest = verifyRuntimeHelperArtifact(bytes); }
+    catch (const std::exception& exception) { return failed("UNSUPPORTED", exception.what()); }
+    if (actualManifest != manifest)
+      return failed("STALE_CONTEXT", "runtime helper manifest does not match the current executable");
+    if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)
+      return failed("TIMEOUT", "runtime helper preparation deadline exhausted");
+    Json target;
+    std::size_t registerNumber = 0;
+    if (!impl_->prepareRegisterWrite("rax", target, registerNumber, error))
+      return failed(error.code, error.message);
+    const auto thread = target.at("threadId").get<std::string>();
+    const auto prepare = std::string(runtimeHelperScript) +
+        "\n_phantom_runtime_helper_prepare(" + manifest.dump() + "," + std::to_string(pid) + "," + Json(thread).dump() + ")\n";
+    MiRecord response;
+    if (!impl_->command("-interpreter-exec console " + miQuote("python exec(" + Json(prepare).dump() + ")"),
+                        false, response, error, 0, true))
+      return failed(error.code == "READ_FAILED" && live() ? "UNSUPPORTED" : error.code, error.message);
+    if (response.klass != "done")
+      return failed("READ_FAILED", "runtime helper preparation acknowledgement is invalid");
+    const auto prepared = proof("PHANTOM_RUNTIME_HELPER_PREPARED_V1:", 2048);
+    if (!prepared.is_object() || prepared.size() != 6 || !prepared.contains("ready") ||
+        !prepared["ready"].is_boolean() || prepared["ready"] != true ||
+        !prepared.contains("pid") || !prepared["pid"].is_number_unsigned() ||
+        prepared["pid"] != pid || prepared.value("threadId", Json()) != thread ||
+        prepared.value("siteAddressHex", Json()) != manifest.at("addressHex") ||
+        !prepared.contains("registerCount") || !prepared["registerCount"].is_number_unsigned() ||
+        prepared["registerCount"].get<std::uint64_t>() < 32 || prepared["registerCount"].get<std::uint64_t>() > 512 ||
+        !prepared.contains("stackBytes") || !prepared["stackBytes"].is_number_unsigned() ||
+        prepared["stackBytes"].get<std::uint64_t>() < 4096 || prepared["stackBytes"].get<std::uint64_t>() > 1048576)
+      return failed("READ_FAILED", "runtime helper preparation proof is invalid");
+    if (cancellation.stop_requested() || impl_->runtimeHelperCancelled)
+      return failed("CANCELLED", "runtime helper cancelled before mutation");
+    if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)
+      return failed("TIMEOUT", "runtime helper deadline exhausted before mutation");
+
+    report["phase"] = "execute";
+    impl_->runtimeHelperMutation = true;
+    if (!impl_->command("-interpreter-exec console \"python _phantom_runtime_helper_execute()\"",
+                        false, response, error, 0, true, &attempted))
+      return failed(error.code, error.message);
+    const auto* barrierFeatures = field(response.fields, "features");
+    if (response.klass != "done" || mi::find_all(response.fields, "features").size() != 1 ||
+        !barrierFeatures || barrierFeatures->kind != mi::ValueKind::value_list ||
+        !barrierFeatures->fields.empty() || barrierFeatures->values.empty() ||
+        barrierFeatures->values.size() > 256)
+      return failed("READ_FAILED", "runtime helper completion barrier is invalid");
+    for (const auto& feature : barrierFeatures->values)
+      if (!feature || feature->kind != mi::ValueKind::string || feature->text.size() > 128)
+        return failed("READ_FAILED", "runtime helper completion barrier metadata is invalid");
+    report["phase"] = "verify";
+    const auto evidence = proof("PHANTOM_RUNTIME_HELPER_RESULT_V1:", 4096);
+    constexpr std::array<std::string_view, 13> flags = {"getpid", "allocated", "writable", "executable",
+      "payloadExecuted", "released", "registersRestored", "stackUnchanged", "errnoUnchanged",
+      "signalMaskUnchanged", "signalPolicyRestored", "codeUnchanged", "mapsRestored"};
+    if (!evidence.is_object() || evidence.size() != flags.size()+5 ||
+        !evidence.contains("pid") || !evidence["pid"].is_number_unsigned() || evidence["pid"] != pid ||
+        !evidence.contains("registerCount") || !evidence["registerCount"].is_number_unsigned() ||
+        evidence["registerCount"] != prepared.at("registerCount") ||
+        !evidence.contains("stackBytes") || !evidence["stackBytes"].is_number_unsigned() ||
+        evidence["stackBytes"] != prepared.at("stackBytes") ||
+        !evidence.contains("pageSize") || !evidence["pageSize"].is_number_unsigned() ||
+        !evidence.contains("scratchAddressHex") || !evidence["scratchAddressHex"].is_string())
+      return failed("READ_FAILED", "runtime helper execution proof is invalid");
+    const auto pageSize = evidence["pageSize"].get<std::uint64_t>();
+    const auto& address = evidence["scratchAddressHex"].get_ref<const std::string&>();
+    const auto numericAddress = parseAddress(address);
+    if (pageSize < 4096 || pageSize > 1048576 || (pageSize & (pageSize-1)) != 0 ||
+        !numericAddress || *numericAddress == 0 || *numericAddress >= (std::uint64_t{1} << 63) ||
+        *numericAddress % pageSize != 0 || address.size() < 3 || address[2] == '0' ||
+        !address.starts_with("0x") || address.find_first_not_of("0123456789abcdef", 2) != std::string::npos)
+      return failed("READ_FAILED", "runtime helper scratch mapping proof is invalid");
+    for (const auto flag : flags) {
+      const auto key = std::string(flag);
+      if (!evidence.contains(key) || !evidence[key].is_boolean() || evidence[key] != true)
+        return failed("READ_FAILED", "runtime helper restoration evidence is incomplete");
+    }
+    if (cancellation.stop_requested() || impl_->runtimeHelperCancelled)
+      return failed("CANCELLED", "runtime helper cancelled before restoration was acknowledged");
+    report["writeAttempted"] = attempted;
+    report["executionAttempted"] = attempted;
+    report["debuggerAlive"] = live();
+    report["outcome"] = "verified";
+    report["evidence"] = evidence;
+    return true;
+  } catch (const std::exception& exception) {
+    return failed("READ_FAILED", exception.what());
+  } catch (...) {
+    return failed("INTERNAL", "runtime helper failed with an unknown error");
+  }
 }
 
 bool GdbEngine::refreshStoppedSnapshot(GdbStop& result, GdbError& error) {

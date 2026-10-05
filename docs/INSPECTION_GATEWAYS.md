@@ -42,6 +42,7 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 | `probeRuntime` | No | Verify fixed syscalls, RW→RX execution and state restoration in a separate shipped fixture. |
+| `runRuntimeHelper` | Required | Execute the opted-in scratch helper in the live native process; retain restoration evidence and an intervention branch. |
 
 Captures and traces share a separate bounded store: at most 128 records and
 `capabilities.limits.maxInspectionStoreBytes` serialized bytes (16 MiB by
@@ -125,6 +126,100 @@ register restoration. See [GDB inferior calls](https://sourceware.org/gdb/curren
 [signal handling](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Signals.html),
 [register bytes](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Values-From-Inferior.html)
 and [mprotect](https://man7.org/linux/man-pages/man2/mprotect.2.html).
+
+## Live runtime scratch helper
+
+`capabilities.runtimeHelper:"linux-x86_64-scratch-v1"` exposes one fixed live
+operation. First opt into the build profile:
+
+```json
+{
+  "revisionId": "runtime-config-1",
+  "compiler": "clang++",
+  "flags": ["-std=c++20", "-g", "-O0"],
+  "outputDirectory": ".phantom/build",
+  "addressProfile": "fixed-executable",
+  "runtimeProfile": "linux-x86_64-scratch-v1"
+}
+```
+
+This is the `configuration` member of a normal build command. The default
+`runtimeProfile:"none"` adds no helper. Opt-in adds a versioned assembly input
+in the reserved `.phantom-runtime-v1` snapshot subtree; user documents cannot
+occupy it. The helper source hash participates in build identity. Its three
+bytes (`syscall; int3`) must belong to a unique hidden function in a dedicated
+RX section and matching non-writable PT_LOAD in the actual ELF64 little-endian
+x86-64 ET_EXEC. Stripped/ambiguous/incompatible output fails the build. The
+verified `artifact.runtimeHelper` manifest contains `profile`, `symbol`,
+`addressHex`, `bytesHex` and `helperSha256`; ordinary builds omit it.
+
+At a current native stop, send:
+
+```json
+{"kind":"runRuntimeHelper","profile":"linux-x86_64-scratch-v1"}
+```
+
+The normal envelope must include the current session and exact `expectedStop`.
+The command accepts no executable path, syscall number, payload, address or
+timeout. It executes `getpid`, allocates one private RW page, writes a fixed
+`movabs` instruction, changes the page to RX, single-steps that instruction,
+and unmaps the page. No retained allocation or arbitrary-code API is implied.
+
+Preflight requires exactly one stopped native thread, the original launched
+executable hash, matching live helper bytes in a private RX mapping, verified
+GDB x86-64 metadata, readable FP/vector/general registers, and a main stack
+mapping no larger than 1 MiB. A known glibc DWARF `errno` symbol is required
+(on the Ubuntu test runner, `libc6-dbg` supplies this metadata). The backend
+never calls `__errno_location` or a user function to obtain it. Missing evidence,
+record-full, input waits, an existing signal stop, pending signals or kernel
+syscall/restart state reject the operation before mutation.
+
+The helper temporarily changes GDB signal handling to stop before a handler can
+run. Success requires exact restoration of those policies and all captured
+register bytes, unchanged original stack bytes, `errno`, kernel signal mask,
+helper instructions and final mappings. These are declared comparisons, not a
+rollback of elapsed time, kernel accounting, allocator decisions or the external
+world. A signal, denied syscall, lost acknowledgement, timeout, cancellation
+during execution or failed verification closes the debugger and inferior. No
+further cleanup syscall executes after an unexpected signal: resuming could
+discard its original delivery information. Process termination releases scratch
+storage on these failure paths.
+
+The result is `{kind:"runtimeIntervention",intervention,throughSequence}`.
+`RuntimeInterventionDTO` uses the existing identity, before/after stop, branch,
+context status and refresh-error fields, with `target` set to the build manifest.
+Its report has `profile`, `writeAttempted`, `executionAttempted`, `debuggerAlive`,
+`cancelled`, `outcome`, `phase`, `evidence` and `error`. Attempt flags become true
+at the execution-command send boundary: execution may have happened even without
+an acknowledgement. `outcome:"verified"` means all declared checks passed;
+`"failed"` retains uncertainty and the concrete error. Preflight rejection is a
+normal protocol error without an intervention entry.
+
+Success evidence records `pid`, `pageSize`, historical `scratchAddressHex`,
+`registerCount`, `stackBytes` and these thirteen checks: `getpid`, `allocated`,
+`writable`, `executable`, `payloadExecuted`, `released`, `registersRestored`,
+`stackUnchanged`, `errnoUnchanged`, `signalMaskUnchanged`, `signalPolicyRestored`,
+`codeUnchanged`, `mapsRestored`. Missing proof is null, never inferred from the
+requested operation. A successful scratch address is already unmapped.
+
+Every attempted helper, including a failed one, has one audit and branch; a
+verified helper refreshes the stop even though the compared state was restored.
+An unverified attempt clears the live observation and publishes a failed state.
+`readIntervention`/`listInterventions` include runtime entries; memory/register
+category queries retain their existing meaning. Exact retries return the stored
+response after stop changes or debugger death, without re-execution. The shared
+ledger reserves 32 KiB before entry and enforces its existing count/byte limits.
+Queued stdin/EOF, previous observations and the physical output journal are not
+replayed or rewritten by this operation.
+
+`limits.runtimeHelperTimeoutMs` is 10000 for the shared preparation/execution
+deadline, followed by bounded termination if needed. `cancel` targets the active
+request; Pause/Stop wait for it to finish. A preflight cancellation drains its
+outstanding read command before returning. Cancellation after verified execution
+is sealed separately as `cancelled:true`; the completed operation's evidence is
+retained. Restoring RIP to an enabled source breakpoint can make the next
+Continue stop at that same breakpoint once more. This is exposed as a real stop;
+the backend does not silently advance additional user instructions.
 
 ## Build and launch address profiles
 

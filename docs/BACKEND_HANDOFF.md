@@ -968,7 +968,7 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**ограниченные live runtime interventions по 20.5 после storage/register-профилей 20.9–20.14 и изолированной проверки 20.16**, параллельно — углубление object/lifetime
+**расширение live runtime interventions по 20.5 после scratch-профиля 20.17**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1423,3 +1423,67 @@ GDB останавливается на starti до main для timeout/cancel; 
 Протокольные проверки покрывают до/после launch, устаревшую сессию, null-session,
 неизменность всех 14 GPR, очереди stdin, history/output/ledger/branches,
 отложенный Stop и исправный последующий Step.
+
+### 20.17. Первый live runtime helper — 05.10.2026
+
+`runRuntimeHelper{profile:"linux-x86_64-scratch-v1"}` выполняет фиксированный
+scratch roundtrip непосредственно в текущем native-процессе: getpid, mmap RW,
+запись фиксированной инструкции, mprotect RX, один машинный шаг и munmap.
+Требуются актуальные session/expectedStop и opt-in сборка с
+`runtimeProfile:"linux-x86_64-scratch-v1"`, `addressProfile:"fixed-executable"`.
+Обычная сборка сохраняет прежние аргументы и не получает helper.
+
+Доверенный assembler input живёт в зарезервированном snapshot-подкаталоге;
+его версия/SHA входят в build identity. Фактические ELF64 LE/EM_X86_64/ET_EXEC,
+уникальный hidden FUNC, трёхбайтовая RX-секция, PT_LOAD и opcodes проверяются
+через запечатанную копию уже хешированных байтов. Перед каждым live helper
+backend сверяет полный hash текущего `/proc/<pid>/exe`, manifest, GDB ABI и
+RX-байты настоящего процесса. Пользовательские пути, syscall numbers,
+payload и адреса команда не принимает.
+
+Preflight отвергает recorder, несколько потоков, input-wait, signal stop,
+pending signals и kernel syscall/restart state. Требуются доступные GDB
+регистры (включая FP/vector), main stack до 1 MiB и подтверждённая glibc errno
+DWARF metadata; CI устанавливает libc6-dbg. Неизвестный адрес errno нельзя
+получать скрытым inferior call. GDB работает в C locale для чтения signal
+policies, а исходная/заданная locale пользовательского процесса сохраняется.
+
+Сохраняются и проверяются байты регистров, исходного стека, errno, маска
+сигналов, helper code и итоговая карта памяти. GDB signal policies временно
+останавливают сигналы до handler и восстанавливаются с точной сверкой.
+Каждая попытка имеет audit/branch и повтор запроса без повторного исполнения.
+При потере подтверждения, сигнале, timeout/cancel во время исполнения либо
+неподтверждённом восстановлении сессия закрывается, live очищается, audit
+сохраняется. После неожиданного signal stop cleanup-syscall не выполняется:
+обычное продолжение могло бы потерять исходную информацию доставки сигнала.
+
+Общий deadline — 10 секунд плюс ограниченная очистка. Отмена на read-only
+подготовке дожидается ответа текущей MI-команды; старый ответ не попадает
+в следующий запрос. Выполняющий Python script под MI выдаёт `^running`,
+но может не выдать последующий `^done`: окончание подтверждается отдельной
+очередной MI-командой после script, а не первым внутренним stop/prompt.
+Pause/Stop ждут завершения helper, cancel имеет отдельный активный путь.
+Очередь stdin/EOF изолирована на всём протяжении операции.
+
+После восстановления RIP следующий Continue может ещё раз остановиться
+на исходном software breakpoint. Это реальная отдельная остановка, которую
+backend не пропускает по совпадению адреса: такой пропуск мог бы скрыть
+исполнение настоящей итерации. Восстановленные сравнения не доказывают откат
+kernel accounting, времени, адресных решений allocator или внешнего мира.
+
+Контракт и пример сборки: [live runtime gateway](INSPECTION_GATEWAYS.md#live-runtime-scratch-helper).
+Далее: сохраняемые runtime allocations/дополнительные ограниченные helpers,
+ветвление с recorder, condition overrides; P2 lifetime/ND, semantic cin и P4
+verified restore остаются самостоятельными незавершёнными направлениями.
+
+Проверки 20.17: **58/58 Debug и 58/58 ASan/UBSan**, соответственно 10405 и
+10431 реальных сообщений через TypeScript 5.9.3; все пять harness-проверок
+и четыре Node contract-теста. Интеграция независимо сравнивает весь исходный
+stack через `/proc/<pid>/mem`, GPR/FP/vector, errno, signal mask, maps и код;
+проверяет очередь stdin/EOF, buffered cout, смешанный audit и once-only retry.
+Реальные seccomp-отказы getpid/mmap/mprotect/munmap, SIGALRM до первой
+инструкции, kernel restart, pending signals, timeout/cancel и потерянный
+MI barrier покрывают аварийные пути. Подмена errno обычной переменной
+отвергается до изменения процесса; после отказа программа продолжает работать.
+Unit-тесты проверяют права/границы ELF, неоднозначный или изменённый helper,
+коллизии исходников и сохранение helper при linker garbage collection.

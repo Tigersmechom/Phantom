@@ -79,6 +79,7 @@ class BackendService final {
   std::vector<Json> handleVtable(const Json& request);
   std::vector<Json> handleMemoryIntervention(const Json& request, const Json& preparedScalar = nullptr);
   std::vector<Json> handleRegisterIntervention(const Json& request);
+  std::vector<Json> handleRuntimeIntervention(const Json& request);
   std::vector<Json> handleInterventionQuery(const Json& request);
   std::optional<Json> interventionBudgetError(const Json& request, std::size_t reservationBytes) const;
   Json beginIntervention(const Json& request);

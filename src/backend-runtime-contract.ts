@@ -655,4 +655,51 @@ export interface RegisterInterventionDTO extends Omit<MemoryInterventionBaseDTO,
   target: RegisterInterventionTargetDTO;
   report: RegisterInterventionReportDTO;
 }
-export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO;
+export interface RuntimeHelperManifestDTO {
+  profile: 'linux-x86_64-scratch-v1';
+  symbol: '__phantom_runtime_syscall_v1';
+  addressHex: string;
+  bytesHex: '0f05cc';
+  helperSha256: string;
+}
+export interface RuntimeHelperEvidenceDTO {
+  pid: number;
+  pageSize: number;
+  /** Historical address of scratch storage, already unmapped on success. */
+  scratchAddressHex: string;
+  registerCount: number;
+  stackBytes: number;
+  getpid: boolean;
+  allocated: boolean;
+  writable: boolean;
+  executable: boolean;
+  payloadExecuted: boolean;
+  released: boolean;
+  registersRestored: boolean;
+  stackUnchanged: boolean;
+  errnoUnchanged: boolean;
+  signalMaskUnchanged: boolean;
+  signalPolicyRestored: boolean;
+  codeUnchanged: boolean;
+  mapsRestored: boolean;
+}
+export interface RuntimeHelperReportDTO {
+  profile: 'linux-x86_64-scratch-v1';
+  /** Conservative send boundary, including context edits before any syscall. */
+  writeAttempted: boolean;
+  /** Execution may have happened even if its acknowledgement was lost. */
+  executionAttempted: boolean;
+  debuggerAlive: boolean;
+  /** Accepted cancellation can arrive after verified execution completed. */
+  cancelled: boolean;
+  outcome: 'rejected' | 'verified' | 'failed';
+  phase: 'prepare' | 'execute' | 'verify';
+  evidence: RuntimeHelperEvidenceDTO | null;
+  error: { code: string; message: string } | null;
+}
+export interface RuntimeInterventionDTO extends Omit<MemoryInterventionBaseDTO, 'mapping' | 'report'> {
+  profile: 'linux-x86_64-scratch-v1';
+  target: RuntimeHelperManifestDTO;
+  report: RuntimeHelperReportDTO;
+}
+export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO | RuntimeInterventionDTO;

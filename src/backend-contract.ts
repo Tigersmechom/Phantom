@@ -1,4 +1,4 @@
-import type { RuntimeProbeDTO, NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { RuntimeHelperManifestDTO, RuntimeInterventionDTO, RuntimeProbeDTO, NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -83,6 +83,8 @@ export interface BuildConfigurationDTO {
   outputDirectory: string;
   /** Omitted means native; fixed-executable adds non-PIE flags and verifies ET_EXEC. */
   addressProfile?: AddressProfileDTO;
+  /** Explicit helper build; scratch-v1 also requires fixed-executable. */
+  runtimeProfile?: 'none' | 'linux-x86_64-scratch-v1';
 }
 export interface BuildArtifactDTO {
   id: string;
@@ -97,6 +99,8 @@ export interface BuildArtifactDTO {
   debugSymbolsAvailable: boolean;
   addressProfile: AddressProfileDTO;
   elf: ElfInspectionDTO;
+  /** Absent for ordinary builds. Verified against the actual executable. */
+  runtimeHelper?: RuntimeHelperManifestDTO;
 }
 export interface SubmittedInputDTO {
   id: string;
@@ -580,6 +584,7 @@ export interface ResourceLimitsDTO {
   maxInterventionStoreBytes: number;
   runtimeProbeTimeoutMs?: number;
   maxRuntimeProbeOutputBytes?: number;
+  runtimeHelperTimeoutMs?: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
 }
@@ -624,6 +629,7 @@ export interface BackendCapabilitiesDTO {
   moduleInspection: 'linux-proc-maps-elf' | 'none';
   recorderProbe: boolean;
   runtimeProbe?: 'isolated-linux-x86_64-syscall-v1' | 'none';
+  runtimeHelper?: 'linux-x86_64-scratch-v1' | 'none';
   recordingProfiles: RecordingProfileDTO[];
   recordingCursor: boolean;
   eventReplay: boolean;
@@ -685,6 +691,7 @@ export type BackendCommandDTO =
   | { kind: 'readModuleSnapshot'; snapshotId: string }
   | { kind: 'probeRecorders' }
   | { kind: 'probeRuntime' }
+  | { kind: 'runRuntimeHelper'; profile: 'linux-x86_64-scratch-v1' }
   | { kind: 'readRecording' }
   | { kind: 'seekRecording'; instruction: string }
   | { kind: 'reverseInstruction' }
@@ -725,6 +732,7 @@ export type BackendResultDTO =
   | { kind: 'vtableSnapshot'; snapshot: VtableSnapshotDTO }
   | { kind: 'recorderProbe'; probe: RecorderProbeDTO }
   | { kind: 'runtimeProbe'; probe: RuntimeProbeDTO }
+  | { kind: 'runtimeIntervention'; intervention: RuntimeInterventionDTO; throughSequence?: number }
   | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }
   | { kind: 'accepted' }

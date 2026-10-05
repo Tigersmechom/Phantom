@@ -31,7 +31,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang cmake ninja-build python3 gdb
+          sudo apt-get install --yes clang cmake ninja-build python3 gdb libc6-dbg
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

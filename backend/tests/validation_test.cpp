@@ -1,5 +1,6 @@
 #include "phantom/validation.hpp"
 #include "phantom/service.hpp"
+#include "phantom/sha256.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -74,6 +75,22 @@ int main() {
   launch["command"]["environment"] = Json::object();
   launch["command"]["input"]["closeAfterWrite"] = false;
   assert(!validation_fails(launch));
+  auto helperBuild = launch;
+  helperBuild["command"] = {{"kind", "build"}, {"architecture", "x86_64"},
+    {"source", {{"id", "source"}, {"documents", Json::array({{
+      {"documentId", "main"}, {"revisionId", "r1"}, {"path", "main.cpp"},
+      {"text", "int main() {}"}, {"sha256", phantom::sha256_hex("int main() {}")}}})}}},
+    {"configuration", {{"revisionId", "config"}, {"compiler", "clang++"},
+      {"flags", Json::array({"-g", "-O0"})}, {"outputDirectory", ".phantom/build"},
+      {"addressProfile", "fixed-executable"}, {"runtimeProfile", "linux-x86_64-scratch-v1"}}}};
+  assert(!validation_fails(helperBuild));
+  for (const auto& profile : Json::array({nullptr, false, 1, "automatic", "linux-x86_64-scratch-v2"})) {
+    auto invalid = helperBuild;
+    invalid["command"]["configuration"]["runtimeProfile"] = profile;
+    assert(validation_fails(invalid, "INVALID_REQUEST"));
+  }
+  helperBuild["command"]["configuration"]["runtimeProfile"] = "none";
+  assert(!validation_fails(helperBuild));
   Json append = launch;
   append["session"] = {{"id", "s"}, {"generation", 1}};
   append["expectedStop"] = {{"stopId", "stop-1"}, {"stateRevision", 1}};
@@ -149,6 +166,21 @@ int main() {
     injected["command"][field] = "untrusted";
     assert(validation_fails(injected, "INVALID_REQUEST"));
   }
+  gateway["command"] = {{"kind", "runRuntimeHelper"}, {"profile", "linux-x86_64-scratch-v1"}};
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway["expectedStop"] = {{"stopId", "stop-1"}, {"stateRevision", 1}};
+  assert(!validation_fails(gateway));
+  for (const auto* field : {"syscall", "code", "addressHex", "arguments", "timeoutMs", "helper"}) {
+    auto injected = gateway;
+    injected["command"][field] = "untrusted";
+    assert(validation_fails(injected, "INVALID_REQUEST"));
+  }
+  for (const auto& profile : Json::array({nullptr, false, "native", "none", "linux-x86_64-scratch-v2"})) {
+    auto invalid = gateway;
+    invalid["command"]["profile"] = profile;
+    assert(validation_fails(invalid, "INVALID_REQUEST"));
+  }
+  gateway.erase("expectedStop");
   gateway["command"] = {{"kind", "readModuleSnapshot"}, {"snapshotId", "modules-1"}};
   assert(!validation_fails(gateway));
   for (const auto& invalidId : Json::array({"", 1, nullptr})) {

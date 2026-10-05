@@ -581,3 +581,25 @@ handoff seals late cancellation as unavailable while retaining collected evidenc
 No current stop, input queue, output journal, branch or intervention entry changes.
 Live runtime helpers still require per-target ABI/code/signal checks, finite
 execution and restoration/error auditing; successful probing does not enable them.
+
+## 2026-10-05: opted-in live runtime scratch helper
+
+`BuildConfigurationDTO.runtimeProfile` adds `none` (default) and
+`linux-x86_64-scratch-v1`. The latter requires explicit `fixed-executable` and
+verified ELF/helper bytes. Its source/version hash changes build identity;
+`BuildArtifactDTO.runtimeHelper` is present only for a verified opt-in build.
+
+`runRuntimeHelper{profile}` requires a live session and expectedStop. The fixed
+getpid/mmap/write/mprotect/instruction/munmap experiment returns a
+`runtimeIntervention` and extends the generic intervention union/ledger.
+The conservative send boundary reserves one audit and lineage branch even if
+execution or acknowledgement fails. A successful helper refreshes the stop;
+an unverified attempt closes the debugger and clears the live observation.
+Existing memory/register category queries and retry semantics are preserved.
+
+The finite runtime execution path isolates queued stdin and validates exact
+restoration of captured registers/stack/errno/mask/code/maps and GDB signal
+policies. A source breakpoint at restored RIP may produce an extra real stop on
+next Continue. This profile provides no persistent allocation, arbitrary syscall
+or code request, recorder branch, semantic assignment or external-effect rollback.
+See the complete [live contract](../../docs/INSPECTION_GATEWAYS.md#live-runtime-scratch-helper).
