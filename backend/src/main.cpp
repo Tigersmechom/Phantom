@@ -130,14 +130,16 @@ int stdio_mode(std::filesystem::path workspace) {
     std::cerr << "Cannot configure nonblocking stdio transport.\n";
     return 1;
   }
-  std::filesystem::path ioWrapper, recorderProbe;
+  std::filesystem::path ioWrapper, recorderProbe, runtimeProbe;
   std::error_code executableError;
   const auto executable = std::filesystem::read_symlink("/proc/self/exe", executableError);
   if (!executableError) {
     ioWrapper = executable.parent_path() / "phantom-io-wrapper";
     recorderProbe = executable.parent_path() / "phantom-recorder-probe";
+    runtimeProbe = executable.parent_path() / "phantom-runtime-probe";
   }
-  phantom::BackendService service({std::move(workspace), {}, PHANTOM_BACKEND_VERSION, {}, std::move(ioWrapper), std::move(recorderProbe)});
+  phantom::BackendService service({std::move(workspace), {}, PHANTOM_BACKEND_VERSION, {},
+    std::move(ioWrapper), std::move(recorderProbe), "gdb", std::move(runtimeProbe)});
   Queue queue;
   std::atomic<std::size_t> pendingFrames{0};
   const auto enqueue = [&](Frame frame) {

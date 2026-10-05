@@ -25,6 +25,7 @@ import advanced_gateway_integration
 import inspection_input_integration
 import modules_integration
 import recorder_probe_integration
+import runtime_probe_integration
 import recording_integration
 import layout_integration
 import symbols_integration
@@ -151,6 +152,8 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         scenarios.append((vtable_integration, []))
     if "gdb-record-full" in capabilities.get("recordingProfiles", []):
         scenarios.append((recording_integration, []))
+    if capabilities.get("runtimeProbe") == "isolated-linux-x86_64-syscall-v1":
+        scenarios.append((runtime_probe_integration, []))
     if capabilities.get("recorderProbe", False):
         scenarios.append((recorder_probe_integration, []))
     for scenario, extra in scenarios:

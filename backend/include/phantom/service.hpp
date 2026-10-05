@@ -24,6 +24,7 @@ struct ServiceOptions {
   std::filesystem::path ioWrapper;
   std::filesystem::path recorderProbeFixture;
   std::string gdbPath = "gdb";
+  std::filesystem::path runtimeProbeFixture;
 };
 
 // The service is intentionally transport-agnostic. One caller owns the
@@ -70,6 +71,7 @@ class BackendService final {
   Json defaultInput() const;
   Json handleBuild(const Json& request);
   Json handleRecorderProbe(const Json& request);
+  Json handleRuntimeProbe(const Json& request);
   std::vector<Json> handleRecordedExecution(const Json& request, const FrameSink& publish);
   std::vector<Json> handleModules(const Json& request);
   std::vector<Json> handleModuleSymbols(const Json& request);

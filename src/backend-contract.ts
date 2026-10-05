@@ -1,4 +1,4 @@
-import type { NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { RuntimeProbeDTO, NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -578,6 +578,8 @@ export interface ResourceLimitsDTO {
   /** Global ledger record cap across memory and register profiles. */
   maxInterventions?: number;
   maxInterventionStoreBytes: number;
+  runtimeProbeTimeoutMs?: number;
+  maxRuntimeProbeOutputBytes?: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
 }
@@ -621,6 +623,7 @@ export interface BackendCapabilitiesDTO {
   vtableInspection: 'itanium-x86_64-absolute-v1' | 'none';
   moduleInspection: 'linux-proc-maps-elf' | 'none';
   recorderProbe: boolean;
+  runtimeProbe?: 'isolated-linux-x86_64-syscall-v1' | 'none';
   recordingProfiles: RecordingProfileDTO[];
   recordingCursor: boolean;
   eventReplay: boolean;
@@ -681,6 +684,7 @@ export type BackendCommandDTO =
   | { kind: 'readVtableSnapshot'; snapshotId: string }
   | { kind: 'readModuleSnapshot'; snapshotId: string }
   | { kind: 'probeRecorders' }
+  | { kind: 'probeRuntime' }
   | { kind: 'readRecording' }
   | { kind: 'seekRecording'; instruction: string }
   | { kind: 'reverseInstruction' }
@@ -720,6 +724,7 @@ export type BackendResultDTO =
   | { kind: 'variableLayout'; snapshot: VariableLayoutSnapshotDTO }
   | { kind: 'vtableSnapshot'; snapshot: VtableSnapshotDTO }
   | { kind: 'recorderProbe'; probe: RecorderProbeDTO }
+  | { kind: 'runtimeProbe'; probe: RuntimeProbeDTO }
   | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })
   | { kind: 'capabilities'; capabilities: BackendCapabilitiesDTO }
   | { kind: 'accepted' }

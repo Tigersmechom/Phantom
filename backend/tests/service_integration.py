@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "recordingProfiles", "recordingCursor",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "runtimeProbe", "recordingProfiles", "recordingCursor",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -113,7 +113,7 @@ def main() -> int:
                 {"maxOutputBytes", "maxHistoryBytes", "maxResidentSnapshots", "maxVariablesPerPage",
                  "maxStringBytes", "maxMemoryReadBytes", "maxInstructionsPerRequest", "maxTraceInstructions",
                  "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions", "maxMemoryWriteBytes", "maxMemoryBatchRanges", "maxMemoryBatchBytes", "maxScalarStorageBatchItems", "maxScalarStorageBatchBytes", "maxMemoryInterventions", "maxInterventions", "maxInterventionStoreBytes",
-                 "commandTimeoutMs", "replayTimeoutMs"},
+                 "runtimeProbeTimeoutMs", "maxRuntimeProbeOutputBytes", "commandTimeoutMs", "replayTimeoutMs"},
                 "ResourceLimitsDTO",
             )
             if caps["addressProfiles"] != ["native", "fixed-executable"] or \

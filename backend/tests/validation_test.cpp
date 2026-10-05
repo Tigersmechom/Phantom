@@ -138,6 +138,17 @@ int main() {
     injected["command"][executable] = "/tmp/untrusted-recorder";
     assert(validation_fails(injected, "INVALID_REQUEST"));
   }
+  // Runtime readiness runs only the shipped fixture. The wire cannot select
+  // a process, an executable, injected instructions or syscall arguments.
+  gateway["command"] = {{"kind", "probeRuntime"}};
+  gateway["session"] = nullptr;
+  assert(!validation_fails(gateway));
+  for (const auto* field : {"pid", "path", "gdbPath", "fixturePath", "profile",
+                            "code", "syscall", "arguments", "timeoutMs"}) {
+    auto injected = gateway;
+    injected["command"][field] = "untrusted";
+    assert(validation_fails(injected, "INVALID_REQUEST"));
+  }
   gateway["command"] = {{"kind", "readModuleSnapshot"}, {"snapshotId", "modules-1"}};
   assert(!validation_fails(gateway));
   for (const auto& invalidId : Json::array({"", 1, nullptr})) {

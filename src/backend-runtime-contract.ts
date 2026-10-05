@@ -114,6 +114,44 @@ export interface RecorderProbeDTO {
   detail?: string;
 }
 
+/** Evidence applies only to the supplied isolated fixture and fixed script. */
+export interface RuntimeProbeEvidenceDTO {
+  profile: 'linux-x86_64-syscall-probe-v1';
+  pid: number;
+  pageSize: number;
+  scratchAddressHex: string;
+  getpid: boolean;
+  allocated: boolean;
+  writable: boolean;
+  executable: boolean;
+  payloadExecuted: boolean;
+  released: boolean;
+  deniedSyscall: boolean;
+  registersRestored: boolean;
+  stackUnchanged: boolean;
+  errnoUnchanged: boolean;
+  signalMaskUnchanged: boolean;
+  /** Original syscall site and entry marker, not every executable mapping. */
+  codeUnchanged: boolean;
+  signalStopVerified: boolean;
+  handlerNotRun: boolean;
+  registerCount: number;
+  stackBytes: number;
+}
+export interface RuntimeProbeDTO {
+  scope: 'isolated-runtime-fixture';
+  profile: 'linux-x86_64-syscall-probe-v1';
+  /** Never enables runtime injection in the user's session. */
+  available: boolean;
+  reason: string;
+  elapsedMs: number;
+  cancelled: boolean;
+  gdbVersion: RecorderProbeStageDTO;
+  execution: RecorderProbeStageDTO;
+  evidence: RuntimeProbeEvidenceDTO | null;
+  limitations: string[];
+}
+
 export type RuntimeModuleFileDTO = {
   available: true;
   identityVerified: true;

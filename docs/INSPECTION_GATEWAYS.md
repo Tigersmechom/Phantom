@@ -41,6 +41,7 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readIntervention` / `listInterventions` / `listBranches` | No | Read all session interventions and their shared branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
+| `probeRuntime` | No | Verify fixed syscalls, RW→RX execution and state restoration in a separate shipped fixture. |
 
 Captures and traces share a separate bounded store: at most 128 records and
 `capabilities.limits.maxInspectionStoreBytes` serialized bytes (16 MiB by
@@ -62,6 +63,68 @@ advance instruction execution or input delivery merely to answer a query.
 Normal execution and explicit input commands keep their delivery semantics.
 Saved observations/history remain immutable: a transport change is visible in
 the next actual stopped snapshot, not rewritten into an earlier observation.
+
+## Isolated runtime probe
+
+```json
+{"kind":"probeRuntime"}
+```
+
+`capabilities.runtimeProbe:"isolated-linux-x86_64-syscall-v1"` advertises this
+diagnostic command. It accepts no arguments; executable paths, syscall numbers,
+payload bytes and time limits are not client-selectable. It works before launch
+with `session:null`, while a session is stopped, and after termination. A supplied
+session or `expectedStop` must still match the normal envelope rules.
+
+The result is `{kind:"runtimeProbe",probe:RuntimeProbeDTO}`. Its scope is
+`isolated-runtime-fixture` and profile is `linux-x86_64-syscall-probe-v1`.
+`gdbVersion` and `execution` retain separate bounded process diagnostics.
+`available:true` requires successful process completion and a complete, strictly
+validated evidence record with every check true. A missing/malformed proof or a
+failed stage returns `available:false` and a reason; successful GDB startup alone
+does not establish readiness. A well-formed record with failed checks may be
+retained, but never makes the result available.
+
+The trusted fixture exercises `getpid`, anonymous private `mmap` with RW access,
+a fixed payload write, expected `EINVAL` from an unaligned `mprotect`, an RW→RX
+transition, execution of one fixed instruction, and `munmap`. It never requests
+RWX permissions. A pending `SIGUSR1` must stop before the helper executes and
+without entering its handler. After each operation it compares the exact bytes
+of GDB-reported registers (including floating/vector state), the bounded original
+stack mapping, `errno`, the signal mask, and the trusted syscall/entry instructions.
+Final mappings must match the original snapshot. Proof is printed only after the
+restored fixture exits normally.
+
+`evidence` is null when no valid record exists. Otherwise its fields are:
+
+| Fields | Meaning |
+| --- | --- |
+| `profile`, `pid`, `pageSize`, `scratchAddressHex` | The isolated experiment's identity and allocation. The address is diagnostic and is no longer allocated on success. |
+| `getpid`, `allocated`, `writable`, `executable`, `payloadExecuted`, `released`, `deniedSyscall` | The fixed syscall/allocation/permissions checks above; `deniedSyscall` means the expected `EINVAL`, not a general seccomp test. |
+| `registersRestored`, `stackUnchanged`, `errnoUnchanged`, `signalMaskUnchanged`, `codeUnchanged` | Exact comparisons in the declared fixture scope; `codeUnchanged` covers the trusted syscall and entry instructions. |
+| `signalStopVerified`, `handlerNotRun` | The controlled signal was intercepted before execution and its handler did not run. |
+| `registerCount`, `stackBytes` | The number of compared registers and size of the compared original stack mapping. |
+
+The default shared deadline is `limits.runtimeProbeTimeoutMs` (10000 ms) for
+version checking plus execution, followed by bounded process cleanup. Each stage
+bounds combined raw stdout/stderr
+to `limits.maxRuntimeProbeOutputBytes` (65536 bytes). Cancellation targets this
+request's separate process, including a pre-main inferior in a different process
+group; it never interrupts the live engine. A cancellation at the final handoff
+still sets `cancelled:true`, `available:false`, `reason:"cancelled"`. Diagnostics
+report failure to confirm cleanup where OS inspection/signalling is unavailable.
+
+No session stop, observation, queued stdin/EOF, output journal, branch or
+intervention record is changed. This result certifies only the fixed experiment
+in its current environment: arbitrary inferior calls/syscalls, live code injection,
+external-effect rollback and recorder-compatible interventions remain unsupported.
+Target threads, seccomp, signal state, loader/CET and ABI evidence need their own
+live-target validation. Normal GDB inferior function calls can have additional
+effects; the probe deliberately uses a prelinked syscall instruction and explicit
+register restoration. See [GDB inferior calls](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Calling.html),
+[signal handling](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Signals.html),
+[register bytes](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Values-From-Inferior.html)
+and [mprotect](https://man7.org/linux/man-pages/man2/mprotect.2.html).
 
 ## Build and launch address profiles
 

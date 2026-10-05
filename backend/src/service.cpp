@@ -119,6 +119,7 @@ Json BackendService::capabilities() const {
       {"instructionTrace", "instruction-boundaries"}, {"memoryCapture", true}, {"memoryMapDiff", true}, {"outputJournal", true},
       {"moduleInspection", "linux-proc-maps-elf"},
       {"moduleSymbols", "elf-section-symbol-tables"}, {"variableLayout", "gdb-python-dwarf"}, {"recorderProbe", true},
+      {"runtimeProbe", "isolated-linux-x86_64-syscall-v1"},
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
       {"memoryWriteBatch", "native-private-memory-batch-v1"},
@@ -144,6 +145,7 @@ Json BackendService::capabilities() const {
                    {"maxMemoryBatchRanges", 8}, {"maxMemoryBatchBytes", std::min<std::size_t>(256, options_.limits.maxMemoryReadBytes)},
                    {"maxScalarStorageBatchItems", 8}, {"maxScalarStorageBatchBytes", std::min<std::size_t>(64, options_.limits.maxMemoryReadBytes)},
                    {"maxInterventionStoreBytes", std::min<std::size_t>(4 * 1024 * 1024, options_.limits.maxWireBytes)},
+                   {"runtimeProbeTimeoutMs", 10000}, {"maxRuntimeProbeOutputBytes", 65536},
                    {"commandTimeoutMs", 30000}, {"replayTimeoutMs", 30000}}},
   };
 }
@@ -757,7 +759,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         return frames;
       }
     }
-    if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "build" || kind == "launch" || kind == "step" ||
+    if (shuttingDown_.load() && (kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
                                  kind == "writeRegister" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
@@ -778,7 +780,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
                            liveObservation_.at("stop") == expected;
       if (!matches) return {errorResponse(request, "STALE_CONTEXT", "expectedStop is no longer current", false)};
     }
-    const bool longOperation = kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
+    const bool longOperation = kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
     std::optional<std::string> activeId;
     if (longOperation) {
       const auto requestId = string_at(request, "requestId");
@@ -822,6 +824,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
       catch (const std::exception& e) { artifact_.reset(); return {errorResponse(request, "BUILD_FAILED", e.what(), false)}; }
     }
     if (kind == "probeRecorders") return {handleRecorderProbe(request)};
+    if (kind == "probeRuntime") return {handleRuntimeProbe(request)};
     if (kind == "inspectModules" || kind == "readModuleSnapshot") return handleModules(request);
     if (kind == "inspectModuleSymbols" || kind == "readModuleSymbols") return handleModuleSymbols(request);
     if (kind == "inspectVariableLayout" || kind == "readVariableLayout") return handleVariableLayout(request);
@@ -923,8 +926,8 @@ bool BackendService::control(const Json& request, bool waitForActive) {
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return false;
-  if (active_->kind != "seekRecording" && active_->kind != "reverseInstruction" && active_->kind != "probeRecorders" && active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
-  if ((active_->kind == "build" || active_->kind == "probeRecorders") && kind != "cancel") return false;
+  if (active_->kind != "seekRecording" && active_->kind != "reverseInstruction" && active_->kind != "probeRecorders" && active_->kind != "probeRuntime" && active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
+  if ((active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime") && kind != "cancel") return false;
   if (active_->kind == "launch" && kind == "pause") return false;
   if (request.at("workspace") != active_->workspace || request.at("session") != active_->session) return false;
   if (kind == "cancel" && request.at("command").at("targetRequestId") != active_->id) return false;
@@ -935,8 +938,8 @@ bool BackendService::control(const Json& request, bool waitForActive) {
   if (kind == "stop" || active_->interruption.empty() ||
       (kind == "cancel" && active_->interruption == "pause"))
     active_->interruption = kind;
-  if (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders") active_->stop.request_stop();
-  if (active_->kind != "build" && active_->kind != "probeRecorders") engine_->interrupt(kind == "stop" || active_->kind == "launch" ? 2 : 1);
+  if (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime") active_->stop.request_stop();
+  if (active_->kind != "build" && active_->kind != "probeRecorders" && active_->kind != "probeRuntime") engine_->interrupt(kind == "stop" || active_->kind == "launch" ? 2 : 1);
   return true;
 }
 
@@ -956,7 +959,7 @@ void BackendService::interrupt(int mode) noexcept {
   if (mode >= 2) shuttingDown_.store(true);
   {
     std::lock_guard lock(controlMutex_);
-    if (active_ && (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders")) active_->stop.request_stop();
+    if (active_ && (active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime")) active_->stop.request_stop();
   }
   controlWake_.notify_all();
   if (engine_) engine_->interrupt(mode);

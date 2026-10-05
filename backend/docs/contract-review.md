@@ -228,7 +228,7 @@ native storage edits and intervention lineage are implemented below (2026-10-05)
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | Implemented memory/scalar batches and native GPR writes: expected/current values, independent readback, refreshed stop and shared lineage/audit ledger; once-only retries. Generic intervention queries preserve typed memory/register subsets. | Control-register writes, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
+| Runtime intervention | Implemented memory/scalar batches and native GPR writes: expected/current values, independent readback, refreshed stop and shared lineage/audit ledger; once-only retries. Generic intervention queries preserve typed memory/register subsets. An isolated `probeRuntime` now verifies fixed syscalls and RW→RX execution in the shipped fixture. | Live control-register writes, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -557,3 +557,27 @@ proves inspections send neither the remainder nor EOF. It also checks unchanged
 history/output markers and successful delivery on the following Continue, so a
 leaked suppression guard cannot masquerade as a fix. The same check covers
 record-full status, successful/failed reads and already isolated gateways.
+
+## 2026-10-05: isolated runtime syscall readiness
+
+`probeRuntime` accepts no command fields beyond `kind` and returns
+`{kind:"runtimeProbe",probe:RuntimeProbeDTO}`. Optional capability
+`runtimeProbe:"isolated-linux-x86_64-syscall-v1"` and limits
+`runtimeProbeTimeoutMs` / `maxRuntimeProbeOutputBytes` advertise this gateway.
+It runs only the trusted shipped fixture, independently of a live session.
+
+The two bounded subprocess stages retain version/execution diagnostics and one
+strict proof record. Availability requires successful completion plus all fixed
+syscall, allocation, RW→RX execution, signal interception and state comparison
+checks. Unknown/malformed/duplicate evidence cannot enable the profile. An
+expected kernel `EINVAL` is tested explicitly; this is not a seccomp certification.
+Exact evidence fields and null semantics:
+[runtime probe contract](../../docs/INSPECTION_GATEWAYS.md#isolated-runtime-probe).
+
+Cancellation uses a separate stop token and never sends an interrupt to the
+session debugger. Cleanup accounts for the probe inferior's separate process
+group before main and reports failures to confirm OS cleanup. The final control
+handoff seals late cancellation as unavailable while retaining collected evidence.
+No current stop, input queue, output journal, branch or intervention entry changes.
+Live runtime helpers still require per-target ABI/code/signal checks, finite
+execution and restoration/error auditing; successful probing does not enable them.

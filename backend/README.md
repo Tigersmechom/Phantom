@@ -62,6 +62,12 @@ protocol capabilities.
 
 ## Честные границы текущего среза
 
+- `probeRuntime` проверяет реальные syscalls и исполнение фиксированной инструкции
+  после перехода RW→RX в отдельной служебной программе. Отчёт подтверждает
+  восстановление регистров, стека, `errno`, маски сигналов и освобождение памяти;
+  отмена не затрагивает текущую пользовательскую сессию. Это готовый диагностический
+  API; исполнение произвольного runtime-кода в пользовательской программе пока
+  не поддерживается. [Контракт и пределы](../docs/INSPECTION_GATEWAYS.md#isolated-runtime-probe).
 - `capabilities.architectures` содержит только `x86_64`; arm64 отклоняется.
 - Настоящие source breakpoints, stack frames, line locations, stepping
   (`over/into/out/instruction`) и immutable in-memory history работают через
