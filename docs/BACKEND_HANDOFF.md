@@ -1337,3 +1337,35 @@ input-wait guards. Проверены 13 fault-сценариев, malformed/dup
 metadata, mixed-type paging, общие 128 записей, смешанный бюджет 32/64 KiB,
 неизменность истории и retry после завершения/потери debugger. Unit-тест
 проверяет худшие ошибки/UTF-8/escaping и 32 KiB audit reservation.
+
+### 20.15. Изоляция stdin при просмотре — 05.10.2026
+
+Исправлен подтверждённый баг: `readRegisters`, `readVariables`,
+`inspectVariableLayout`, `disassemble`, `readRecording` могли отправлять
+оставшуюся очередь stdin и закрывать её по EOF во время обработки ответов
+GDB. Программа при этом не исполнялась, а прежний observation показывал старое
+состояние доставки. Repro обнаружил дополнительные 4096 байтов после чтения
+регистров; отдельный сценарий подтвердил преждевременное закрытие stdin.
+
+Пять публичных методов теперь используют существующий nested RAII guard,
+который запрещает feedInput на время inspection, включая error paths.
+stdout/stderr продолжают считываться. Внутренние execution/capture helpers
+не изменены, поэтому последующий Continue доставляет очередь и EOF как раньше.
+DTO/capabilities не менялись; старые observation/history остаются неизменными.
+
+Новый `inspection_input-integration` физически уменьшает пустой FIFO без
+повышенных прав, заполняет его, освобождает место при stopped inferior и
+проверяет отсутствие новых байтов/EOF после просмотра. После каждого native
+сценария Continue обязан доставить ровно остаток, прочитать EOF и завершиться
+с корректным stdout. Проверяются 14 native-сценариев и record-full status,
+успешные/неудачные чтения, пустой frame, неизменная история и process journal.
+До исправления тест воспроизводил дефект, после пяти guards проходит.
+
+Далее по P5: ограниченные runtime helpers/syscalls и совместимое с recorder
+ветвление. P2 object lifetime/ND и P4 verified restore не объявлены завершёнными.
+
+Проверки 20.15: **54/54 Debug и 54/54 ASan/UBSan**, 9547 реальных сообщений
+через TypeScript 5.9.3. Повторно прошли оба live harness-теста: app→HTTP→GDB
+с cin/getline/unsynced cout/flush/maps и build→launch→step→stop. Остальные
+три harness-проверки и четыре Node contract-теста прошли на предыдущем
+срезе; их UI/DTO код этим исправлением не менялся.

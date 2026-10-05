@@ -54,6 +54,15 @@ strings with `BigInt`, not JavaScript `Number`. Bounded page/read byte counts
 within the advertised budgets are numbers; use the DTO field types.
 Stop/history ordinals are session-local, not global timestamps.
 
+Live inspections (`readRegisters`, `readVariables`, `inspectVariableLayout`,
+`disassemble`, `readRecording`, and the memory/scalar gateways) leave queued
+stdin and requested EOF pending while servicing GDB replies. This applies to
+failed reads too. They can drain already produced stdout/stderr, but never
+advance instruction execution or input delivery merely to answer a query.
+Normal execution and explicit input commands keep their delivery semantics.
+Saved observations/history remain immutable: a transport change is visible in
+the next actual stopped snapshot, not rewritten into an earlier observation.
+
 ## Build and launch address profiles
 
 `configuration.addressProfile` accepts `native` (default) or

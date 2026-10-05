@@ -48,6 +48,11 @@ node tools/frontend-harness/smoke.mjs backend/out/linux-debug/phantom-backend
 продолжение процесса создаст актуальный снимок. Неотправленный локальный черновик
 при перезагрузке страницы не сохраняется.
 
+Просмотр переменных, регистров, ASM и recording status оставляет отложенный
+ввод/EOF в очереди. Раньше некоторые такие запросы могли незаметно продвинуть
+доставку stdin на остановке; это исправлено. Обычный Continue сохраняет
+доставку ввода и подтверждённого EOF.
+
 ## Что проверить вручную
 
 1. Build и Launch: после Launch дождись `state.phase=stopped`, проверь `stop.reason=entry`, source location и `processInstanceId`.

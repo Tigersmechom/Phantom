@@ -22,6 +22,7 @@ from pathlib import Path
 
 import service_integration
 import advanced_gateway_integration
+import inspection_input_integration
 import modules_integration
 import recorder_probe_integration
 import recording_integration
@@ -115,6 +116,10 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
     capabilities = next(frame["capabilities"] for direction, frame in traffic
                         if direction == "received" and frame.get("kind") == "connectResult")
     scenarios = [(advanced_gateway_integration, [])]
+    # Older supplied contract refs may not include all the inspection gateways.
+    if capabilities.get("scalarStorage") == "native-dwarf-scalar-v1" and \
+            capabilities.get("vtableInspection") == "itanium-x86_64-absolute-v1":
+        scenarios.append((inspection_input_integration, []))
     if capabilities.get("registerWrite") == "native-x86_64-gpr-v1":
         scenarios.append((register_edit_integration, []))
         scenarios.append((register_edit_failure_integration, []))

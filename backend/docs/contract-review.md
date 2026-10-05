@@ -539,3 +539,21 @@ with 32 KiB register reservations and existing 64 KiB typed batches. New optiona
 Once-only results survive changed stops, inferior exit and debugger death in
 the session. Details and examples:
 [register gateway](../../docs/INSPECTION_GATEWAYS.md#checked-native-register-interventions).
+
+## 2026-10-05: read-only inspection must not pump stdin
+
+Five existing public GDB reads (`readVariables`, `readRegisters`,
+`inspectVariableLayout`, `disassemble`, `readRecording`) now suspend input
+delivery throughout their MI commands, including failure paths. Previously the
+reply loop could feed the pending queue and close stdin when EOF was requested,
+even though no program instruction ran and the saved observation stayed old.
+The nested RAII guard leaves output draining intact and ends before later
+execution/input commands. Internal execution/capture helpers keep their normal
+behavior. No DTO or capability changes are needed.
+
+A real FIFO regression shrinks the empty pipe without elevated permissions,
+queues more bytes than fit, frees space while the inferior is stopped, and
+proves inspections send neither the remainder nor EOF. It also checks unchanged
+history/output markers and successful delivery on the following Continue, so a
+leaked suppression guard cannot masquerade as a fix. The same check covers
+record-full status, successful/failed reads and already isolated gateways.

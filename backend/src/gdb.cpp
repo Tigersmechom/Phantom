@@ -2327,6 +2327,7 @@ bool GdbEngine::resume(std::string_view stepKind, GdbStop& result, GdbError& err
 bool GdbEngine::readRecording(nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"STALE_CONTEXT", "no live debugger", false}; return false; }
   error = {};
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   return impl_->recordingSnapshot(result, error);
 }
 
@@ -2543,6 +2544,7 @@ bool GdbEngine::setBreakpoints(const nlohmann::json& request, nlohmann::json& re
 bool GdbEngine::readVariables(std::string_view reference, std::size_t start,
                               std::size_t count, nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   if (count > impl_->options.maxVariablesPerPage) count = impl_->options.maxVariablesPerPage;
   int level = 0;
   std::string ref(reference);
@@ -2568,6 +2570,7 @@ bool GdbEngine::inspectVariableLayout(std::string_view locator, nlohmann::json& 
                                       GdbError& error) {
   error = {};
   if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   unsigned level = 0;
   std::string_view name;
   if (!impl_->resolveIssuedRootLocator(locator, level, name, error)) return false;
@@ -2875,6 +2878,7 @@ bool GdbEngine::writeRegisterValue(std::string_view name, std::string_view value
 bool GdbEngine::disassemble(std::string_view addressHex, std::size_t maxInstructions,
                             nlohmann::json& result, GdbError& error) {
   if (!live()) { error = {"INVALID_REQUEST", "no live debugger", false}; return false; }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   if (maxInstructions == 0 || maxInstructions > impl_->options.maxInstructions) maxInstructions = impl_->options.maxInstructions;
   auto address = parseAddress(addressHex);
   if (!address) { error = {"INVALID_REQUEST", "invalid disassembly address", false}; return false; }
@@ -2916,6 +2920,7 @@ bool GdbEngine::readRegisters(const std::vector<std::string>& names,
                               nlohmann::json& result, GdbError& error) {
   error = {};
   if (!inferiorPid()) { error = {"INVALID_REQUEST", "no stopped inferior", false}; return false; }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
   std::vector<std::pair<std::size_t, std::string>> selection;
   if (!impl_->resolveRegisters(names, selection, error)) return false;
   MiRecord selected;
