@@ -702,4 +702,56 @@ export interface RuntimeInterventionDTO extends Omit<MemoryInterventionBaseDTO, 
   target: RuntimeHelperManifestDTO;
   report: RuntimeHelperReportDTO;
 }
-export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO | RuntimeInterventionDTO;
+export interface RuntimeAllocationEvidenceDTO {
+  pid: number;
+  pageSize: number;
+  addressHex: string;
+  /** Page-rounded extent, not a C++ object or enclosing VMA size. */
+  byteCount: number;
+  registerCount: number;
+  stackBytes: number;
+  getpid: boolean;
+  allocated: boolean;
+  released: boolean;
+  zeroInitialized: boolean;
+  registersRestored: boolean;
+  stackUnchanged: boolean;
+  errnoUnchanged: boolean;
+  signalMaskUnchanged: boolean;
+  signalPolicyRestored: boolean;
+  codeUnchanged: boolean;
+  mappingDeltaVerified: boolean;
+}
+export interface RuntimeAllocationReportDTO extends Omit<RuntimeHelperReportDTO, 'profile' | 'evidence'> {
+  profile: 'linux-x86_64-retained-rw-v1';
+  action: 'allocate' | 'release';
+  evidence: RuntimeAllocationEvidenceDTO | null;
+}
+export interface RuntimeAllocationInterventionDTO extends Omit<MemoryInterventionBaseDTO, 'mapping' | 'report'> {
+  profile: 'linux-x86_64-retained-rw-v1';
+  action: 'allocate' | 'release';
+  target: {
+    /** Reserved attempt identity; only verified allocations enter the registry. */
+    allocationId: string;
+    addressHex: string | null;
+    requestedBytes: number;
+    byteCount: number | null;
+  };
+  report: RuntimeAllocationReportDTO;
+}
+/** Current registry view; an immutable intervention response grants no authority. */
+export interface RuntimeAllocationDTO {
+  id: string;
+  processInstanceId: string;
+  requestedBytes: number;
+  byteCount: number;
+  addressHex: string;
+  createdByInterventionId: string;
+  createdAt: HistoryPointDTO | null;
+  releasedByInterventionId: string | null;
+  state: 'owned' | 'ownership-unknown' | 'released' | 'process-ended';
+  invalidatedByRequestId: string | null;
+  releaseAllowed: boolean;
+  authorityStop: StopRefDTO | null;
+}
+export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO | RuntimeInterventionDTO | RuntimeAllocationInterventionDTO;

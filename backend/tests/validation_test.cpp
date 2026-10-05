@@ -142,6 +142,36 @@ int main() {
   isolated["command"]["processProfile"] = "native";
   assert(!validation_fails(isolated));
   Json gateway = append;
+  const Json allocationCommand = {{"kind", "allocateRuntimeMemory"},
+      {"profile", "linux-x86_64-retained-rw-v1"}, {"byteCount", 1}};
+  gateway["command"] = allocationCommand;
+  assert(!validation_fails(gateway));
+  gateway["command"]["byteCount"] = 65536;
+  assert(!validation_fails(gateway));
+  for (const auto& count : Json::array({0, -1, 65537, 1.5, false, nullptr, "1"})) {
+    gateway["command"] = allocationCommand; gateway["command"]["byteCount"] = count;
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  for (const auto* key : {"addressHex", "flags", "protection", "payload", "allocationId"}) {
+    gateway["command"] = allocationCommand; gateway["command"][key] = "unexpected";
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  gateway["command"] = allocationCommand;
+  auto missingAllocationStop = gateway; missingAllocationStop.erase("expectedStop");
+  assert(validation_fails(missingAllocationStop, "INVALID_REQUEST"));
+  gateway["command"] = {{"kind", "releaseRuntimeMemory"},
+      {"profile", "linux-x86_64-retained-rw-v1"}, {"allocationId", "allocation-1"}};
+  assert(!validation_fails(gateway));
+  auto missingReleaseStop = gateway; missingReleaseStop.erase("expectedStop");
+  assert(validation_fails(missingReleaseStop, "INVALID_REQUEST"));
+  gateway["command"]["addressHex"] = "0x1000";
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway["command"] = {{"kind", "listRuntimeAllocations"}, {"start", 9007199254740991ULL}, {"count", 64}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["start"] = -1;
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  gateway["command"] = {{"kind", "readRuntimeAllocation"}, {"allocationId", "allocation-1"}};
+  assert(!validation_fails(gateway));
   for (const auto* kind : {"readRecording", "reverseInstruction", "inspectModules"}) {
     gateway["command"] = {{"kind", kind}};
     assert(!validation_fails(gateway));

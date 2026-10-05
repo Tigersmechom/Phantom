@@ -624,3 +624,36 @@ its mappings. Rejected native helper requests leave state/audit untouched;
 ordinary native debugging and record-full keep their existing behavior.
 The restriction is not a general sandbox or proof of allocation lifetime.
 See [process profile](../../docs/INSPECTION_GATEWAYS.md#process-creation-profile).
+
+## 2026-10-05: retained private RW allocations
+
+`allocateRuntimeMemory{profile,byteCount}` and
+`releaseRuntimeMemory{profile,allocationId}` add the explicit operation profile
+`linux-x86_64-retained-rw-v1`. Both require session/current expectedStop and the
+existing opted-in scratch build plus verified single-process native launch.
+Allocation accepts 1–65536 requested bytes; actual storage is page-rounded.
+Release accepts only a backend allocation ID, never a caller-supplied address.
+
+Results use `runtimeAllocationIntervention` in the shared audit/branch ledger.
+Evidence covers real getpid/mmap/munmap, zero initialization on allocation,
+restoration of registers/stack/errno/mask/code/signal policies, and an independent
+complete proc-map delta check. Anonymous private VMA merge/split is accounted
+for without interpreting address equality as allocation identity. Attempted
+execution with an unverified outcome terminates the inferior. Exact request
+retries return the saved receipt without another syscall or renewed authority.
+
+Session-only `readRuntimeAllocation{allocationId}` and
+`listRuntimeAllocations{start,count}` expose `owned`, `ownership-unknown`,
+`released`, or `process-ended`, with `releaseAllowed` and `authorityStop`.
+These reflect the last observed backend state; queries do not secretly poll GDB.
+Possible user execution conservatively revokes release authority before dispatch,
+even when execution later fails. Passive reads and checked direct writes retain
+authority; history, matching maps and old receipts never restore it. Read-only
+release preflight rejection restores the previously held authority.
+
+The limits are 64 registry records, including released records, and 1 MiB of
+outstanding page-rounded storage. Unknown ownership still consumes the byte
+budget until process termination is observed. Release frees bytes, not a record
+slot. A new session clears the registry. Existing generic intervention limits
+also apply. No C++ lifetime, arbitrary syscall/code execution, or record-full
+support is implied. See [wire schemas and examples](../../docs/INSPECTION_GATEWAYS.md#retained-runtime-allocations).

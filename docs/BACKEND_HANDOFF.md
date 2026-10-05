@@ -958,6 +958,9 @@ observation history, сохраняет границы eviction и не обещ
 - `traceInstructions` / `readInstructionTrace`: сохраняемая история выбранных
   значений на instruction boundaries. Capture/trace store ограничен 128 records
   и 16 MiB по умолчанию; eviction возвращает `HISTORY_EVICTED`.
+- `allocateRuntimeMemory` / `releaseRuntimeMemory`: сохраняемые private RW
+  allocations по backend ID; `readRuntimeAllocation` / `listRuntimeAllocations`
+  показывают состояние и право освобождения. Opt-in профиль и пределы — §20.19.
 
 Чтения живого процесса требуют `expectedStop`; исторические запросы не читают
 нынешний процесс. `probeRecorders` не требует live-сессии или stop token.
@@ -968,7 +971,8 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**сохраняемые runtime allocations по 20.5 после scratch-профиля 20.17 и изоляции запуска 20.18**, параллельно — углубление object/lifetime
+**дополнительные ограниченные runtime helpers по 20.5 после сохраняемых RW allocations 20.19,
+затем согласование вмешательств с recorder-ветвями**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1537,3 +1541,55 @@ constructors/LD_PRELOAD, невозможность снять либо осла
 потерянный marker и неподтверждённые kernel properties без fallback и утечки
 inferior. Native relaunch, cin/getline/EOF/cout, errno, steps и прежний
 runtime-helper с новым явным профилем прошли регрессию.
+
+### 20.19. Сохраняемые runtime allocations — 05.10.2026
+
+Реализованы `allocateRuntimeMemory` / `releaseRuntimeMemory` с operation profile
+`linux-x86_64-retained-rw-v1`. Нужны opt-in scratch-сборка 20.17,
+`single-process-v1` из 20.18, native recording и текущий `expectedStop`.
+Allocation выполняет настоящий mmap private anonymous RW и сохраняет область
+после возврата из команды. Проверяются нулевые байты всех выделенных страниц,
+getpid, восстановление всех захваченных регистров, стека, errno, маски сигналов,
+GDB signal policies и helper code. Независимый C++ verifier сравнивает полные
+карты до/после с учётом допустимого слияния и разделения anonymous private VMA;
+изменения за пределами целевого диапазона не принимаются за успех.
+
+Каждая область получает непрозрачный backend ID, process identity, точный
+адрес, requested и page-rounded byte counts, ссылки на audit/точку создания.
+Release принимает только этот ID и выполняет munmap подтверждённого диапазона.
+После Step/Continue и других потенциально исполняющих пользовательский код
+команд право освобождения отзывается до dispatch, даже если команда затем
+завершилась ошибкой. Совпадение адреса, байтов или `/proc/maps` не возвращает
+это право: сама программа могла заменить mapping. Проверяемые прямые записи
+памяти/регистров/scalar storage и пассивные чтения сохраняют право; отдельный
+scratch helper консервативно отзывает его. Неисполняющий отказ release на
+preflight восстанавливает прежнее право, попытка с недоказанным исходом
+закрывает inferior. Эти правила проверены реальным ABA-сценарием с
+munmap/MAP_FIXED и повторным получением тех же нулевых страниц по тому же адресу.
+
+`readRuntimeAllocation` / `listRuntimeAllocations` требуют только session и
+возвращают `owned`, `ownership-unknown`, `released`, `process-ended`, причину
+отзыва и `releaseAllowed`/`authorityStop`. Это сохранённое знание backend,
+без скрытого исполнения либо MI-poll при чтении. После наблюдаемого завершения
+процесса записи остаются доступны; новый launch/session очищает реестр.
+Успешный повтор requestId возвращает прежнюю квитанцию без повторного syscall
+и без восстановления права освобождения.
+
+Лимиты: 1–65536 requested bytes на allocation, 64 записи за session, 1 MiB
+одновременно учтённых page-rounded bytes. `ownership-unknown` продолжает
+занимать квоту; подтверждённый release возвращает байтовую квоту, но не слот
+записи. Дополнительно действуют общий audit budget и десятисекундный runtime
+deadline. Очередь stdin/EOF остаётся изолированной на протяжении операции.
+Это storage, без конструирования C++ объектов, произвольных syscall/кода или
+совместимости с record-full. P2 semantic cin/ND, P4 полный recorder и P6 этим
+срезом не закрываются. Новые кнопки/2D renderer не добавлялись; frontend получает
+DTO, примеры запросов и [контракт выделений](INSPECTION_GATEWAYS.md#retained-runtime-allocations).
+
+Новые проверки включают реальные mmap/munmap и VMA merge/split, сохранение
+всей прежней карты и контекста, квоты/пагинацию, direct-write authority,
+отзыв при исполнении, ABA-подмену, неизменность stdin/EOF, seccomp-отказ,
+отмену до/после попытки, потерю подтверждения, timeout, повреждённое evidence
+и отказ post-refresh. Полная регрессия: **62/62 Debug и 62/62 ASan/UBSan**,
+по 12473 реальных сообщения через TypeScript 5.9.3, все пять harness-проверок
+и четыре Node contract-теста. Прежние cin/cout, stepping/history, recording,
+inspection и memory/register/scalar interventions прошли общие проверки.

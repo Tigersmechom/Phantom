@@ -8,6 +8,7 @@
 #include "scalar_storage_script.hpp"
 #include "runtime_helper_script.hpp"
 #include "phantom/runtime_helper.hpp"
+#include "phantom/runtime_allocation.hpp"
 #include "phantom/validation.hpp"
 #include "phantom/sha256.hpp"
 
@@ -1181,7 +1182,8 @@ struct GdbEngine::Impl {
     try {
       auto wireCommand = tokenText + std::string(commandText) + "\n";
       if (runtimeHelperActive && runtimeHelperMutation &&
-          commandText == "-interpreter-exec console \"python _phantom_runtime_helper_execute()\"") {
+          (commandText == "-interpreter-exec console \"python _phantom_runtime_helper_execute()\"" ||
+           commandText == "-interpreter-exec console \"python _phantom_runtime_allocation_execute()\"")) {
         // A Python script which resumes the inferior produces ^running on
         // its first stepi, but GDB does not subsequently emit ^done for that
         // token. Queue a read-only MI barrier behind the complete script and
@@ -2956,11 +2958,30 @@ bool GdbEngine::writeMemoryBytes(std::string_view addressHex, std::string_view b
 
 bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
     nlohmann::json& report, GdbError& error, std::stop_token cancellation) {
+  nlohmann::json afterMaps;
+  return executeRuntimeOperation(manifest, RuntimeOperation::scratch, {}, 0, report, afterMaps, error, cancellation);
+}
+
+bool GdbEngine::executeRuntimeAllocation(const nlohmann::json& manifest, bool release,
+    std::string_view addressHex, std::size_t byteCount, nlohmann::json& report,
+    nlohmann::json& afterMaps, GdbError& error, std::stop_token cancellation) {
+  return executeRuntimeOperation(manifest, release ? RuntimeOperation::release : RuntimeOperation::allocate,
+                                 addressHex, byteCount, report, afterMaps, error, cancellation);
+}
+
+bool GdbEngine::executeRuntimeOperation(const nlohmann::json& manifest, RuntimeOperation operation,
+    std::string_view addressHex, std::size_t byteCount, nlohmann::json& report,
+    nlohmann::json& afterMaps, GdbError& error, std::stop_token cancellation) {
   using Json = nlohmann::json;
+  const bool retained = operation != RuntimeOperation::scratch;
+  const bool release = operation == RuntimeOperation::release;
+  const std::string_view action = retained ? (release ? "release" : "allocate") : "scratch";
   error = {};
-  report = {{"profile", "linux-x86_64-scratch-v1"}, {"writeAttempted", false},
+  afterMaps = nullptr;
+  report = {{"profile", retained ? "linux-x86_64-retained-rw-v1" : "linux-x86_64-scratch-v1"}, {"writeAttempted", false},
     {"executionAttempted", false}, {"debuggerAlive", live()}, {"cancelled", false},
     {"outcome", "rejected"}, {"phase", "prepare"}, {"evidence", nullptr}, {"error", nullptr}};
+  if (retained) report["action"] = action;
   Impl::CaptureOnlyIo captureOnly(*impl_);
   bool attempted = false;
   struct RuntimeScope {
@@ -2982,6 +3003,7 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
     }
   } runtime(*impl_, cancellation);
   const auto failed = [&](std::string code, std::string message) {
+    afterMaps = nullptr;
     if (attempted && impl_->live.load()) {
       impl_->failClosed(error, code, message + "; runtime state unverified, debugger and inferior closed", false);
     } else error = {std::move(code), std::move(message), false};
@@ -3016,6 +3038,29 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
     return parse_wire_json(*record, limits);
   };
   try {
+    const auto hostPageSize = ::sysconf(_SC_PAGESIZE);
+    std::size_t mappedBytes = 0;
+    std::uint64_t releaseAddress = 0;
+    if (retained) {
+      if (hostPageSize < 4096 || hostPageSize > 1048576 || (hostPageSize & (hostPageSize-1)) != 0)
+        return failed("UNSUPPORTED", "runtime allocation requires a supported host page size");
+      if (byteCount == 0 || byteCount > (release ? 1048576u : 65536u))
+        return failed("LIMIT_EXCEEDED", "runtime allocation byte count exceeds the supported limit");
+      const auto page = static_cast<std::size_t>(hostPageSize);
+      mappedBytes = ((byteCount + page-1) / page) * page;
+      if (!release && !addressHex.empty())
+        return failed("INVALID_REQUEST", "runtime allocation does not accept an address");
+      if (release) {
+        const auto address = addressHex.size() <= 18 ? parseAddress(addressHex) : std::nullopt;
+        if (!address || *address == 0 || *address >= (std::uint64_t{1} << 63) ||
+            addressHex.size() < 3 || addressHex[2] == '0' || !addressHex.starts_with("0x") ||
+            addressHex.find_first_not_of("0123456789abcdef", 2) != std::string_view::npos ||
+            *address % page != 0 || byteCount != mappedBytes ||
+            mappedBytes > (std::uint64_t{1} << 63) - *address)
+          return failed("INVALID_REQUEST", "runtime release requires a canonical aligned owned range");
+        releaseAddress = *address;
+      }
+    }
     if (cancellation.stop_requested()) return failed("CANCELLED", "runtime helper cancelled before preparation");
     if (!live()) return failed("STALE_CONTEXT", "runtime helper requires a live stopped process");
     if (impl_->processProfile != "single-process-v1" || !impl_->processIsolationVerified)
@@ -3035,6 +3080,32 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
         impl_->inferiorPid.data()+impl_->inferiorPid.size(), pid);
     if (parsedPid.ec != std::errc{} || parsedPid.ptr != impl_->inferiorPid.data()+impl_->inferiorPid.size() || pid <= 0)
       return failed("READ_FAILED", "runtime inferior identity is invalid");
+    Json beforeMaps = nullptr;
+    if (retained) {
+      beforeMaps = readLinuxMemoryMap(pid);
+      if (!beforeMaps.value("available", false) || beforeMaps.value("coverage", "") != "complete")
+        return failed("UNSUPPORTED", "runtime allocation requires a complete current memory map");
+      if (release) {
+        // The service supplies ownership; independently refuse any hole,
+        // protection change, file mapping or special mapping before munmap.
+        auto cursor = releaseAddress;
+        const auto end = releaseAddress + mappedBytes;
+        for (const auto& region : beforeMaps.at("regions")) {
+          const auto low = parseAddress(region.at("startAddressHex").get<std::string>());
+          const auto high = parseAddress(region.at("endAddressHex").get<std::string>());
+          if (!low || !high) return failed("READ_FAILED", "runtime release map contains invalid bounds");
+          if (*high <= cursor) continue;
+          if (cursor == end) break;
+          if (*low > cursor || region.at("permissions") != "rw-p" || region.at("offsetHex") != "0x0" ||
+              region.at("device") != "00:00" || region.at("inodeDecimal") != "0" ||
+              !region.at("path").is_null() || region.contains("pathBytesHex") || region.at("kind") != "anonymous")
+            return failed("STALE_CONTEXT", "runtime release range is not current private anonymous RW storage");
+          cursor = std::min(end, *high);
+        }
+        if (cursor != end)
+          return failed("STALE_CONTEXT", "runtime release range is not completely mapped");
+      }
+    }
 
     // Read the current process image through one descriptor. Hash and ELF
     // verifier consume the same bounded bytes; no executable path/symbol
@@ -3073,7 +3144,8 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
       return failed(error.code, error.message);
     const auto thread = target.at("threadId").get<std::string>();
     const auto prepare = std::string(runtimeHelperScript) +
-        "\n_phantom_runtime_helper_prepare(" + manifest.dump() + "," + std::to_string(pid) + "," + Json(thread).dump() + ")\n";
+        "\n_phantom_runtime_helper_prepare(" + manifest.dump() + "," + std::to_string(pid) + "," + Json(thread).dump() +
+        (retained ? "," + Json(std::string(action)).dump() + "," + std::to_string(releaseAddress) + "," + std::to_string(byteCount) : "") + ")\n";
     MiRecord response;
     if (!impl_->command("-interpreter-exec console " + miQuote("python exec(" + Json(prepare).dump() + ")"),
                         false, response, error, 0, true))
@@ -3104,7 +3176,8 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
 
     report["phase"] = "execute";
     impl_->runtimeHelperMutation = true;
-    if (!impl_->command("-interpreter-exec console \"python _phantom_runtime_helper_execute()\"",
+    if (!impl_->command(retained ? "-interpreter-exec console \"python _phantom_runtime_allocation_execute()\"" :
+                                  "-interpreter-exec console \"python _phantom_runtime_helper_execute()\"",
                         false, response, error, 0, true, &attempted))
       return failed(error.code, error.message);
     const auto* barrierFeatures = field(response.fields, "features");
@@ -3117,34 +3190,58 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
       if (!feature || feature->kind != mi::ValueKind::string || feature->text.size() > 128)
         return failed("READ_FAILED", "runtime helper completion barrier metadata is invalid");
     report["phase"] = "verify";
-    const auto evidence = proof("PHANTOM_RUNTIME_HELPER_RESULT_V1:", 4096);
-    constexpr std::array<std::string_view, 13> flags = {"getpid", "allocated", "writable", "executable",
-      "payloadExecuted", "released", "registersRestored", "stackUnchanged", "errnoUnchanged",
-      "signalMaskUnchanged", "signalPolicyRestored", "codeUnchanged", "mapsRestored"};
-    if (!evidence.is_object() || evidence.size() != flags.size()+5 ||
+    auto evidence = proof(retained ? "PHANTOM_RUNTIME_ALLOCATION_RESULT_V1:" : "PHANTOM_RUNTIME_HELPER_RESULT_V1:", 4096);
+    constexpr std::array<std::string_view, 7> flags = {"getpid", "registersRestored", "stackUnchanged", "errnoUnchanged",
+      "signalMaskUnchanged", "signalPolicyRestored", "codeUnchanged"};
+    const std::string addressKey = retained ? "addressHex" : "scratchAddressHex";
+    if (!evidence.is_object() || evidence.size() != (retained ? 16u : 18u) ||
         !evidence.contains("pid") || !evidence["pid"].is_number_unsigned() || evidence["pid"] != pid ||
         !evidence.contains("registerCount") || !evidence["registerCount"].is_number_unsigned() ||
         evidence["registerCount"] != prepared.at("registerCount") ||
         !evidence.contains("stackBytes") || !evidence["stackBytes"].is_number_unsigned() ||
         evidence["stackBytes"] != prepared.at("stackBytes") ||
         !evidence.contains("pageSize") || !evidence["pageSize"].is_number_unsigned() ||
-        !evidence.contains("scratchAddressHex") || !evidence["scratchAddressHex"].is_string())
+        !evidence.contains(addressKey) || !evidence[addressKey].is_string())
       return failed("READ_FAILED", "runtime helper execution proof is invalid");
     const auto pageSize = evidence["pageSize"].get<std::uint64_t>();
-    const auto& address = evidence["scratchAddressHex"].get_ref<const std::string&>();
+    const auto& address = evidence[addressKey].get_ref<const std::string&>();
     const auto numericAddress = parseAddress(address);
     if (pageSize < 4096 || pageSize > 1048576 || (pageSize & (pageSize-1)) != 0 ||
         !numericAddress || *numericAddress == 0 || *numericAddress >= (std::uint64_t{1} << 63) ||
         *numericAddress % pageSize != 0 || address.size() < 3 || address[2] == '0' ||
         !address.starts_with("0x") || address.find_first_not_of("0123456789abcdef", 2) != std::string::npos)
-      return failed("READ_FAILED", "runtime helper scratch mapping proof is invalid");
+      return failed("READ_FAILED", "runtime mapping proof is invalid");
     for (const auto flag : flags) {
       const auto key = std::string(flag);
       if (!evidence.contains(key) || !evidence[key].is_boolean() || evidence[key] != true)
         return failed("READ_FAILED", "runtime helper restoration evidence is incomplete");
     }
+    if (retained) {
+      if (pageSize != static_cast<std::uint64_t>(hostPageSize) ||
+          !evidence.contains("byteCount") || !evidence["byteCount"].is_number_unsigned() ||
+          evidence["byteCount"] != mappedBytes || mappedBytes > (std::uint64_t{1} << 63) - *numericAddress ||
+          (release && (address != addressHex || *numericAddress != releaseAddress)))
+        return failed("READ_FAILED", "runtime allocation range proof is invalid");
+      for (const auto key : {"allocated", "released", "zeroInitialized"}) {
+        const bool expected = std::string_view(key) == "released" ? release : !release;
+        if (!evidence.contains(key) || !evidence[key].is_boolean() || evidence[key] != expected)
+          return failed("READ_FAILED", "runtime allocation action evidence is invalid");
+      }
+      auto observedMaps = readLinuxMemoryMap(pid);
+      std::string detail;
+      if (!verifyRuntimeAllocationDelta(beforeMaps, observedMaps, address, mappedBytes, release, detail))
+        return failed("READ_FAILED", "runtime allocation mapping delta is unverified: " + detail);
+      evidence["mappingDeltaVerified"] = true;
+      afterMaps = std::move(observedMaps);
+    } else {
+      for (const auto key : {"allocated", "writable", "executable", "payloadExecuted", "released", "mapsRestored"})
+        if (!evidence.contains(key) || !evidence[key].is_boolean() || evidence[key] != true)
+          return failed("READ_FAILED", "runtime helper restoration evidence is incomplete");
+    }
     if (cancellation.stop_requested() || impl_->runtimeHelperCancelled)
       return failed("CANCELLED", "runtime helper cancelled before restoration was acknowledged");
+    if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)
+      return failed("TIMEOUT", "runtime helper verification deadline exhausted");
     report["writeAttempted"] = attempted;
     report["executionAttempted"] = attempted;
     report["debuggerAlive"] = live();

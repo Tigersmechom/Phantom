@@ -80,6 +80,10 @@ class BackendService final {
   std::vector<Json> handleMemoryIntervention(const Json& request, const Json& preparedScalar = nullptr);
   std::vector<Json> handleRegisterIntervention(const Json& request);
   std::vector<Json> handleRuntimeIntervention(const Json& request);
+  std::vector<Json> handleRuntimeAllocation(const Json& request);
+  Json handleRuntimeAllocationQuery(const Json& request);
+  void revokeRuntimeAllocations(std::string_view requestId);
+  void synchronizeRuntimeAllocations();
   std::vector<Json> handleInterventionQuery(const Json& request);
   std::optional<Json> interventionBudgetError(const Json& request, std::size_t reservationBytes) const;
   Json beginIntervention(const Json& request);
@@ -145,6 +149,13 @@ class BackendService final {
     std::size_t reservationBytes = interventionReservation;
   };
   std::vector<InterventionEntry> interventions_;
+  // Proven allocations only. Ownership is never reacquired by comparing
+  // addresses/maps after execution; records persist until the session ends.
+  static constexpr std::size_t maxRuntimeAllocations = 64;
+  static constexpr std::size_t maxRuntimeAllocationBytes = 65536;
+  static constexpr std::size_t maxRuntimeAllocationTotalBytes = 1024 * 1024;
+  std::vector<Json> runtimeAllocations_;
+  std::uint64_t runtimeAllocationCounter_ = 0;
   Json executionLayout_ = nullptr;
   OutputJournal stdoutJournal_, stderrJournal_;
   bool outputJournalConsistent_ = true;

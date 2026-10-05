@@ -203,6 +203,14 @@ class GdbEngine {
   bool executeRuntimeHelper(const nlohmann::json& manifest,
                             nlohmann::json& report, GdbError& error,
                             std::stop_token cancellation = {});
+  // Trusted service-only retained mappings. Allocation accepts an empty
+  // address and 1..65536 requested bytes. Release accepts only the service's
+  // owned, page-aligned address and mapped size; no wire address is allowed.
+  // afterMaps is the independently verified complete post-operation map.
+  bool executeRuntimeAllocation(const nlohmann::json& manifest, bool release,
+                                std::string_view addressHex, std::size_t byteCount,
+                                nlohmann::json& report, nlohmann::json& afterMaps,
+                                GdbError& error, std::stop_token cancellation = {});
   // Independently re-check the stop, capture without target execution or
   // input delivery, and replace issued variable handles for this new state.
   bool refreshStoppedSnapshot(GdbStop& result, GdbError& error);
@@ -234,6 +242,11 @@ class GdbEngine {
                      nlohmann::json&, GdbError& error);
 
  private:
+  enum class RuntimeOperation { scratch, allocate, release };
+  bool executeRuntimeOperation(const nlohmann::json& manifest, RuntimeOperation operation,
+                               std::string_view addressHex, std::size_t byteCount,
+                               nlohmann::json& report, nlohmann::json& afterMaps,
+                               GdbError& error, std::stop_token cancellation);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

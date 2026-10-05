@@ -43,6 +43,8 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 | `probeRuntime` | No | Verify fixed syscalls, RW→RX execution and state restoration in a separate shipped fixture. |
 | `runRuntimeHelper` | Required | Execute the opted-in scratch helper in the live native process; retain restoration evidence and an intervention branch. |
+| `allocateRuntimeMemory` / `releaseRuntimeMemory` | Required | Retain private RW storage or release an authorized backend allocation ID; retain an intervention branch. |
+| `readRuntimeAllocation` / `listRuntimeAllocations` | No | Read current session registry status, separate from immutable intervention receipts. |
 
 Captures and traces share a separate bounded store: at most 128 records and
 `capabilities.limits.maxInspectionStoreBytes` serialized bytes (16 MiB by
@@ -224,6 +226,105 @@ retained. Restoring RIP to an enabled source breakpoint can make the next
 Continue stop at that same breakpoint once more. This is exposed as a real stop;
 the backend does not silently advance additional user instructions.
 
+## Retained runtime allocations
+
+`capabilities.runtimeAllocations:"linux-x86_64-retained-rw-v1"` enables:
+
+```json
+{"kind":"allocateRuntimeMemory","profile":"linux-x86_64-retained-rw-v1","byteCount":4097}
+{"kind":"releaseRuntimeMemory","profile":"linux-x86_64-retained-rw-v1","allocationId":"allocation-1"}
+{"kind":"readRuntimeAllocation","allocationId":"allocation-1"}
+{"kind":"listRuntimeAllocations","start":0,"count":64}
+```
+
+Use the scratch helper build profile and verified `single-process-v1` launch
+described above. Allocation/release require the current session and exact
+`expectedStop`; registry queries require the session and work after process
+termination. Release accepts no address, length, protection flags or payload:
+the backend resolves its ID against its own session registry.
+
+Allocation uses anonymous private RW `mmap`, rounds the requested size up to
+the kernel page size, independently verifies every returned byte is zero,
+then leaves the mapping in the stopped program. It never executes bytes from
+this allocation. The exact returned extent is stored separately from the
+enclosing VMA. Release unmaps exactly that extent. Mappings may merge with or
+split adjacent anonymous mappings; the verifier compares coverage and metadata
+outside the permitted interval, and requires only that interval to be added
+or removed. File/special/shared/named mappings cannot be treated as equivalent
+anonymous storage. [Linux mmap/munmap](https://man7.org/linux/man-pages/man2/munmap.2.html),
+[proc maps](https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html).
+
+Both operations preserve and verify the captured registers, original stack,
+errno, signal mask, helper code and GDB signal policies. They share the live
+helper's native ABI/TLS/signal/restart guards, stdin/EOF isolation and 10-second
+deadline. C++ independently checks the actual before/after mapping delta after
+the complete MI barrier. The service then refreshes the observation and requires
+the same final mappings. A signal, denied syscall, uncertain acknowledgement,
+timeout, cancellation before verification completes or failed refresh closes
+the process and retains the intervention; no uncertain syscall is retried for
+cleanup. Cancellation accepted after verified execution is recorded separately
+as `cancelled:true` and preserves the completed operation's evidence.
+
+The result is `runtimeAllocationIntervention` with `intervention` and
+`throughSequence`. It extends the common audit with `action:"allocate"|"release"`,
+`target:{allocationId,addressHex,requestedBytes,byteCount}` and a report using
+the retained-RW profile. Before allocation is proven, target address/byteCount
+are null; the reserved ID alone is not proof that memory was allocated.
+Only a verified allocation enters the registry, even if a subsequent refresh
+fails and its process has already ended.
+
+The report uses the scratch report's attempt/cancel/outcome/phase/error fields
+and adds `action`. Evidence has six metadata fields (`pid`, `pageSize`,
+`addressHex`, mapped `byteCount`, `registerCount`, `stackBytes`) and eleven
+checks: `getpid`, `allocated`, `released`, `zeroInitialized`,
+`registersRestored`, `stackUnchanged`, `errnoUnchanged`, `signalMaskUnchanged`,
+`signalPolicyRestored`, `codeUnchanged`, `mappingDeltaVerified`.
+Successful allocation sets allocated/zeroInitialized true and released false;
+release sets the converse. Absent proof is null. Every attempted operation
+gets one audit/branch; exact retries return their saved response without
+repeating the syscall. Generic intervention queries include these records.
+
+Registry results are `runtimeAllocation{allocation}` or
+`runtimeAllocations{items,start,total,hasMore,totalBytes}`. A record contains
+`id`, `processInstanceId`, `requestedBytes`, mapped `byteCount`, `addressHex`,
+`createdByInterventionId`, nullable `createdAt`, nullable
+`releasedByInterventionId`, `state`, nullable `invalidatedByRequestId`,
+`releaseAllowed` and nullable `authorityStop`. A failed post-allocation refresh
+leaves createdAt null. IDs are scoped to the session and never reused within it.
+
+State means:
+
+- `owned`: release authority remains within the continuously stopped process.
+- `ownership-unknown`: authority was irrevocably revoked; the address is historical.
+- `released`: the backend confirmed the release syscall and its mapping delta.
+- `process-ended`: a previously unreleased record belongs to an ended process.
+
+Read-only queries and supported passive memory/register/scalar edits preserve
+authority. Verified allocate/release preserve other owned allocations too.
+Step, Continue, Pause, instruction trace, seek/reverse, scratch execution,
+launch attempts, setBreakpoints and writeVariable requests revoke authority
+before dispatch. This is conservative even when such a request later fails or
+returns to the same PC. Stale requests fail before revocation. Cancellation
+before an allocation/release execution attempt leaves authority intact after
+draining the read-only preparation command.
+
+After revocation the program might have unmapped and recreated identical
+zero-filled memory at the same address. Matching bytes/maps, history reads and
+replayed intervention responses never restore release authority. The registry
+is the current backend view, not an immutable creation receipt. Like getState,
+it reflects the latest observed process state; release always performs fresh
+engine checks, even when the prior query said releaseAllowed:true.
+
+Limits are 65536 requested bytes per allocation, 64 retained allocation
+records per session, and 1 MiB outstanding page-rounded bytes, also published
+as `maxRuntimeAllocationBytes`, `maxRuntimeAllocations` and
+`maxRuntimeAllocationTotalBytes`. Unknown ownership continues to consume byte
+quota. Verified release or observed process termination frees byte quota;
+released records continue to consume record quota. The common intervention
+count/byte budget is checked before every syscall attempt. New sessions reset
+the registry; failed releases never trigger an automatic munmap by old address.
+These are OS storage allocations, not C++ object construction or lifetime proof.
+
 ## Process creation profile
 
 `capabilities.processProfiles` advertises `native` and `single-process-v1`.
@@ -272,8 +373,9 @@ This version requires an entry stop and native recording; record-full is
 rejected before launch. The restriction is inherited across target exec and
 cannot be disabled during the session. Relaunch with `native` to run a program
 which needs threads or child processes. Memory allocation ownership across
-user execution remains a separate problem: this profile does not implement
-retained allocations, release authority or C++ object lifetime.
+user execution remains a separate problem: the retained allocation gateway
+above uses a separate authority registry, and neither profile proves C++ object
+lifetime.
 
 ## Build and launch address profiles
 

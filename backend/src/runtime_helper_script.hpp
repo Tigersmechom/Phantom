@@ -92,7 +92,7 @@ def _phantom_runtime_helper_set(name,value):
     _phantom_runtime_helper_require(name in _phantom_runtime_helper_regs, 'unexpected register write')
     gdb.execute('set $%s = 0x%x' % (name,value & _phantom_runtime_helper_mask),to_string=True)
 
-def _phantom_runtime_helper_prepare(manifest,pid,thread):
+def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address=0,byte_count=0):
     global _phantom_runtime_helper_ctx
     _phantom_runtime_helper_ctx = None
     inferior = gdb.selected_inferior()
@@ -145,18 +145,31 @@ def _phantom_runtime_helper_prepare(manifest,pid,thread):
     require(tls_match is not None and int(tls_match.group(1),16) < 1 << 63 and
         tls_match.group(2) in [symbol.symtab.objfile.filename,libraries[0].filename],
         'glibc errno TLS identity unavailable')
-    address = symbol.value().address
-    require(address is not None, 'errno is not addressable')
-    errno_address = int(address)
+    errno_pointer = symbol.value().address
+    require(errno_pointer is not None, 'errno is not addressable')
+    errno_address = int(errno_pointer)
     require(any(lo <= errno_address and errno_address+4 <= hi and permissions == 'rw-p'
                 for lo,hi,permissions,_ in maps), 'errno is not readable private storage')
     page_size = os.sysconf('SC_PAGESIZE')
     require(4096 <= page_size <= 1048576 and page_size & (page_size-1) == 0,
             'unsupported page size')
+    require(action in ['scratch','allocate','release'] and type(address) is int and type(byte_count) is int,
+            'unsupported runtime action')
+    if action == 'scratch':
+        require(address == 0 and byte_count == 0, 'unexpected scratch arguments')
+    elif action == 'allocate':
+        require(address == 0 and 1 <= byte_count <= 65536, 'invalid allocation size')
+        byte_count = ((byte_count+page_size-1)//page_size)*page_size
+        require(byte_count <= 1048576, 'allocation exceeds mapped size limit')
+    else:
+        require(0 < address < 1 << 63 and address % page_size == 0 and
+            1 <= byte_count <= 1048576 and byte_count % page_size == 0 and
+            address+byte_count <= 1 << 63, 'invalid release range')
     registers = _phantom_runtime_helper_registers()
     policies = _phantom_runtime_helper_policies()
     _phantom_runtime_helper_ctx = {
         'inferior':inferior,'pid':pid,'thread':thread,'site':site,'code':code,'pageSize':page_size,
+        'action':action,'address':address,'byteCount':byte_count,
         'maps':_phantom_runtime_helper_proc(pid,'maps'),'stackStart':low,
         'stack':bytes(inferior.read_memory(low,high-low)),
         'errnoAddress':errno_address,'errno':bytes(inferior.read_memory(errno_address,4)),
@@ -166,11 +179,12 @@ def _phantom_runtime_helper_prepare(manifest,pid,thread):
         'ready':True,'pid':pid,'threadId':thread,'siteAddressHex':hex(site),
         'registerCount':len(registers),'stackBytes':high-low},separators=(',',':')))
 
-def _phantom_runtime_helper_execute():
+def _phantom_runtime_helper_execute_operation(expected_actions):
     global _phantom_runtime_helper_ctx
     context = _phantom_runtime_helper_ctx
     require = _phantom_runtime_helper_require
     require(context is not None, 'prepared state unavailable')
+    require(context['action'] in expected_actions, 'prepared action mismatch')
     inferior = context['inferior']
     stops = []
     def on_stop(event):
@@ -208,8 +222,10 @@ def _phantom_runtime_helper_execute():
             result = _phantom_runtime_helper_reg('rax')
             restore()
             return result
-        def permissions(address,expected):
-            require(any(lo <= address and address+context['pageSize'] <= hi and mode == expected
+        def permissions(address,expected,count=None):
+            if count is None:
+                count = context['pageSize']
+            require(any(lo <= address and address+count <= hi and mode == expected
                 for lo,hi,mode,_ in _phantom_runtime_helper_maps(context['pid'])), 'scratch permission mismatch')
 
         verify()
@@ -225,24 +241,36 @@ def _phantom_runtime_helper_execute():
             all(stop and printed and not passed for name,(stop,printed,passed) in guarded.items()
                 if name not in ['SIGKILL','SIGSTOP']), 'signal guard policy mismatch')
         require(syscall(39,[]) == context['pid'], 'getpid mismatch')
-        scratch = syscall(9,[0,context['pageSize'],3,0x22,_phantom_runtime_helper_mask,0])
-        require(0 < scratch < 1 << 63 and scratch % context['pageSize'] == 0, 'mmap failed')
-        permissions(scratch,'rw-p')
-        payload_value = 0x5048414e544f4d31
-        payload = b'\x48\xb8' + payload_value.to_bytes(8,'little') + b'\xcc'
-        inferior.write_memory(scratch,payload)
-        require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'scratch write mismatch')
-        verify()
-        require(syscall(10,[scratch,context['pageSize'],5]) == 0, 'mprotect RX failed')
-        permissions(scratch,'r-xp')
-        require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'RX payload changed')
-        _phantom_runtime_helper_set('rip',scratch)
-        step(scratch+10)
-        require(_phantom_runtime_helper_reg('rax') == payload_value, 'payload result mismatch')
-        restore()
-        require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'payload changed')
-        require(syscall(11,[scratch,context['pageSize']]) == 0, 'munmap failed')
-        require(_phantom_runtime_helper_proc(context['pid'],'maps') == context['maps'], 'mapping restoration mismatch')
+        action = context['action']
+        if action == 'scratch':
+            scratch = syscall(9,[0,context['pageSize'],3,0x22,_phantom_runtime_helper_mask,0])
+            require(0 < scratch < 1 << 63 and scratch % context['pageSize'] == 0, 'mmap failed')
+            permissions(scratch,'rw-p')
+            payload_value = 0x5048414e544f4d31
+            payload = b'\x48\xb8' + payload_value.to_bytes(8,'little') + b'\xcc'
+            inferior.write_memory(scratch,payload)
+            require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'scratch write mismatch')
+            verify()
+            require(syscall(10,[scratch,context['pageSize'],5]) == 0, 'mprotect RX failed')
+            permissions(scratch,'r-xp')
+            require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'RX payload changed')
+            _phantom_runtime_helper_set('rip',scratch)
+            step(scratch+10)
+            require(_phantom_runtime_helper_reg('rax') == payload_value, 'payload result mismatch')
+            restore()
+            require(bytes(inferior.read_memory(scratch,len(payload))) == payload, 'payload changed')
+            require(syscall(11,[scratch,context['pageSize']]) == 0, 'munmap failed')
+            require(_phantom_runtime_helper_proc(context['pid'],'maps') == context['maps'], 'mapping restoration mismatch')
+        elif action == 'allocate':
+            scratch = syscall(9,[0,context['byteCount'],3,0x22,_phantom_runtime_helper_mask,0])
+            require(0 < scratch < 1 << 63 and scratch % context['pageSize'] == 0 and
+                scratch+context['byteCount'] <= 1 << 63, 'mmap failed')
+            permissions(scratch,'rw-p',context['byteCount'])
+            require(bytes(inferior.read_memory(scratch,context['byteCount'])) == bytes(context['byteCount']),
+                    'anonymous allocation is not zero initialized')
+        else:
+            scratch = context['address']
+            require(syscall(11,[scratch,context['byteCount']]) == 0, 'munmap failed')
         for name,(stopped,printed,passed) in context['policies'].items():
             # Restore stop before print: noprint implies nostop in GDB. Valid
             # policy combinations are rechecked as a complete table below.
@@ -251,18 +279,31 @@ def _phantom_runtime_helper_execute():
             gdb.execute(command,to_string=True)
         require(_phantom_runtime_helper_policies() == context['policies'], 'signal policy restoration mismatch')
         verify()
-        print('PHANTOM_RUNTIME_HELPER_RESULT_V1:' + json.dumps({
-            'pid':context['pid'],'pageSize':context['pageSize'],'scratchAddressHex':hex(scratch),
+        evidence = {
+            'pid':context['pid'],'pageSize':context['pageSize'],
             'registerCount':len(context['registers']),'stackBytes':len(context['stack']),
-            'getpid':True,'allocated':True,'writable':True,'executable':True,'payloadExecuted':True,
-            'released':True,'registersRestored':True,'stackUnchanged':True,'errnoUnchanged':True,
-            'signalMaskUnchanged':True,'signalPolicyRestored':True,'codeUnchanged':True,'mapsRestored':True
-            },separators=(',',':')))
+            'getpid':True,'registersRestored':True,'stackUnchanged':True,'errnoUnchanged':True,
+            'signalMaskUnchanged':True,'signalPolicyRestored':True,'codeUnchanged':True}
+        if action == 'scratch':
+            prefix = 'PHANTOM_RUNTIME_HELPER_RESULT_V1:'
+            evidence.update({'scratchAddressHex':hex(scratch),'allocated':True,'writable':True,
+                'executable':True,'payloadExecuted':True,'released':True,'mapsRestored':True})
+        else:
+            prefix = 'PHANTOM_RUNTIME_ALLOCATION_RESULT_V1:'
+            evidence.update({'addressHex':hex(scratch),'byteCount':context['byteCount'],
+                'allocated':action == 'allocate','released':action == 'release','zeroInitialized':action == 'allocate'})
+        print(prefix + json.dumps(evidence,separators=(',',':')))
     finally:
         # Never execute cleanup instructions after an unexpected signal. C++
         # closes the debugger/inferior on failure, with the attempt in audit.
         gdb.events.stop.disconnect(on_stop)
         _phantom_runtime_helper_ctx = None
+
+def _phantom_runtime_helper_execute():
+    _phantom_runtime_helper_execute_operation(('scratch',))
+
+def _phantom_runtime_allocation_execute():
+    _phantom_runtime_helper_execute_operation(('allocate','release'))
 )PY";
 
 } // namespace phantom

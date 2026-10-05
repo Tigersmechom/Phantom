@@ -28,6 +28,7 @@ import recorder_probe_integration
 import runtime_probe_integration
 import runtime_helper_integration
 import process_profile_integration
+import runtime_allocation_integration
 import recording_integration
 import layout_integration
 import symbols_integration
@@ -160,6 +161,8 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         scenarios.append((runtime_helper_integration, []))
     if "single-process-v1" in capabilities.get("processProfiles", []):
         scenarios.append((process_profile_integration, []))
+    if capabilities.get("runtimeAllocations") == "linux-x86_64-retained-rw-v1":
+        scenarios.append((runtime_allocation_integration, []))
     if capabilities.get("recorderProbe", False):
         scenarios.append((recorder_probe_integration, []))
     for scenario, extra in scenarios:
