@@ -130,6 +130,7 @@ Json BackendService::capabilities() const {
       {"scalarStorageBatch", "native-dwarf-scalar-batch-v1"},
       {"registerWrite", "native-x86_64-gpr-v1"}, {"interventionLog", true},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
+      {"processProfiles", {"native", "single-process-v1"}},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},
                    {"maxResidentSnapshots", 4096},
@@ -478,6 +479,7 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
   GdbLaunchRequest launch;
   launch.disableRandomization = addressPolicy != "native";
   launch.recordingProfile = command.value("recordingProfile", "native");
+  launch.processProfile = command.value("processProfile", "native");
   launch.maxRecordedInstructions = command.value("maxRecordedInstructions", std::size_t{200000});
   launch.binaryPath = artifact_->binary; launch.stopAtEntry = command.value("stopAtEntry", true);
   launch.binarySha256 = artifact_->dto.at("binarySha256").get<std::string>();
@@ -521,7 +523,9 @@ std::vector<Json> BackendService::handleLaunch(const Json& request, const FrameS
               {"runFingerprint", sha256_hex(artifact_->dto.at("binarySha256").get<std::string>() +
                   json_text(command.at("argv")) + json_text(command.at("environment")) +
                   json_text(command.at("input")) + addressPolicy + launch.recordingProfile +
-                  std::to_string(launch.maxRecordedInstructions))},
+                  std::to_string(launch.maxRecordedInstructions) +
+                  (launch.processProfile == "native" ? "" : "process-profile:" + launch.processProfile))},
+              {"processIsolation", engine_->processIsolation()},
               {"allocatorDeterminism", "not-established"}, {"replayVerified", false}};
     if (addressPolicy == "require-fixed" && !disabled) {
       engine_->stop(); launched = false;

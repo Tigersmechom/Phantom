@@ -410,6 +410,12 @@ export type ProcessInspectionDTO = {
   }>;
 });
 
+export type ProcessProfileDTO = 'native' | 'single-process-v1';
+/** Trusted wrapper acknowledgement and kernel evidence captured at launch. */
+export type ProcessIsolationDTO =
+  | { requested: 'native'; verified: false; mechanism: 'none'; noNewPrivileges: null; seccompMode: null }
+  | { requested: 'single-process-v1'; verified: true; mechanism: 'linux-seccomp-bpf'; noNewPrivileges: true; seccompMode: 2 };
+
 /** Evidence captured at launch, not a guarantee of addresses after future execution. */
 export interface ExecutionLayoutDTO {
   addressPolicy: AddressPolicyDTO;
@@ -425,6 +431,8 @@ export interface ExecutionLayoutDTO {
   runFingerprint: string;
   allocatorDeterminism: 'not-established';
   replayVerified: false;
+  /** Opt-in restriction on process/thread creation, not a general sandbox. */
+  processIsolation?: ProcessIsolationDTO;
 }
 
 export interface InspectionContextDTO {
@@ -631,6 +639,7 @@ export interface BackendCapabilitiesDTO {
   runtimeProbe?: 'isolated-linux-x86_64-syscall-v1' | 'none';
   runtimeHelper?: 'linux-x86_64-scratch-v1' | 'none';
   recordingProfiles: RecordingProfileDTO[];
+  processProfiles?: ProcessProfileDTO[];
   recordingCursor: boolean;
   eventReplay: boolean;
   limits: ResourceLimitsDTO;
@@ -647,7 +656,7 @@ export interface BackendErrorDTO {
 export type BackendCommandDTO =
   | { kind: 'capabilities' }
   | { kind: 'build'; source: SourceBundleDTO; configuration: BuildConfigurationDTO; architecture: ArchitectureDTO }
-  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean; addressPolicy?: AddressPolicyDTO; recordingProfile?: RecordingProfileDTO; maxRecordedInstructions?: number }
+  | { kind: 'launch'; buildId: string; input: SubmittedInputDTO; argv: string[]; environment: Record<string, string>; stopAtEntry: boolean; addressPolicy?: AddressPolicyDTO; recordingProfile?: RecordingProfileDTO; maxRecordedInstructions?: number; processProfile?: ProcessProfileDTO }
   | { kind: 'appendInput'; id: string; text: string }
   | { kind: 'closeInput' }
   | { kind: 'step'; stepKind: 'over' | 'into' | 'out' | 'instruction' }

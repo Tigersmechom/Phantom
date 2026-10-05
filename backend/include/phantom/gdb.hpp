@@ -70,6 +70,9 @@ struct GdbLaunchRequest {
   // Immutable artifact identity supplied by the owning build service. Older
   // direct engine callers may omit it, but live runtime helpers then refuse.
   std::string binarySha256;
+  // Opt-in process-creation isolation, installed by the trusted wrapper
+  // before executing the target. Native preserves ordinary program behavior.
+  std::string processProfile = "native";
 };
 
 struct GdbError {
@@ -141,6 +144,10 @@ class GdbEngine {
   bool live() const noexcept;
   std::optional<int> gdbPid() const noexcept;
   std::optional<int> inferiorPid() const noexcept;
+  // Requested profile and actual wrapper/kernel confirmation for the live
+  // process. This is evidence of the fixed process-creation filter, not a
+  // general sandbox; termination clears verification but retains requested.
+  nlohmann::json processIsolation() const;
 
   bool setBreakpoints(const nlohmann::json& request, nlohmann::json& result,
                       GdbError& error);
@@ -189,7 +196,8 @@ class GdbEngine {
   bool writeRegisterValue(std::string_view name, std::string_view valueHex,
                           bool& attempted, GdbError& error);
   // Explicit bounded runtime transaction, only for the trusted opt-in helper
-  // manifest from the immutable build. No caller code or syscall arguments.
+  // manifest from the immutable build and verified single-process-v1 launch.
+  // No caller code or syscall arguments.
   // After a possible mutation, any unverified state/signal/cancellation closes
   // the debugger and inferior; report remains suitable for the service audit.
   bool executeRuntimeHelper(const nlohmann::json& manifest,

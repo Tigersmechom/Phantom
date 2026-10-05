@@ -968,7 +968,7 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**расширение live runtime interventions по 20.5 после scratch-профиля 20.17**, параллельно — углубление object/lifetime
+**сохраняемые runtime allocations по 20.5 после scratch-профиля 20.17 и изоляции запуска 20.18**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1487,3 +1487,53 @@ MI barrier покрывают аварийные пути. Подмена errno 
 отвергается до изменения процесса; после отказа программа продолжает работать.
 Unit-тесты проверяют права/границы ELF, неоднозначный или изменённый helper,
 коллизии исходников и сохранение helper при linker garbage collection.
+
+### 20.18. Проверяемый профиль одного процесса — 05.10.2026
+
+При подготовке сохраняемых runtime allocations проверен отдельный пограничный
+случай: `clone(CLONE_VM)` без `CLONE_THREAD` создаёт другой PID с общей памятью.
+Пока основной процесс остановлен и имеет один task, второй может выполнить
+munmap/MAP_FIXED и заменить область; итоговый `/proc/maps` останется прежним.
+Сравнение карты и количества GDB threads не доказывает владение отображением.
+Это подтверждено отдельным исполняемым экспериментом и соответствует
+[Linux clone](https://man7.org/linux/man-pages/man2/clone.2.html).
+
+Добавлен явный launch `processProfile:"single-process-v1"`; отсутствие поля
+сохраняет `native`. Доверенный I/O wrapper до exec пользовательского ELF
+устанавливает no_new_privs и seccomp BPF: fork/vfork/clone/clone3, x32 и другой
+syscall ABI получают EPERM. Ограничение действует уже в loader/LD_PRELOAD/
+constructors, наследуется при exec и не снимается внутри сессии. Обычные
+native syscalls остаются доступны. Это ограничение создания процессов и
+потоков, не общая песочница; pthread_create также получает отказ.
+
+Для успешного launch обязательны отдельное подтверждение wrapper после
+установки фильтра и kernel evidence остановленного процесса: owned pidfd,
+Pid/Tgid, ptrace tracer, Threads=1, NoNewPrivs=1, Seccomp=2. Потерянный либо
+неверный marker, отказ установки и недоступные данные завершают launch без
+перехода к native. Профиль требует stopAtEntry и native recording; неизвестная
+или несовместимая конфигурация отклоняется до замены текущей сессии.
+
+`executionLayout.processIsolation` хранит подтверждённый профиль запуска;
+он входит в run fingerprint. После relaunch native прежняя verified isolation
+не переносится в новую сессию. Старые observations сохраняют прежнее evidence.
+Live scratch helper теперь требует verified single-process-v1 и повторяет
+kernel guard перед мутацией. Это намеренное ужесточение admission из 20.17:
+native helper-запрос получает UNSUPPORTED без попытки исполнения и audit.
+
+Контракт и примеры: [process profile](INSPECTION_GATEWAYS.md#process-creation-profile).
+Далее — сохраняемые RW allocations с непрозрачным ID и ограниченным правом
+освобождения. Изоляция сама по себе не доказывает владение после обычного
+исполнения: программа может заменить собственный mapping. Будущий release
+обязан отзывать право при потенциальном user execution, не восстанавливать
+его по совпадению адреса/maps и учитывать VMA merge/split. Неизвестные
+allocations продолжают занимать квоту до доказанного release или конца процесса.
+
+Проверки 20.18: **60/60 Debug и 60/60 ASan/UBSan**, по 10654 реальных
+сообщения через TypeScript 5.9.3, все пять harness-проверок и четыре Node
+contract-теста. Новые unit/integration проверяют реальные fork/vfork/clone/
+CLONE_VM/clone3/pthread, int80/x32, ordinary I/O/mmap, наследование при exec,
+constructors/LD_PRELOAD, невозможность снять либо ослабить фильтр и ошибки
+обоих этапов установки. Отдельные GDB-proxy сценарии проверяют неверный или
+потерянный marker и неподтверждённые kernel properties без fallback и утечки
+inferior. Native relaunch, cin/getline/EOF/cout, errno, steps и прежний
+runtime-helper с новым явным профилем прошли регрессию.

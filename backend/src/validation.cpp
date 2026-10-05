@@ -342,10 +342,13 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "runRuntimeHelper") { only({"kind", "profile"}); enum_string(req(c,"profile","command"),"command.profile",{"linux-x86_64-scratch-v1"}); return; }
   if (kind == "build") { only({"kind","source","configuration","architecture"}); source_bundle(req(c,"source","command"),l); config(req(c,"configuration","command"),l); enum_string(req(c,"architecture","command"),"command.architecture",{"arm64","x86_64"}); return; }
   if (kind == "launch") {
-    only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy","recordingProfile","maxRecordedInstructions"});
+    only({"kind","buildId","input","argv","environment","stopAtEntry","addressPolicy","recordingProfile","maxRecordedInstructions","processProfile"});
     if(has(c,"addressPolicy")) enum_string(c["addressPolicy"],"command.addressPolicy",{"native","disable-aslr","require-fixed"}); id(req(c,"buildId","command"),"command.buildId",l); submitted(req(c,"input","command"),l);
     if(has(c,"recordingProfile")) enum_string(c["recordingProfile"],"command.recordingProfile",{"native","gdb-record-full"});
+    if(has(c,"processProfile")) enum_string(c["processProfile"],"command.processProfile",{"native","single-process-v1"});
     const bool recorded = c.value("recordingProfile","native") == "gdb-record-full";
+    const bool isolated = c.value("processProfile","native") == "single-process-v1";
+    if(isolated && recorded) invalid("command.processProfile","single-process-v1 currently requires native recording");
     if(has(c,"maxRecordedInstructions")) {
       if(!recorded) invalid("command.maxRecordedInstructions","requires gdb-record-full profile");
       positive_uint(c["maxRecordedInstructions"],"command.maxRecordedInstructions",1000000);
@@ -357,6 +360,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
     for(auto it=env.begin();it!=env.end();++it){ string_value(Json(it.key()),"command.environment.key",l.maxArgumentBytes); if(!environment_name(it.key())) invalid("command.environment.key","must be a POSIX environment name"); string_value(it.value(),"command.environment",l.maxArgumentBytes,false); if(it.key().find('\0') != std::string::npos || it.value().get<std::string>().find('\0') != std::string::npos) invalid("command.environment","must not contain NUL"); total += it.key().size()+it.value().get<std::string>().size(); }
     if(total>l.maxEnvironmentBytes) limit("command.environment","environment exceeds limit"); boolean(req(c,"stopAtEntry","command"),"command.stopAtEntry");
     if(recorded && !c.at("stopAtEntry").get<bool>()) invalid("command.stopAtEntry","record-full requires an entry stop");
+    if(isolated && !c.at("stopAtEntry").get<bool>()) invalid("command.stopAtEntry","single-process-v1 requires an entry stop for kernel verification");
     return;
   }
   if (kind == "seekRecording") {

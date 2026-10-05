@@ -243,6 +243,7 @@ def launch(client, artifact, *, mode='n', recording=False):
     client.execute({'kind': 'launch', 'buildId': artifact['id'],
         'input': {'id': 'runtime-input', 'text': '', 'encoding': 'utf-8', 'closeAfterWrite': recording},
         'argv': [mode], 'environment': {}, 'stopAtEntry': True,
+        'processProfile': 'native' if recording or mode == 't' else 'single-process-v1',
         'recordingProfile': 'gdb-record-full' if recording else 'native'})
     result = client.good({'kind': 'setBreakpoints', 'documentId': 'runtime-helper', 'revisionId': 'runtime-helper-1',
         'breakpoints': [{'id': name, 'range': location(name), 'enabled': True} for name in ('HOLD', 'AFTER')]})
@@ -526,7 +527,8 @@ def shadowed_errno(client):
         'int main() { volatile int guard = 7; return guard - 7; }\n')
     client.execute({'kind': 'launch', 'buildId': artifact['id'],
         'input': {'id': 'shadow-input', 'text': '', 'encoding': 'utf-8', 'closeAfterWrite': False},
-        'argv': [], 'environment': {}, 'stopAtEntry': True, 'recordingProfile': 'native'})
+        'argv': [], 'environment': {}, 'stopAtEntry': True, 'recordingProfile': 'native',
+        'processProfile': 'single-process-v1'})
     before = client.checkpoint()
     baseline = registers(client)
     client.reject(client.frame(COMMAND), ('UNSUPPORTED',))

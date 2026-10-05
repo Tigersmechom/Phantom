@@ -288,6 +288,10 @@ struct GdbEngine::Impl {
   bool submittedInputClosed = true;
   bool closeInputAfterWrite = true;
   bool wrapperReady = false;
+  unsigned char wrapperReadyMarker = 0;
+  bool wrapperHandshakeInvalid = false;
+  std::string processProfile = "native";
+  bool processIsolationVerified = false;
   GdbSourceBundle sourceBundle;
   std::string inferiorPid;
   struct BreakpointEntry { std::string documentId; std::string number; };
@@ -385,6 +389,7 @@ struct GdbEngine::Impl {
     process.reset();
     killInferior();
     live = false;
+    processIsolationVerified = false;
     breakpoints.clear();
     issuedLayoutLocators.clear();
     layoutLocatorLimitReached = false;
@@ -398,6 +403,80 @@ struct GdbEngine::Impl {
       (void)::syscall(SYS_pidfd_send_signal, inferiorPidFd, SIGKILL, nullptr, 0);
       (void)::close(inferiorPidFd); inferiorPidFd = -1;
     }
+  }
+  bool verifyProcessIsolation(GdbError& error) {
+    processIsolationVerified = false;
+    if (processProfile != "single-process-v1") {
+      setError(error, "UNSUPPORTED", "verified single-process-v1 isolation is required");
+      return false;
+    }
+    {
+      std::lock_guard inputLock(inputMutex);
+      readWrapperReadyLocked();
+      if (!wrapperReady || wrapperReadyMarker != 2 || wrapperHandshakeInvalid) {
+        setError(error, "LAUNCH_FAILED", "single-process wrapper confirmation is missing or invalid");
+        return false;
+      }
+    }
+    if (!live.load() || inferiorPidFd < 0 || !process ||
+        ::syscall(SYS_pidfd_send_signal, inferiorPidFd, 0, nullptr, 0) != 0) {
+      setError(error, "READ_FAILED", "single-process isolation requires the owned live inferior");
+      return false;
+    }
+    const int descriptor = ::open(("/proc/" + inferiorPid + "/status").c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+      setError(error, "READ_FAILED", "single-process kernel status is unavailable");
+      return false;
+    }
+    struct CloseStatus { int descriptor; ~CloseStatus() { (void)::close(descriptor); } } close{descriptor};
+    std::array<char, 65537> data{};
+    std::size_t size = 0;
+    while (size < data.size()) {
+      const auto count = ::read(descriptor, data.data() + size, data.size() - size);
+      if (count < 0 && errno == EINTR) continue;
+      if (count < 0) {
+        setError(error, "READ_FAILED", "single-process kernel status could not be read");
+        return false;
+      }
+      if (count == 0) break;
+      size += static_cast<std::size_t>(count);
+    }
+    if (size == data.size()) {
+      setError(error, "LIMIT_EXCEEDED", "single-process kernel status exceeds limit");
+      return false;
+    }
+    std::map<std::string, std::uint64_t> observed;
+    std::istringstream statusLines(std::string(data.data(), size));
+    std::string line;
+    while (std::getline(statusLines, line)) {
+      const auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      const auto key = line.substr(0, colon);
+      if (key != "Pid" && key != "Tgid" && key != "TracerPid" && key != "Threads" &&
+          key != "NoNewPrivs" && key != "Seccomp") continue;
+      std::string_view value(line.data() + colon + 1, line.size() - colon - 1);
+      while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+      while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+      std::uint64_t number = 0;
+      const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+      if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+          !observed.emplace(key, number).second) {
+        setError(error, "READ_FAILED", "single-process kernel status is malformed");
+        return false;
+      }
+    }
+    const auto expectedPid = parseUnsigned(inferiorPid);
+    // The configured trusted GDB executable may itself be a transport proxy.
+    // Its child GDB then owns ptrace, so TracerPid need not equal Process::pid.
+    // The target identity is already bound by its retained pidfd and MI group.
+    if (!expectedPid || observed.size() != 6 || observed.at("Pid") != *expectedPid ||
+        observed.at("Tgid") != *expectedPid || observed.at("TracerPid") == 0 ||
+        observed.at("Threads") != 1 || observed.at("NoNewPrivs") != 1 || observed.at("Seccomp") != 2) {
+      setError(error, "READ_FAILED", "single-process kernel isolation could not be confirmed");
+      return false;
+    }
+    processIsolationVerified = true;
+    return true;
   }
   void interruptExecution() noexcept {
     // In synchronous record-full source stepping GDB can defer its own
@@ -485,6 +564,8 @@ struct GdbEngine::Impl {
     submittedInputClosed = request.closeInputAfterWrite;
     closeInputAfterWrite = request.closeInputAfterWrite;
     wrapperReady = false;
+    wrapperReadyMarker = 0;
+    wrapperHandshakeInvalid = false;
     return true;
   }
   void cleanupTemp() noexcept {
@@ -504,6 +585,7 @@ struct GdbEngine::Impl {
     pendingInput.clear(); inputId.clear(); inputChunks.clear();
     inputRevisionId.clear(); inputParentRevisionId.clear();
     submittedInputClosed = true; closeInputAfterWrite = true; wrapperReady = false;
+    wrapperReadyMarker = 0; wrapperHandshakeInvalid = false;
     if (!tempDir.empty()) { std::error_code ec; std::filesystem::remove_all(tempDir, ec); }
     tempDir.clear();
   }
@@ -527,18 +609,29 @@ struct GdbEngine::Impl {
     }
   }
 
-  void feedInputLocked() {
-    if (inputDeliverySuspensions != 0) return;
+  void readWrapperReadyLocked() {
     if (!wrapperReady && readyFd >= 0) {
-      char marker = 0;
-      if (::read(readyFd, &marker, 1) == 1 && marker == 1) {
-        wrapperReady = true;
+      unsigned char marker = 0;
+      ssize_t count;
+      do { count = ::read(readyFd, &marker, 1); } while (count < 0 && errno == EINTR);
+      if (count == 1) {
+        wrapperReadyMarker = marker;
+        wrapperHandshakeInvalid = marker != (processProfile == "single-process-v1" ? 2 : 1);
+        wrapperReady = !wrapperHandshakeInvalid;
         (void)::close(readyFd); readyFd = -1;
+        if (!wrapperReady) return;
         // Remove our bootstrap reader now: early close(0) in the target must
         // produce EPIPE rather than leave a writer waiting on its own reader.
         (void)::close(stdinKeepFd); stdinKeepFd = -1;
       }
     }
+  }
+
+  void feedInputLocked() {
+    // Receiving the trusted wrapper handshake is separate from exposing
+    // queued bytes/EOF; capture-only probes may verify readiness safely.
+    readWrapperReadyLocked();
+    if (inputDeliverySuspensions != 0) return;
     if (!wrapperReady || stdinFd < 0) return;
     // Once the wrapper's bootstrap reader is gone, HUP/ERR means the
     // inferior closed fd 0. Mark the transport closed even when there are no
@@ -1166,6 +1259,15 @@ struct GdbEngine::Impl {
       ProcessOutput output;
       try { drainIo(); output = process->poll(std::chrono::milliseconds(5)); drainIo(); }
       catch (const std::exception& ex) { failClosed(e, "INTERNAL", ex.what()); return false; }
+      bool invalidHandshake = false;
+      {
+        std::lock_guard inputLock(inputMutex);
+        invalidHandshake = wrapperHandshakeInvalid;
+      }
+      if (invalidHandshake) {
+        failClosed(e, "LAUNCH_FAILED", "inferior wrapper returned an unexpected process-profile confirmation", false);
+        return false;
+      }
       lines += output.out;
       std::size_t p = 0;
       while ((p = lines.find('\n')) != std::string::npos) {
@@ -2161,7 +2263,8 @@ struct GdbEngine::Impl {
     // the helper immediately before exec, so LD_*/BASH_ENV never affect GDB,
     // the shell or the helper itself.
     if (!setup("-interpreter-exec console " + miQuote("set exec-wrapper " +
-        shellQuote(options.execWrapper.string()) + " " + shellQuote(tempDir.string())))) return false;
+        shellQuote(options.execWrapper.string()) + " " + shellQuote(tempDir.string()) +
+        (request.processProfile == "single-process-v1" ? " --single-process-v1" : "")))) return false;
     std::string file = "-file-exec-and-symbols " + miQuote(request.binaryPath.string());
     if (!setup(file)) return false;
     std::string args = "-exec-arguments";
@@ -2176,9 +2279,16 @@ GdbEngine::~GdbEngine() { stop(); }
 
 bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbError& error,
                        std::stop_token cancellation) {
-  stop();
   result = {};
   error = {};
+  if (request.processProfile != "native" && request.processProfile != "single-process-v1") {
+    error = {"UNSUPPORTED", "unknown process profile", false}; return false;
+  }
+  if (request.processProfile == "single-process-v1" &&
+      (request.recordingProfile != "native" || !request.stopAtEntry)) {
+    error = {"INVALID_REQUEST", "single-process-v1 requires native recording and an entry stop", false};
+    return false;
+  }
   if (request.recordingProfile != "native" && request.recordingProfile != "gdb-record-full") {
     error = {"UNSUPPORTED", "unknown recording profile", false}; return false;
   }
@@ -2205,6 +2315,7 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
       return false;
     }
   }
+  stop();
   impl_->control.store(0);
   impl_->inferiorPid.clear();
   impl_->lines.clear(); impl_->nextToken = 1; impl_->selectedFrame = 0;
@@ -2215,6 +2326,8 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   impl_->registerNames.clear();
   impl_->traceActive = false;
   impl_->recordingProfile = request.recordingProfile;
+  impl_->processProfile = request.processProfile;
+  impl_->processIsolationVerified = false;
   impl_->maxRecordedInstructions = request.maxRecordedInstructions;
   impl_->recordingActive = false;
   impl_->sourceBundle = request.sourceBundle;
@@ -2227,6 +2340,10 @@ bool GdbEngine::launch(const GdbLaunchRequest& request, GdbStop& result, GdbErro
   }
   MiRecord stopped;
   if (!impl_->command("-exec-run", true, stopped, error)) { stop(); return false; }
+  if (request.processProfile == "single-process-v1" && !impl_->verifyProcessIsolation(error)) {
+    error.code = "LAUNCH_FAILED";
+    stop(); return false;
+  }
   if (request.recordingProfile == "gdb-record-full") {
     if (impl_->inferiorPidFd < 0) {
       error = {"LAUNCH_FAILED", "record-full requires pidfd support for reliable inferior interruption", false};
@@ -2500,6 +2617,7 @@ void GdbEngine::stop() noexcept {
   impl_->process.reset();
   impl_->killInferior();
   impl_->live = false;
+  impl_->processIsolationVerified = false;
   impl_->breakpoints.clear();
   impl_->issuedLayoutLocators.clear();
   impl_->layoutLocatorLimitReached = false;
@@ -2520,6 +2638,15 @@ std::optional<int> GdbEngine::inferiorPid() const noexcept {
   const auto parsed = std::from_chars(text.data(), text.data() + text.size(), pid);
   return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && pid > 0 ?
       std::optional<int>(pid) : std::nullopt;
+}
+
+nlohmann::json GdbEngine::processIsolation() const {
+  const bool verified = impl_->processProfile == "single-process-v1" &&
+      impl_->processIsolationVerified && inferiorPid().has_value();
+  return {{"requested", impl_->processProfile}, {"verified", verified},
+    {"mechanism", verified ? "linux-seccomp-bpf" : "none"},
+    {"noNewPrivileges", verified ? nlohmann::json(true) : nlohmann::json(nullptr)},
+    {"seccompMode", verified ? nlohmann::json(2) : nlohmann::json(nullptr)}};
 }
 
 bool GdbEngine::setBreakpoints(const nlohmann::json& request, nlohmann::json& result,
@@ -2891,6 +3018,8 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
   try {
     if (cancellation.stop_requested()) return failed("CANCELLED", "runtime helper cancelled before preparation");
     if (!live()) return failed("STALE_CONTEXT", "runtime helper requires a live stopped process");
+    if (impl_->processProfile != "single-process-v1" || !impl_->processIsolationVerified)
+      return failed("UNSUPPORTED", "runtime helper requires verified single-process-v1 isolation");
     if (impl_->inputWaitActive || impl_->recordingProfile != "native")
       return failed("UNSUPPORTED", "runtime helper requires a native stop outside input wait");
     if (valText(field(impl_->latestStop.fields, "reason")) == "signal-received" ||
@@ -2962,6 +3091,12 @@ bool GdbEngine::executeRuntimeHelper(const nlohmann::json& manifest,
         !prepared.contains("stackBytes") || !prepared["stackBytes"].is_number_unsigned() ||
         prepared["stackBytes"].get<std::uint64_t>() < 4096 || prepared["stackBytes"].get<std::uint64_t>() > 1048576)
       return failed("READ_FAILED", "runtime helper preparation proof is invalid");
+    if (cancellation.stop_requested() || impl_->runtimeHelperCancelled)
+      return failed("CANCELLED", "runtime helper cancelled before mutation");
+    if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)
+      return failed("TIMEOUT", "runtime helper deadline exhausted before mutation");
+    if (!impl_->verifyProcessIsolation(error))
+      return failed("UNSUPPORTED", error.message);
     if (cancellation.stop_requested() || impl_->runtimeHelperCancelled)
       return failed("CANCELLED", "runtime helper cancelled before mutation");
     if (std::chrono::steady_clock::now() >= impl_->runtimeHelperDeadline)

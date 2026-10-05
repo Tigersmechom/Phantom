@@ -160,6 +160,9 @@ At a current native stop, send:
 ```
 
 The normal envelope must include the current session and exact `expectedStop`.
+Launch must explicitly select `processProfile:"single-process-v1"`; see
+[process creation profile](#process-creation-profile). A successful build alone
+does not establish that another process cannot share its address space.
 The command accepts no executable path, syscall number, payload, address or
 timeout. It executes `getpid`, allocates one private RW page, writes a fixed
 `movabs` instruction, changes the page to RX, single-steps that instruction,
@@ -220,6 +223,57 @@ is sealed separately as `cancelled:true`; the completed operation's evidence is
 retained. Restoring RIP to an enabled source breakpoint can make the next
 Continue stop at that same breakpoint once more. This is exposed as a real stop;
 the backend does not silently advance additional user instructions.
+
+## Process creation profile
+
+`capabilities.processProfiles` advertises `native` and `single-process-v1`.
+The optional launch field `processProfile` defaults to `native`. To request
+the restricted profile, add this to a normal launch command:
+
+```json
+{"processProfile":"single-process-v1","recordingProfile":"native","stopAtEntry":true}
+```
+
+The trusted I/O wrapper installs `no_new_privs` and a Linux x86-64 seccomp BPF
+filter before executing the target, including its loader, preload libraries
+and constructors. `fork`, `vfork`, `clone` and `clone3` return `EPERM`; this also
+prevents `pthread_create`. Non-x86-64 syscall ABIs and x32 syscall numbers are
+rejected, including attempts through `int 0x80`. Other native syscalls retain
+their ordinary behavior. This is a process-creation restriction, not an I/O or
+general security sandbox. Filter inheritance and architecture checks follow
+the [kernel seccomp documentation](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html).
+
+The profile closes a specific runtime-helper gap: `clone(CLONE_VM)` without
+`CLONE_THREAD` can create a separate process which changes the same address
+space while GDB sees one stopped thread. It can replace a mapping without
+changing the final `/proc/maps` text. Counting threads or comparing map rows
+does not prove ownership. [Linux clone](https://man7.org/linux/man-pages/man2/clone.2.html).
+
+Launch succeeds only after the wrapper acknowledges successful installation
+and the stopped owned process confirms `NoNewPrivs:1`, `Seccomp:2`, one thread
+and an active ptrace tracer. A missing/wrong acknowledgement or unavailable
+kernel evidence fails launch; there is no fallback to `native`. The live
+scratch helper requires this verified profile and rechecks kernel evidence
+before execution. A `native` launch remains usable for ordinary debugging,
+but `runRuntimeHelper` rejects it before creating an intervention.
+
+`observation.executionLayout.processIsolation` records launch evidence:
+
+```json
+{"requested":"single-process-v1","verified":true,"mechanism":"linux-seccomp-bpf","noNewPrivileges":true,"seccompMode":2}
+```
+
+For a native launch it contains `requested:"native"`, `verified:false`,
+`mechanism:"none"` and null kernel fields; this does not claim the environment
+has no other seccomp policy. The selected profile participates in the run
+fingerprint. Old observations retain their original launch evidence.
+
+This version requires an entry stop and native recording; record-full is
+rejected before launch. The restriction is inherited across target exec and
+cannot be disabled during the session. Relaunch with `native` to run a program
+which needs threads or child processes. Memory allocation ownership across
+user execution remains a separate problem: this profile does not implement
+retained allocations, release authority or C++ object lifetime.
 
 ## Build and launch address profiles
 

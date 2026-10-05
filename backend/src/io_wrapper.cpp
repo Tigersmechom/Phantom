@@ -1,4 +1,7 @@
+#include "phantom/process_isolation.hpp"
+
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
@@ -17,10 +20,9 @@ bool redirect(const std::string& path, int target, int flags) {
   return ok;
 }
 
-bool signal_ready(const std::string& path) {
+bool signal_ready(const std::string& path, unsigned char marker) {
   const int descriptor = ::open(path.c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
   if (descriptor < 0) return false;
-  const char marker = 1;
   ssize_t count;
   do { count = ::write(descriptor, &marker, 1); } while (count < 0 && errno == EINTR);
   (void)::close(descriptor);
@@ -50,6 +52,9 @@ bool apply_environment(const std::string& path) {
 
 int main(int argc, char** argv) {
   if (argc < 3) return 127;
+  const bool isolated = std::string_view(argv[2]) == "--single-process-v1";
+  const int target = isolated ? 3 : 2;
+  if (argc <= target) return 127;
   const pid_t debugger = ::getppid();
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != debugger || debugger == 1)
     return 126;
@@ -58,11 +63,21 @@ int main(int argc, char** argv) {
   // Even empty input therefore connects before the backend closes for EOF.
   if (!redirect(directory + "/stdin", STDIN_FILENO, O_RDONLY) ||
       !redirect(directory + "/stdout", STDOUT_FILENO, O_WRONLY) ||
-      !redirect(directory + "/stderr", STDERR_FILENO, O_WRONLY) ||
-      !signal_ready(directory + "/ready")) return 126;
+      !redirect(directory + "/stderr", STDERR_FILENO, O_WRONLY)) return 126;
+  // Preserve the native handshake and environment order. The explicit profile
+  // only acknowledges readiness after its inherited kernel filter is active.
+  if (!isolated && !signal_ready(directory + "/ready", phantom::nativeWrapperReady)) return 126;
   // Preserve the submitted environment exactly, including whitespace and
   // newlines; apply it only after this helper and GDB's shell are loaded.
   if (!apply_environment(directory + "/environment")) return 126;
-  ::execv(argv[2], argv + 2);
+  if (isolated) {
+    const auto error = phantom::installSingleProcessIsolation();
+    if (error) {
+      std::fprintf(stderr, "phantom: cannot install single-process-v1: %s\n", error.message().c_str());
+      return 126;
+    }
+    if (!signal_ready(directory + "/ready", phantom::singleProcessWrapperReady)) return 126;
+  }
+  ::execv(argv[target], argv + target);
   return errno == ENOENT ? 127 : 126;
 }

@@ -62,7 +62,15 @@ protocol capabilities.
 
 ## Честные границы текущего среза
 
+- Launch `processProfile:"single-process-v1"` устанавливает до исполнения
+  пользовательского кода ограничение на создание процессов/потоков. `fork`,
+  `vfork`, `clone`, `clone3` и альтернативные syscall ABI возвращают `EPERM`.
+  Подтверждение wrapper и kernel evidence сохраняются в executionLayout;
+  обычный launch по умолчанию использует `native`. Это отдельный профиль,
+  требующий entry stop и native recording, без обещания общей песочницы.
+  [Контракт](../docs/INSPECTION_GATEWAYS.md#process-creation-profile).
 - `runRuntimeHelper` с opt-in сборкой `runtimeProfile:"linux-x86_64-scratch-v1"`
+  и launch `processProfile:"single-process-v1"`
   выполняет фиксированный цикл выделения RW-памяти, исполнения инструкции после
   перехода в RX и освобождения памяти в остановленной пользовательской программе.
   Восстановление проверяется; попытка попадает в общий audit/branch. Неожиданный

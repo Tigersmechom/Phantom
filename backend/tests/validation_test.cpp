@@ -123,6 +123,24 @@ int main() {
   assert(!validation_fails(recorded));
   recorded["command"]["recordingProfile"] = "rr";
   assert(validation_fails(recorded, "INVALID_REQUEST"));
+  Json isolated = launch;
+  for (const auto* profile : {"native", "single-process-v1"}) {
+    isolated["command"]["processProfile"] = profile;
+    assert(!validation_fails(isolated));
+  }
+  for (const auto& profile : Json::array({nullptr, false, 1, "", "single-process", Json::object(), Json::array()})) {
+    isolated["command"]["processProfile"] = profile;
+    assert(validation_fails(isolated, "INVALID_REQUEST"));
+  }
+  isolated["command"]["processProfile"] = "single-process-v1";
+  isolated["command"]["stopAtEntry"] = false;
+  assert(validation_fails(isolated, "INVALID_REQUEST"));
+  isolated["command"]["stopAtEntry"] = true;
+  isolated["command"]["input"]["closeAfterWrite"] = true;
+  isolated["command"]["recordingProfile"] = "gdb-record-full";
+  assert(validation_fails(isolated, "INVALID_REQUEST"));
+  isolated["command"]["processProfile"] = "native";
+  assert(!validation_fails(isolated));
   Json gateway = append;
   for (const auto* kind : {"readRecording", "reverseInstruction", "inspectModules"}) {
     gateway["command"] = {{"kind", kind}};

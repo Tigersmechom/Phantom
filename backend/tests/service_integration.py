@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "runtimeProbe", "runtimeHelper", "recordingProfiles", "recordingCursor",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "runtimeProbe", "runtimeHelper", "recordingProfiles", "recordingCursor", "processProfiles",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -228,7 +228,7 @@ def main() -> int:
             require_keys(
                 layout,
                 {"addressPolicy", "elfType", "aslr", "addresses", "processStartTimeTicks", "runFingerprint",
-                 "allocatorDeterminism", "replayVerified"},
+                 "allocatorDeterminism", "replayVerified", "processIsolation"},
                 "ExecutionLayoutDTO",
             )
             require_keys(layout["aslr"],

@@ -603,3 +603,24 @@ policies. A source breakpoint at restored RIP may produce an extra real stop on
 next Continue. This profile provides no persistent allocation, arbitrary syscall
 or code request, recorder branch, semantic assignment or external-effect rollback.
 See the complete [live contract](../../docs/INSPECTION_GATEWAYS.md#live-runtime-scratch-helper).
+
+## 2026-10-05: verified single-process launch profile
+
+Optional `launch.processProfile` and `capabilities.processProfiles` add
+`single-process-v1`; omission preserves native process/thread creation.
+The opt-in requires native recording and an entry stop. The trusted wrapper
+installs no_new_privs and an inherited Linux x86-64 seccomp filter before target
+exec; native fork/vfork/clone/clone3 and foreign/x32 syscall ABIs return EPERM.
+
+`executionLayout.processIsolation` retains launch-time requested profile,
+verification, mechanism and kernel mode/no_new_privs evidence. A dedicated
+wrapper acknowledgement and owned stopped process inspection are both required;
+missing evidence fails launch. Selected isolation participates in run identity.
+
+The live scratch helper now requires verified single-process isolation and
+rechecks it before mutation. This intentionally tightens its earlier admission:
+one stopped GDB thread does not exclude a separate CLONE_VM process replacing
+its mappings. Rejected native helper requests leave state/audit untouched;
+ordinary native debugging and record-full keep their existing behavior.
+The restriction is not a general sandbox or proof of allocation lifetime.
+See [process profile](../../docs/INSPECTION_GATEWAYS.md#process-creation-profile).
