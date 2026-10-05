@@ -142,6 +142,38 @@ int main() {
   isolated["command"]["processProfile"] = "native";
   assert(!validation_fails(isolated));
   Json gateway = append;
+  const Json protectionCommand = {{"kind", "protectRuntimeMemory"},
+      {"profile", "linux-x86_64-owned-protection-v1"}, {"allocationId", "allocation-1"},
+      {"expectedPermissions", "rw-"}, {"replacementPermissions", "r-x"}};
+  for (const auto* before : {"r--", "rw-", "r-x"})
+    for (const auto* after : {"r--", "rw-", "r-x"}) {
+      gateway["command"] = protectionCommand;
+      gateway["command"]["expectedPermissions"] = before;
+      gateway["command"]["replacementPermissions"] = after;
+      assert(!validation_fails(gateway));
+    }
+  gateway["command"] = protectionCommand;
+  auto missingProtectionStop = gateway; missingProtectionStop.erase("expectedStop");
+  assert(validation_fails(missingProtectionStop, "INVALID_REQUEST"));
+  for (const auto* key : {"expectedPermissions", "replacementPermissions"})
+    for (const auto& permissions : Json::array({"rwx", "---", "rw-p", "R-X", "r-x\n", "-wx", "", 5, nullptr, false})) {
+      gateway["command"] = protectionCommand; gateway["command"][key] = permissions;
+      assert(validation_fails(gateway, "INVALID_REQUEST"));
+    }
+  for (const auto* key : {"profile", "allocationId", "expectedPermissions", "replacementPermissions"}) {
+    gateway["command"] = protectionCommand; gateway["command"].erase(key);
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  for (const auto* key : {"addressHex", "byteCount", "offset", "flags", "payload", "pid"}) {
+    gateway["command"] = protectionCommand; gateway["command"][key] = "unexpected";
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
+  gateway["command"] = protectionCommand; gateway["command"]["profile"] = "linux-x86_64-retained-rw-v1";
+  assert(validation_fails(gateway, "INVALID_REQUEST"));
+  for (const auto& identifier : Json::array({"", 1, false, nullptr})) {
+    gateway["command"] = protectionCommand; gateway["command"]["allocationId"] = identifier;
+    assert(validation_fails(gateway, "INVALID_REQUEST"));
+  }
   const Json allocationCommand = {{"kind", "allocateRuntimeMemory"},
       {"profile", "linux-x86_64-retained-rw-v1"}, {"byteCount", 1}};
   gateway["command"] = allocationCommand;

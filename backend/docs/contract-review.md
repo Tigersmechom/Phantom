@@ -657,3 +657,28 @@ budget until process termination is observed. Release frees bytes, not a record
 slot. A new session clears the registry. Existing generic intervention limits
 also apply. No C++ lifetime, arbitrary syscall/code execution, or record-full
 support is implied. See [wire schemas and examples](../../docs/INSPECTION_GATEWAYS.md#retained-runtime-allocations).
+
+## 2026-10-05: owned allocation page permissions
+
+`protectRuntimeMemory{profile,allocationId,expectedPermissions,replacementPermissions}`
+uses `linux-x86_64-owned-protection-v1`, session/current expectedStop, and the
+same opted-in build/single-process launch as retained allocations. Both permission
+fields accept exactly `r--`, `rw-`, `r-x`. The server resolves the complete owned
+extent; no arbitrary address, subrange, flags, payload or RWX request is accepted.
+Same-to-same is a real audited mprotect; expected mismatch rejects before execution.
+
+The result is `runtimeProtectionIntervention`, also in the generic intervention
+union. Proof covers unchanged full extent bytes, exact map delta and the existing
+context restoration checks. Personality is preserved; READ_IMPLIES_EXEC rejects
+protection/scratch/allocation before mutation. An unverified attempt is fail-closed
+because even a failing mprotect can have partial effects.
+
+Registry DTO adds last verified `permissions`, nullable
+`lastProtectionInterventionId`, and `protectionAllowed` sharing release authority.
+Verified protect preserves all owned IDs and updates last proof before refresh;
+failed refresh ends the process without erasing that evidence. Normal execution
+irrevocably revokes both authorities. Release verifies the stored permissions and
+works from RO/RW/RX. Direct memory/scalar writes still require private RW storage.
+Retries remain once-only and cannot reinstate old permissions. Shared operation
+deadlines/audit quotas apply; allocation counts/bytes do not change. See the
+[complete contract](../../docs/INSPECTION_GATEWAYS.md#owned-allocation-permissions).

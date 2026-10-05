@@ -1,4 +1,4 @@
-import type { RuntimeAllocationDTO, RuntimeAllocationInterventionDTO, RuntimeHelperManifestDTO, RuntimeInterventionDTO, RuntimeProbeDTO, NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { RuntimeMemoryPermissionsDTO, RuntimeProtectionInterventionDTO, RuntimeAllocationDTO, RuntimeAllocationInterventionDTO, RuntimeHelperManifestDTO, RuntimeInterventionDTO, RuntimeProbeDTO, NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -642,6 +642,7 @@ export interface BackendCapabilitiesDTO {
   runtimeProbe?: 'isolated-linux-x86_64-syscall-v1' | 'none';
   runtimeHelper?: 'linux-x86_64-scratch-v1' | 'none';
   runtimeAllocations?: 'linux-x86_64-retained-rw-v1' | 'none';
+  runtimeProtection?: 'linux-x86_64-owned-protection-v1' | 'none';
   recordingProfiles: RecordingProfileDTO[];
   processProfiles?: ProcessProfileDTO[];
   recordingCursor: boolean;
@@ -707,6 +708,7 @@ export type BackendCommandDTO =
   | { kind: 'runRuntimeHelper'; profile: 'linux-x86_64-scratch-v1' }
   | { kind: 'allocateRuntimeMemory'; profile: 'linux-x86_64-retained-rw-v1'; byteCount: number }
   | { kind: 'releaseRuntimeMemory'; profile: 'linux-x86_64-retained-rw-v1'; allocationId: string }
+  | { kind: 'protectRuntimeMemory'; profile: 'linux-x86_64-owned-protection-v1'; allocationId: string; expectedPermissions: RuntimeMemoryPermissionsDTO; replacementPermissions: RuntimeMemoryPermissionsDTO }
   | { kind: 'readRuntimeAllocation'; allocationId: string }
   | { kind: 'listRuntimeAllocations'; start: number; count: number }
   | { kind: 'readRecording' }
@@ -751,6 +753,7 @@ export type BackendResultDTO =
   | { kind: 'runtimeProbe'; probe: RuntimeProbeDTO }
   | { kind: 'runtimeIntervention'; intervention: RuntimeInterventionDTO; throughSequence?: number }
   | { kind: 'runtimeAllocationIntervention'; intervention: RuntimeAllocationInterventionDTO; throughSequence?: number }
+  | { kind: 'runtimeProtectionIntervention'; intervention: RuntimeProtectionInterventionDTO; throughSequence?: number }
   | { kind: 'runtimeAllocation'; allocation: RuntimeAllocationDTO }
   | { kind: 'runtimeAllocations'; items: RuntimeAllocationDTO[]; start: number; total: number; hasMore: boolean; totalBytes: number }
   | (InspectionContextDTO & { kind: 'recording'; recording: RecordingStatusDTO })

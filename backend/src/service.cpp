@@ -123,6 +123,7 @@ Json BackendService::capabilities() const {
       {"runtimeProbe", "isolated-linux-x86_64-syscall-v1"},
       {"runtimeHelper", "linux-x86_64-scratch-v1"},
       {"runtimeAllocations", "linux-x86_64-retained-rw-v1"},
+      {"runtimeProtection", "linux-x86_64-owned-protection-v1"},
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
       {"memoryWriteBatch", "native-private-memory-batch-v1"},
@@ -782,7 +783,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         return frames;
       }
     }
-    if (shuttingDown_.load() && (kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "runRuntimeHelper" || kind == "build" || kind == "launch" || kind == "step" ||
+    if (shuttingDown_.load() && (kind == "protectRuntimeMemory" || kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "runRuntimeHelper" || kind == "build" || kind == "launch" || kind == "step" ||
                                  kind == "continue" || kind == "pause" || kind == "stop" ||
                                  kind == "writeRegister" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "appendInput" || kind == "closeInput" || kind == "traceInstructions"))
       return {errorResponse(request, "CANCELLED", "transport is shutting down", false)};
@@ -792,7 +793,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
                              kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" ||
                              kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions" ||
                              kind == "setBreakpoints" || kind == "writeVariable" || kind == "writeMemory" || kind == "writeMemoryBatch" ||
-                             kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeRegister" || kind == "runRuntimeHelper" || kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory";
+                             kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeRegister" || kind == "runRuntimeHelper" || kind == "protectRuntimeMemory" || kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory";
     if (liveCommand && (request.at("session").is_null() || sessionId_.empty()))
       return {errorResponse(request, "STALE_CONTEXT", "a live session is required for this command", false)};
     if (liveCommand && !engine_->live())
@@ -812,7 +813,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
         kind == "seekRecording" || kind == "reverseInstruction" || kind == "runRuntimeHelper" ||
         kind == "setBreakpoints" || kind == "writeVariable" || kind == "launch")
       revokeRuntimeAllocations(string_at(request, "requestId"));
-    const bool longOperation = kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "runRuntimeHelper" || kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
+    const bool longOperation = kind == "protectRuntimeMemory" || kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "runRuntimeHelper" || kind == "traceInstructions" || kind == "build" || kind == "launch" || kind == "step" || kind == "continue" || kind == "pause" || kind == "stop";
     std::optional<std::string> activeId;
     if (longOperation) {
       const auto requestId = string_at(request, "requestId");
@@ -865,6 +866,7 @@ std::vector<Json> BackendService::request(const Json& request, FrameSink publish
     if (kind == "writeMemory" || kind == "writeMemoryBatch") return handleMemoryIntervention(request);
     if (kind == "writeRegister") return handleRegisterIntervention(request);
     if (kind == "runRuntimeHelper") return handleRuntimeIntervention(request);
+    if (kind == "protectRuntimeMemory") return handleRuntimeProtection(request);
     if (kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory") return handleRuntimeAllocation(request);
     if (kind == "readRuntimeAllocation" || kind == "listRuntimeAllocations") return {handleRuntimeAllocationQuery(request)};
     if (kind == "readMemoryIntervention" || kind == "listMemoryInterventions" || kind == "listBranches" ||
@@ -961,7 +963,7 @@ bool BackendService::control(const Json& request, bool waitForActive) {
       return (active_.has_value() && active_->ready) || shuttingDown_.load();
     });
   if (!active_ || !active_->ready) return false;
-  const bool allocation = active_->kind == "allocateRuntimeMemory" || active_->kind == "releaseRuntimeMemory";
+  const bool allocation = active_->kind == "protectRuntimeMemory" || active_->kind == "allocateRuntimeMemory" || active_->kind == "releaseRuntimeMemory";
   if (!allocation && active_->kind != "seekRecording" && active_->kind != "reverseInstruction" && active_->kind != "probeRecorders" && active_->kind != "probeRuntime" && active_->kind != "runRuntimeHelper" && active_->kind != "build" && active_->kind != "launch" && active_->kind != "step" && active_->kind != "continue" && active_->kind != "traceInstructions") return false;
   if ((allocation || active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime" || active_->kind == "runRuntimeHelper") && kind != "cancel") return false;
   if (active_->kind == "launch" && kind == "pause") return false;
@@ -995,7 +997,7 @@ void BackendService::interrupt(int mode) noexcept {
   if (mode >= 2) shuttingDown_.store(true);
   {
     std::lock_guard lock(controlMutex_);
-    if (active_ && (active_->kind == "allocateRuntimeMemory" || active_->kind == "releaseRuntimeMemory" || active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime" || active_->kind == "runRuntimeHelper")) active_->stop.request_stop();
+    if (active_ && (active_->kind == "protectRuntimeMemory" || active_->kind == "allocateRuntimeMemory" || active_->kind == "releaseRuntimeMemory" || active_->kind == "launch" || active_->kind == "build" || active_->kind == "probeRecorders" || active_->kind == "probeRuntime" || active_->kind == "runRuntimeHelper")) active_->stop.request_stop();
   }
   controlWake_.notify_all();
   if (engine_) engine_->interrupt(mode);

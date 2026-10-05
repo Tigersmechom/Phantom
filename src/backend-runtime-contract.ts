@@ -739,7 +739,33 @@ export interface RuntimeAllocationInterventionDTO extends Omit<MemoryInterventio
   };
   report: RuntimeAllocationReportDTO;
 }
-/** Current registry view; an immutable intervention response grants no authority. */
+/** Readable page protections; writable executable storage is excluded. */
+export type RuntimeMemoryPermissionsDTO = 'r--' | 'rw-' | 'r-x';
+export interface RuntimeProtectionEvidenceDTO extends Omit<RuntimeAllocationEvidenceDTO,
+  'allocated' | 'released' | 'zeroInitialized'> {
+  beforePermissions: RuntimeMemoryPermissionsDTO;
+  afterPermissions: RuntimeMemoryPermissionsDTO;
+  protectionApplied: boolean;
+  bytesUnchanged: boolean;
+}
+export interface RuntimeProtectionReportDTO extends Omit<RuntimeHelperReportDTO, 'profile' | 'evidence'> {
+  profile: 'linux-x86_64-owned-protection-v1';
+  action: 'protect';
+  evidence: RuntimeProtectionEvidenceDTO | null;
+}
+export interface RuntimeProtectionInterventionDTO extends Omit<MemoryInterventionBaseDTO, 'mapping' | 'report'> {
+  profile: 'linux-x86_64-owned-protection-v1';
+  action: 'protect';
+  target: {
+    allocationId: string;
+    addressHex: string;
+    byteCount: number;
+    expectedPermissions: RuntimeMemoryPermissionsDTO;
+    replacementPermissions: RuntimeMemoryPermissionsDTO;
+  };
+  report: RuntimeProtectionReportDTO;
+}
+/** Current registry view; permissions remain historical after authority ends. */
 export interface RuntimeAllocationDTO {
   id: string;
   processInstanceId: string;
@@ -749,9 +775,12 @@ export interface RuntimeAllocationDTO {
   createdByInterventionId: string;
   createdAt: HistoryPointDTO | null;
   releasedByInterventionId: string | null;
+  permissions: RuntimeMemoryPermissionsDTO;
+  lastProtectionInterventionId: string | null;
   state: 'owned' | 'ownership-unknown' | 'released' | 'process-ended';
   invalidatedByRequestId: string | null;
   releaseAllowed: boolean;
+  protectionAllowed: boolean;
   authorityStop: StopRefDTO | null;
 }
-export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO | RuntimeInterventionDTO | RuntimeAllocationInterventionDTO;
+export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO | RuntimeInterventionDTO | RuntimeAllocationInterventionDTO | RuntimeProtectionInterventionDTO;

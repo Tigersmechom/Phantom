@@ -210,6 +210,16 @@ class GdbEngine {
   bool executeRuntimeAllocation(const nlohmann::json& manifest, bool release,
                                 std::string_view addressHex, std::size_t byteCount,
                                 nlohmann::json& report, nlohmann::json& afterMaps,
+                                GdbError& error, std::stop_token cancellation = {},
+                                std::string_view permissions = "rw-");
+  // Change only the full server-owned mapping to r--, rw- or r-x. Exact
+  // expected permissions and all target bytes are verified without executing
+  // target allocation code. Equal permissions still execute audited mprotect.
+  bool executeRuntimeProtection(const nlohmann::json& manifest,
+                                std::string_view addressHex, std::size_t byteCount,
+                                std::string_view expectedPermissions,
+                                std::string_view replacementPermissions,
+                                nlohmann::json& report, nlohmann::json& afterMaps,
                                 GdbError& error, std::stop_token cancellation = {});
   // Independently re-check the stop, capture without target execution or
   // input delivery, and replace issued variable handles for this new state.
@@ -242,9 +252,10 @@ class GdbEngine {
                      nlohmann::json&, GdbError& error);
 
  private:
-  enum class RuntimeOperation { scratch, allocate, release };
+  enum class RuntimeOperation { scratch, allocate, release, protect };
   bool executeRuntimeOperation(const nlohmann::json& manifest, RuntimeOperation operation,
                                std::string_view addressHex, std::size_t byteCount,
+                               std::string_view expectedPermissions, std::string_view replacementPermissions,
                                nlohmann::json& report, nlohmann::json& afterMaps,
                                GdbError& error, std::stop_token cancellation);
   struct Impl;

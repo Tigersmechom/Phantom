@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "runtimeProbe", "runtimeHelper", "runtimeAllocations", "recordingProfiles", "recordingCursor", "processProfiles",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "registerWrite", "interventionLog", "interventionBranches", "recorderProbe", "runtimeProbe", "runtimeHelper", "runtimeAllocations", "runtimeProtection", "recordingProfiles", "recordingCursor", "processProfiles",
                 },
                 "BackendCapabilitiesDTO",
             )

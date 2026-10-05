@@ -182,48 +182,99 @@ std::vector<Segment> outside(const std::vector<Region>& regions,
   }
   return result;
 }
+
+struct Interval {
+  std::uint64_t start;
+  std::uint64_t end;
+};
+
+Interval interval(std::string_view addressHex, std::size_t byteCount) {
+  const auto start = hexadecimal(addressHex);
+  if (start == 0 || byteCount == 0 || byteCount > maximumAllocation ||
+      byteCount > std::numeric_limits<std::uint64_t>::max() - start)
+    reject("runtime allocation interval is invalid or exceeds limit");
+  return {start, start + byteCount};
+}
+
+std::string privatePermissions(std::string_view permissions) {
+  if (permissions != "r--" && permissions != "rw-" && permissions != "r-x")
+    reject("runtime memory permissions must be r--, rw- or r-x");
+  return std::string(permissions) + 'p';
+}
+
+void requireCovered(const std::vector<Region>& regions, Interval target,
+                    std::string_view permissions) {
+  auto covered = target.start;
+  for (const auto& region : regions) {
+    if (region.end <= target.start || region.start >= target.end) continue;
+    if (region.start > covered || !region.mergeable || region.source->at("permissions") != permissions)
+      reject("runtime allocation lacks complete unnamed private anonymous coverage with the required permissions");
+    covered = std::min(region.end, target.end);
+  }
+  if (covered != target.end) reject("runtime allocation interval has missing mapped bytes");
+}
+
+void requireOutsideUnchanged(const std::vector<Region>& before,
+                             const std::vector<Region>& after, Interval target) {
+  const auto normalizedBefore = outside(before, target.start, target.end);
+  const auto normalizedAfter = outside(after, target.start, target.end);
+  if (normalizedBefore.size() != normalizedAfter.size())
+    reject("memory mappings outside the runtime allocation changed");
+  for (std::size_t i = 0; i < normalizedBefore.size(); ++i) {
+    const auto& a = normalizedBefore[i];
+    const auto& b = normalizedAfter[i];
+    if (a.start != b.start || a.end != b.end || a.metadata != b.metadata)
+      reject("memory coverage or metadata outside the runtime allocation changed");
+  }
+}
 }  // namespace
 
 bool verifyRuntimeAllocationDelta(const Json& before, const Json& after,
                                   std::string_view addressHex, std::size_t byteCount,
-                                  bool released, std::string& detail) {
+                                  bool released, std::string& detail, std::string_view permissions) {
   detail.clear();
   try {
-    const auto start = hexadecimal(addressHex);
-    if (start == 0 || byteCount == 0 || byteCount > maximumAllocation ||
-        byteCount > std::numeric_limits<std::uint64_t>::max() - start)
-      reject("runtime allocation interval is invalid or exceeds limit");
-    const auto end = start + byteCount;
+    const auto target = interval(addressHex, byteCount);
+    const auto requiredPermissions = privatePermissions(permissions);
+    if (!released && permissions != "rw-") reject("runtime allocation must initially be RW");
     const auto beforeRegions = validate(before);
     const auto afterRegions = validate(after);
     const auto& occupied = released ? beforeRegions : afterRegions;
     const auto& vacant = released ? afterRegions : beforeRegions;
     for (const auto& region : vacant)
-      if (region.start < end && start < region.end)
+      if (region.start < target.end && target.start < region.end)
         reject("runtime allocation interval is not a complete hole in the opposite map");
-    auto covered = start;
-    for (const auto& region : occupied) {
-      if (region.end <= start || region.start >= end) continue;
-      if (region.start > covered || !region.mergeable || region.source->at("permissions") != "rw-p")
-        reject("runtime allocation is not completely covered by unnamed private RW anonymous memory");
-      covered = std::min(region.end, end);
-    }
-    if (covered != end) reject("runtime allocation interval has missing mapped bytes");
-    const auto normalizedBefore = outside(beforeRegions, start, end);
-    const auto normalizedAfter = outside(afterRegions, start, end);
-    if (normalizedBefore.size() != normalizedAfter.size())
-      reject("memory mappings outside the runtime allocation changed");
-    for (std::size_t i = 0; i < normalizedBefore.size(); ++i) {
-      const auto& a = normalizedBefore[i];
-      const auto& b = normalizedAfter[i];
-      if (a.start != b.start || a.end != b.end || a.metadata != b.metadata)
-        reject("memory coverage or metadata outside the runtime allocation changed");
-    }
+    requireCovered(occupied, target, requiredPermissions);
+    requireOutsideUnchanged(beforeRegions, afterRegions, target);
     return true;
   } catch (const Invalid& error) {
     detail = error.reason;
   } catch (...) {
     detail = "runtime allocation map proof could not be validated";
+  }
+  return false;
+}
+
+bool verifyRuntimeProtectionDelta(const Json& before, const Json& after,
+                                  std::string_view addressHex, std::size_t byteCount,
+                                  std::string_view expectedPermissions,
+                                  std::string_view replacementPermissions,
+                                  std::string& detail) {
+  detail.clear();
+  try {
+    const auto target = interval(addressHex, byteCount);
+    const auto expected = privatePermissions(expectedPermissions);
+    const auto replacement = privatePermissions(replacementPermissions);
+    const auto beforeRegions = validate(before);
+    const auto afterRegions = validate(after);
+    requireCovered(beforeRegions, target, expected);
+    requireCovered(afterRegions, target, replacement);
+    requireOutsideUnchanged(beforeRegions, afterRegions, target);
+    return true;
+  } catch (const Invalid& error) {
+    detail = error.reason;
+  } catch (...) {
+    detail = "runtime protection map proof could not be validated";
   }
   return false;
 }

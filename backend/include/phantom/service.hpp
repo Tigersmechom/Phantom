@@ -81,6 +81,7 @@ class BackendService final {
   std::vector<Json> handleRegisterIntervention(const Json& request);
   std::vector<Json> handleRuntimeIntervention(const Json& request);
   std::vector<Json> handleRuntimeAllocation(const Json& request);
+  std::vector<Json> handleRuntimeProtection(const Json& request);
   Json handleRuntimeAllocationQuery(const Json& request);
   void revokeRuntimeAllocations(std::string_view requestId);
   void synchronizeRuntimeAllocations();

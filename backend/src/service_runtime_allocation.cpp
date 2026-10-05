@@ -28,6 +28,7 @@ Json BackendService::handleRuntimeAllocationQuery(const Json& request) {
     const bool allowed = stored.at("state") == "owned" && engine_->inferiorPid().has_value() &&
         liveState_.value("phase", "") == "stopped" && liveObservation_.is_object();
     result["releaseAllowed"] = allowed;
+    result["protectionAllowed"] = allowed;
     result["authorityStop"] = allowed ? liveObservation_.at("stop") : Json(nullptr);
     return result;
   };
@@ -110,6 +111,7 @@ std::vector<Json> BackendService::handleRuntimeAllocation(const Json& request) {
   Json created = {{"id", allocationId}, {"processInstanceId", processInstanceId_},
       {"requestedBytes", requestedBytes}, {"byteCount", mappedBytes}, {"addressHex", nullptr},
       {"createdByInterventionId", interventionId}, {"createdAt", nullptr},
+      {"permissions", "rw-"}, {"lastProtectionInterventionId", nullptr},
       {"releasedByInterventionId", nullptr}, {"state", "owned"}, {"invalidatedByRequestId", nullptr}};
   std::stop_token cancellation;
   {
@@ -129,7 +131,8 @@ std::vector<Json> BackendService::handleRuntimeAllocation(const Json& request) {
   Json report, afterMaps;
   GdbError error;
   const bool success = engine_->executeRuntimeAllocation(artifact_->dto.at("runtimeHelper"),
-      release, address, release ? mappedBytes : requestedBytes, report, afterMaps, error, cancellation);
+      release, address, release ? mappedBytes : requestedBytes, report, afterMaps, error, cancellation,
+      release ? saved.at("permissions").get<std::string>() : "rw-");
   {
     std::lock_guard lock(controlMutex_);
     if (active_ && active_->id == requestId) {

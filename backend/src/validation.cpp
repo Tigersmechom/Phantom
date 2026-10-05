@@ -335,13 +335,21 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory") && !has(r, "expectedStop"))
+  if ((kind == "protectRuntimeMemory" || kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeRegister" || kind == "runRuntimeHelper" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "probeRuntime" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
   if (kind == "runRuntimeHelper") { only({"kind", "profile"}); enum_string(req(c,"profile","command"),"command.profile",{"linux-x86_64-scratch-v1"}); return; }
+  if (kind == "protectRuntimeMemory") {
+    only({"kind", "profile", "allocationId", "expectedPermissions", "replacementPermissions"});
+    enum_string(req(c,"profile","command"), "command.profile", {"linux-x86_64-owned-protection-v1"});
+    id(req(c,"allocationId","command"), "command.allocationId", l);
+    for (const auto* field : {"expectedPermissions", "replacementPermissions"})
+      enum_string(req(c,field,"command"), std::string("command.") + field, {"r--", "rw-", "r-x"});
+    return;
+  }
   if (kind == "allocateRuntimeMemory" || kind == "releaseRuntimeMemory") {
     if (kind == "allocateRuntimeMemory") only({"kind", "profile", "byteCount"});
     else only({"kind", "profile", "allocationId"});

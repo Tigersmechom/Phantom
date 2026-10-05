@@ -41,6 +41,12 @@ def _phantom_runtime_helper_status(pid):
     _phantom_runtime_helper_require(len(result) == 3, 'signal status unavailable')
     return result
 
+def _phantom_runtime_helper_personality(pid):
+    value = _phantom_runtime_helper_proc(pid,'personality').strip()
+    _phantom_runtime_helper_require(re.fullmatch('[0-9a-fA-F]{8}',value) is not None,
+                                    'personality metadata unavailable')
+    return int(value,16)
+
 def _phantom_runtime_helper_maps(pid):
     result = []
     for line in _phantom_runtime_helper_proc(pid,'maps').splitlines():
@@ -92,7 +98,8 @@ def _phantom_runtime_helper_set(name,value):
     _phantom_runtime_helper_require(name in _phantom_runtime_helper_regs, 'unexpected register write')
     gdb.execute('set $%s = 0x%x' % (name,value & _phantom_runtime_helper_mask),to_string=True)
 
-def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address=0,byte_count=0):
+def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address=0,byte_count=0,
+                                    expected_permissions='rw-',replacement_permissions=''):
     global _phantom_runtime_helper_ctx
     _phantom_runtime_helper_ctx = None
     inferior = gdb.selected_inferior()
@@ -107,6 +114,12 @@ def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address
             'pending syscall/restart state')
     status = _phantom_runtime_helper_status(pid)
     require(status['SigPnd'] == 0 and status['ShdPnd'] == 0, 'pending signal')
+    require(action in ['scratch','allocate','release','protect'], 'unsupported runtime action')
+    personality = _phantom_runtime_helper_personality(pid)
+    # READ_IMPLIES_EXEC can silently turn even an initial RW mmap into RWX.
+    # Reject before any mutation; release alone never adds access rights.
+    require(action == 'release' or personality & 0x00400000 == 0,
+            'READ_IMPLIES_EXEC is unsupported for runtime mapping/protection')
     maps = _phantom_runtime_helper_maps(pid)
     site = int(manifest['addressHex'],16)
     require(any(lo <= site and site+3 <= hi and permissions == 'r-xp'
@@ -153,8 +166,11 @@ def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address
     page_size = os.sysconf('SC_PAGESIZE')
     require(4096 <= page_size <= 1048576 and page_size & (page_size-1) == 0,
             'unsupported page size')
-    require(action in ['scratch','allocate','release'] and type(address) is int and type(byte_count) is int,
+    require(type(address) is int and type(byte_count) is int,
             'unsupported runtime action')
+    require(expected_permissions in ['r--','rw-','r-x'] and
+        (action != 'protect' or replacement_permissions in ['r--','rw-','r-x']),
+        'unsupported runtime permissions')
     if action == 'scratch':
         require(address == 0 and byte_count == 0, 'unexpected scratch arguments')
     elif action == 'allocate':
@@ -164,12 +180,15 @@ def _phantom_runtime_helper_prepare(manifest,pid,thread,action='scratch',address
     else:
         require(0 < address < 1 << 63 and address % page_size == 0 and
             1 <= byte_count <= 1048576 and byte_count % page_size == 0 and
-            address+byte_count <= 1 << 63, 'invalid release range')
+            address+byte_count <= 1 << 63, 'invalid owned range')
+    target_bytes = bytes(inferior.read_memory(address,byte_count)) if action == 'protect' else None
     registers = _phantom_runtime_helper_registers()
     policies = _phantom_runtime_helper_policies()
     _phantom_runtime_helper_ctx = {
         'inferior':inferior,'pid':pid,'thread':thread,'site':site,'code':code,'pageSize':page_size,
         'action':action,'address':address,'byteCount':byte_count,
+        'expectedPermissions':expected_permissions,'replacementPermissions':replacement_permissions,
+        'targetBytes':target_bytes,'personality':personality,
         'maps':_phantom_runtime_helper_proc(pid,'maps'),'stackStart':low,
         'stack':bytes(inferior.read_memory(low,high-low)),
         'errnoAddress':errno_address,'errno':bytes(inferior.read_memory(errno_address,4)),
@@ -200,7 +219,11 @@ def _phantom_runtime_helper_execute_operation(expected_actions):
                     'original stack changed')
             require(bytes(inferior.read_memory(context['errnoAddress'],4)) == context['errno'], 'errno changed')
             require(_phantom_runtime_helper_status(context['pid'])['SigBlk'] == context['mask'], 'signal mask changed')
+            require(_phantom_runtime_helper_personality(context['pid']) == context['personality'], 'personality changed')
             require(bytes(inferior.read_memory(context['site'],3)) == context['code'], 'helper instructions changed')
+            if context['targetBytes'] is not None:
+                require(bytes(inferior.read_memory(context['address'],context['byteCount'])) == context['targetBytes'],
+                        'owned allocation bytes changed')
         def restore():
             for name in _phantom_runtime_helper_regs:
                 if _phantom_runtime_helper_reg(name) != context['context'][name]:
@@ -268,9 +291,14 @@ def _phantom_runtime_helper_execute_operation(expected_actions):
             permissions(scratch,'rw-p',context['byteCount'])
             require(bytes(inferior.read_memory(scratch,context['byteCount'])) == bytes(context['byteCount']),
                     'anonymous allocation is not zero initialized')
-        else:
+        elif action == 'release':
             scratch = context['address']
             require(syscall(11,[scratch,context['byteCount']]) == 0, 'munmap failed')
+        else:
+            scratch = context['address']
+            protection = {'r--':1,'rw-':3,'r-x':5}[context['replacementPermissions']]
+            require(syscall(10,[scratch,context['byteCount'],protection]) == 0, 'mprotect failed')
+            permissions(scratch,context['replacementPermissions']+'p',context['byteCount'])
         for name,(stopped,printed,passed) in context['policies'].items():
             # Restore stop before print: noprint implies nostop in GDB. Valid
             # policy combinations are rechecked as a complete table below.
@@ -288,6 +316,11 @@ def _phantom_runtime_helper_execute_operation(expected_actions):
             prefix = 'PHANTOM_RUNTIME_HELPER_RESULT_V1:'
             evidence.update({'scratchAddressHex':hex(scratch),'allocated':True,'writable':True,
                 'executable':True,'payloadExecuted':True,'released':True,'mapsRestored':True})
+        elif action == 'protect':
+            prefix = 'PHANTOM_RUNTIME_PROTECTION_RESULT_V1:'
+            evidence.update({'addressHex':hex(scratch),'byteCount':context['byteCount'],
+                'beforePermissions':context['expectedPermissions'],'afterPermissions':context['replacementPermissions'],
+                'protectionApplied':True,'bytesUnchanged':True})
         else:
             prefix = 'PHANTOM_RUNTIME_ALLOCATION_RESULT_V1:'
             evidence.update({'addressHex':hex(scratch),'byteCount':context['byteCount'],
@@ -304,6 +337,9 @@ def _phantom_runtime_helper_execute():
 
 def _phantom_runtime_allocation_execute():
     _phantom_runtime_helper_execute_operation(('allocate','release'))
+
+def _phantom_runtime_protection_execute():
+    _phantom_runtime_helper_execute_operation(('protect',))
 )PY";
 
 } // namespace phantom

@@ -38,6 +38,11 @@ memory captures/diff и ограниченная запись изменений
 прошёл 26/26 CTest в Debug и ASan/UBSan и проверку 819 реальных DTO.
 Подробный порядок, зависимости и приёмка — [§20](#20-дополнение-04102026-память-вывод-и-расширенный-gdb).
 
+Актуальные расширения **05.10.2026**: проверяемые вмешательства в память,
+scalar storage и регистры; runtime helpers, сохраняемые выделения памяти и
+смена их прав RO/RW/RX. Последний срез и его приёмка — **§20.20**, запросы для
+frontend собраны в [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md).
+
 ## 1. Что уже работает
 
 phantom — Electron-приложение с React/TypeScript и отдельным Three.js-представлением кода. Запуск: `Start.command` или `release/phantom-darwin-arm64/phantom.app`; архив приложения — `release/phantom-macOS-arm64.zip`.
@@ -961,6 +966,8 @@ observation history, сохраняет границы eviction и не обещ
 - `allocateRuntimeMemory` / `releaseRuntimeMemory`: сохраняемые private RW
   allocations по backend ID; `readRuntimeAllocation` / `listRuntimeAllocations`
   показывают состояние и право освобождения. Opt-in профиль и пределы — §20.19.
+- `protectRuntimeMemory`: проверяемые RO/RW/RX переходы всей owned-области по
+  ID, сохранность байтов, право освобождения после смены защиты — §20.20.
 
 Чтения живого процесса требуют `expectedStop`; исторические запросы не читают
 нынешний процесс. `probeRecorders` не требует live-сессии или stop token.
@@ -971,8 +978,8 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**дополнительные ограниченные runtime helpers по 20.5 после сохраняемых RW allocations 20.19,
-затем согласование вмешательств с recorder-ветвями**, параллельно — углубление object/lifetime
+**согласование вмешательств с recorder-ветвями после сохраняемых allocations 20.19
+и управления правами 20.20**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1593,3 +1600,57 @@ DTO, примеры запросов и [контракт выделений](IN
 по 12473 реальных сообщения через TypeScript 5.9.3, все пять harness-проверок
 и четыре Node contract-теста. Прежние cin/cout, stepping/history, recording,
 inspection и memory/register/scalar interventions прошли общие проверки.
+
+### 20.20. Права owned runtime-памяти — 05.10.2026
+
+Добавлен `protectRuntimeMemory` с профилем `linux-x86_64-owned-protection-v1`.
+Запрос принимает ID выделения, ожидаемые и новые права (`r--`, `rw-`, `r-x`),
+текущие session/expectedStop. Backend сам разрешает ID в полный page-rounded
+диапазон. Произвольные адреса, поддиапазоны, флаги и RWX не принимаются.
+Все девять сочетаний допустимы; same→same также выполняет настоящий mprotect
+с аудитом. Несовпадение ожидаемых прав отклоняется до попытки исполнения.
+
+До syscall захватываются все байты области, включая padding, после него
+проверяются их сохранность и точное изменение полной карты памяти с учётом
+VMA merge/split. Контекст, стек, errno, сигналы, helper bytes, stdin/EOF и
+последующее обновление observation проверяются как в предыдущих runtime
+операциях. Команда не выполняет инструкции из этой области. READ_IMPLIES_EXEC
+отклоняется до мутации: Linux иначе может неявно добавить исполнение даже к
+запрошенному RW. Personality не меняется и сравнивается при проверках контекста;
+этот guard также добавлен в прежние scratch/allocate helpers.
+
+Реестр хранит последние подтверждённые `permissions`, nullable
+`lastProtectionInterventionId` и `protectionAllowed` с общим `authorityStop`.
+Успешная защита сохраняет authority всех owned-областей; release теперь
+проверяет сохранённые права и допускает RO/RW/RX. Прямые memory/scalar writes
+по-прежнему требуют RW. После обычного исполнения или конца процесса поле
+permissions имеет историческое значение, право не восстанавливается по maps.
+Exact retry возвращает прежний audit без повторного syscall и без отката прав.
+
+Неподтверждённая попытка, сигнал, timeout или отмена до завершения проверки
+закрывают inferior с аудитом: ошибка mprotect не доказывает отсутствие
+частичных изменений. Обратный mprotect для «починки» не исполняется.
+Read-only preflight rejection сохраняет прежнее право; поздняя отмена
+фиксируется отдельно от уже доказанного результата. При доказанной операции
+и последующем отказе refresh сохраняются последние права/evidence, а запись
+переходит в process-ended. Действуют общий audit budget и runtime deadline;
+квота выделений от изменения прав не меняется.
+
+Схема, примеры и ссылки на первичные источники:
+[контракт прав памяти](INSPECTION_GATEWAYS.md#owned-allocation-permissions).
+Полноценные function calls, C++ lifetime и совместимость с record-full этим
+шлюзом не объявляются. Кнопки frontend/2D renderer не добавлялись.
+
+Приёмка включает все девять переходов прав и release RO/RX, сравнение всех
+байтов области/стека/регистров и карты вне диапазона, запрет single/batch
+записей в RO/RX, stale/expected mismatch, неизменные квоты, ABA и exact retry.
+Проверены stdin/EOF, seccomp-отказ (включая same→same), отмена preflight и
+исполнения, timeout, сигнал, потерянный barrier, повреждённое proof, отказ
+refresh и отложенный Stop. Отдельные unit-тесты используют реальные mmap/
+mprotect/munmap, в том числе частичное изменение прав перед ENOMEM.
+
+Полная регрессия 20.20: **63/63 Debug и 63/63 ASan/UBSan**, по 13608 реальных
+сообщений через TypeScript 5.9.3; все пять harness-проверок и четыре Node
+contract-теста. Старые runtime helpers/allocations, cin/cout, inspection,
+stepping/history, recording и memory/register/scalar interventions прошли
+общие наборы без регрессий.

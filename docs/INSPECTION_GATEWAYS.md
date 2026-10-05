@@ -44,6 +44,7 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `probeRuntime` | No | Verify fixed syscalls, RW→RX execution and state restoration in a separate shipped fixture. |
 | `runRuntimeHelper` | Required | Execute the opted-in scratch helper in the live native process; retain restoration evidence and an intervention branch. |
 | `allocateRuntimeMemory` / `releaseRuntimeMemory` | Required | Retain private RW storage or release an authorized backend allocation ID; retain an intervention branch. |
+| `protectRuntimeMemory` | Required | Compare and change the full owned allocation's page permissions; verify unchanged bytes and retain an intervention branch. |
 | `readRuntimeAllocation` / `listRuntimeAllocations` | No | Read current session registry status, separate from immutable intervention receipts. |
 
 Captures and traces share a separate bounded store: at most 128 records and
@@ -289,7 +290,8 @@ Registry results are `runtimeAllocation{allocation}` or
 `id`, `processInstanceId`, `requestedBytes`, mapped `byteCount`, `addressHex`,
 `createdByInterventionId`, nullable `createdAt`, nullable
 `releasedByInterventionId`, `state`, nullable `invalidatedByRequestId`,
-`releaseAllowed` and nullable `authorityStop`. A failed post-allocation refresh
+`releaseAllowed`, `protectionAllowed`, `permissions`, nullable
+`lastProtectionInterventionId` and nullable `authorityStop`. A failed post-allocation refresh
 leaves createdAt null. IDs are scoped to the session and never reused within it.
 
 State means:
@@ -300,7 +302,7 @@ State means:
 - `process-ended`: a previously unreleased record belongs to an ended process.
 
 Read-only queries and supported passive memory/register/scalar edits preserve
-authority. Verified allocate/release preserve other owned allocations too.
+authority. Verified allocate/release/protect preserve other owned allocations too.
 Step, Continue, Pause, instruction trace, seek/reverse, scratch execution,
 launch attempts, setBreakpoints and writeVariable requests revoke authority
 before dispatch. This is conservative even when such a request later fails or
@@ -324,6 +326,72 @@ released records continue to consume record quota. The common intervention
 count/byte budget is checked before every syscall attempt. New sessions reset
 the registry; failed releases never trigger an automatic munmap by old address.
 These are OS storage allocations, not C++ object construction or lifetime proof.
+
+## Owned allocation permissions
+
+`capabilities.runtimeProtection:"linux-x86_64-owned-protection-v1"` enables:
+
+```json
+{"kind":"protectRuntimeMemory","profile":"linux-x86_64-owned-protection-v1","allocationId":"allocation-1","expectedPermissions":"rw-","replacementPermissions":"r-x"}
+```
+
+Use the same scratch build and verified single-process native launch as retained
+allocations. Supply the current session and `expectedStop`. The backend resolves
+the ID to its entire page-rounded allocation; address, offset, length, raw flags
+and code payload fields are forbidden. Both permission fields accept exactly
+`r--`, `rw-`, or `r-x`. All nine transitions are supported; an unchanged pair
+still performs a real `mprotect` and produces an audit. A mismatched expected
+value or lost ownership rejects the request before execution, with no new audit.
+
+The helper captures all allocation bytes before execution, applies the requested
+protection, and verifies every byte afterward, including padding beyond the
+requested allocation size. No instruction from the allocation is executed by
+this command. The independent map verifier checks both interval permissions and
+unchanged outside coverage/metadata, including legal anonymous VMA split/merge.
+The existing register/stack/errno/signal/code restoration checks, stdin isolation,
+ten-second deadline and verified post-operation refresh also apply.
+
+Before any operation that adds page permissions, the helper requires readable
+process personality with `READ_IMPLIES_EXEC` clear. Otherwise a requested RW
+mapping could implicitly become executable. Personality is preserved and checked
+throughout the operation; the backend does not silently change it. This guard
+also applies to the existing scratch and allocate helpers.
+[Linux mprotect](https://man7.org/linux/man-pages/man2/mprotect.2.html),
+[process personality](https://man7.org/linux/man-pages/man2/personality.2.html).
+
+Result `runtimeProtectionIntervention` contains `intervention` and
+`throughSequence`. The audit has the protection profile, `action:"protect"`,
+and `target:{allocationId,addressHex,byteCount,expectedPermissions,replacementPermissions}`.
+The report has the common helper attempt/cancel/outcome/phase/error fields and
+`action:"protect"`. Its evidence is null without proof; successful evidence has
+six metadata fields (`pid`, `pageSize`, `addressHex`, `byteCount`, `registerCount`,
+`stackBytes`), `beforePermissions`, `afterPermissions`, and ten true checks:
+`getpid`, `registersRestored`, `stackUnchanged`, `errnoUnchanged`,
+`signalMaskUnchanged`, `signalPolicyRestored`, `codeUnchanged`,
+`protectionApplied`, `bytesUnchanged`, `mappingDeltaVerified`.
+
+Registry `permissions` starts as `rw-`; `lastProtectionInterventionId` is initially
+null. Verified protection updates both and preserves ownership of this allocation
+and other owned allocations. `protectionAllowed` follows the same current
+authority as `releaseAllowed`, with the shared `authorityStop`. After authority
+ends, permissions are the last verified historical value, not a current map
+claim. A verified operation followed by failed refresh retains its proof/last
+permissions, but marks the allocation `process-ended`. Release works from all
+three permissions. Existing memory/scalar writes continue to require RW storage:
+ptrace is not used to bypass read-only or executable page permissions.
+
+Failed mprotect is not treated as an atomic no-op: the kernel may have modified
+an earlier part of a range before reporting failure. Once execution may have
+happened, unverified failure, signal or cancellation closes the inferior and
+retains its audit without another syscall for rollback. Read-only preflight
+cancellation preserves authority; late cancellation after verified completion
+is recorded separately. Exact request retries return the original receipt and
+never restore former permissions or ownership. The shared audit budget applies;
+protection does not consume allocation-record or outstanding-byte quota.
+[Kernel partial-update semantics](https://docs.kernel.org/6.11/userspace-api/mseal.html).
+
+This gateway changes page permissions only. It does not provide an arbitrary
+function call, instruction execution, C++ construction or record-full support.
 
 ## Process creation profile
 

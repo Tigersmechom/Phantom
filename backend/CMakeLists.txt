@@ -12,6 +12,7 @@ find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 add_library(phantom-core STATIC
   src/runtime_allocation.cpp
   src/service_runtime_allocation.cpp
+  src/service_runtime_protection.cpp
   src/runtime_helper.cpp
   src/service_runtime_helper.cpp
   src/runtime_probe.cpp
@@ -154,7 +155,7 @@ if(BUILD_TESTING)
       set_tests_properties(${module} PROPERTIES TIMEOUT 45)
     endif()
   endforeach()
-  foreach(integration IN ITEMS address_profile process_profile advanced_gateway trace_failure inspection_input register_edit register_edit_failure memory_edit memory_edit_failure memory_batch memory_batch_failure scalar_storage scalar_storage_failure scalar_batch scalar_batch_failure float_storage float_storage_failure output_journal recorder_probe runtime_probe runtime_helper runtime_allocation recording layout vtable)
+  foreach(integration IN ITEMS address_profile process_profile advanced_gateway trace_failure inspection_input register_edit register_edit_failure memory_edit memory_edit_failure memory_batch memory_batch_failure scalar_storage scalar_storage_failure scalar_batch scalar_batch_failure float_storage float_storage_failure output_journal recorder_probe runtime_probe runtime_helper runtime_allocation runtime_protection recording layout vtable)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -277,7 +278,9 @@ if(BUILD_TESTING)
     add_test(NAME frontend-contract
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/frontend_contract_test.py"
         "$<TARGET_FILE:phantom-backend>" --tsc "${PHANTOM_TYPESCRIPT_EXECUTABLE}")
-    set_tests_properties(frontend-contract PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    # This captures every capability's real integration traffic, including
+    # bounded runtime fault scenarios; sanitizer runs need the combined budget.
+    set_tests_properties(frontend-contract PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
   endif()
   add_test(NAME transport
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/transport_test.py"

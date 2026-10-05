@@ -125,9 +125,13 @@ def entry(client, identifier):
     item = result['allocation']
     assert set(item) == {'id', 'processInstanceId', 'requestedBytes', 'byteCount', 'addressHex',
         'createdByInterventionId', 'createdAt', 'releasedByInterventionId', 'state',
-        'invalidatedByRequestId', 'releaseAllowed', 'authorityStop'}, item
+        'invalidatedByRequestId', 'releaseAllowed', 'authorityStop', 'permissions',
+        'lastProtectionInterventionId', 'protectionAllowed'}, item
     assert item['id'] == identifier
     assert item['releaseAllowed'] is (item['state'] == 'owned')
+    assert item['protectionAllowed'] is item['releaseAllowed']
+    assert item['permissions'] in ('r--', 'rw-', 'r-x')
+    assert item['lastProtectionInterventionId'] is None or isinstance(item['lastProtectionInterventionId'], str)
     if item['releaseAllowed']:
         assert item['authorityStop'] == client.observation['stop'] and item['invalidatedByRequestId'] is None
     else:

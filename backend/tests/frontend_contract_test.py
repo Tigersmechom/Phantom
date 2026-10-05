@@ -29,6 +29,7 @@ import runtime_probe_integration
 import runtime_helper_integration
 import process_profile_integration
 import runtime_allocation_integration
+import runtime_protection_integration
 import recording_integration
 import layout_integration
 import symbols_integration
@@ -163,6 +164,8 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
         scenarios.append((process_profile_integration, []))
     if capabilities.get("runtimeAllocations") == "linux-x86_64-retained-rw-v1":
         scenarios.append((runtime_allocation_integration, []))
+    if capabilities.get("runtimeProtection") == "linux-x86_64-owned-protection-v1":
+        scenarios.append((runtime_protection_integration, []))
     if capabilities.get("recorderProbe", False):
         scenarios.append((recorder_probe_integration, []))
     for scenario, extra in scenarios:
@@ -192,6 +195,10 @@ def typecheck_source(traffic: list[tuple[str, dict]]) -> tuple[str, dict[str, in
         'type ConnectRequest = Parameters<DebugBackendAdapter["connect"]>[0]',
         '  & { kind: "connect" };',
         '// Profile discrimination must reject exact floats on legacy writes.',
+        '// @ts-expect-error writable executable runtime memory is not supported',
+        'const executableWrite = {kind:"protectRuntimeMemory",profile:"linux-x86_64-owned-protection-v1",allocationId:"allocation-1",expectedPermissions:"rw-",replacementPermissions:"rwx"} satisfies BackendRequestDTO["command"];',
+        '// @ts-expect-error protection resolves its extent from a backend allocation ID',
+        'const protectAddress = {kind:"protectRuntimeMemory",profile:"linux-x86_64-owned-protection-v1",allocationId:"allocation-1",expectedPermissions:"rw-",replacementPermissions:"r-x",addressHex:"0x1000"} satisfies BackendRequestDTO["command"];',
         '// @ts-expect-error control registers require a separate execution profile',
         'const controlRegister = {kind:"writeRegister",profile:"native-x86_64-gpr-v1",register:"rip",expectedValueHex:"0x0000000000000000",replacementValueHex:"0x0000000000000000"} satisfies BackendRequestDTO["command"];',
         '// @ts-expect-error register bits cannot be represented by a JS number',
