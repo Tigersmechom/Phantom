@@ -65,36 +65,12 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   if (sessionId_.empty()) return {errorResponse(request,"STALE_CONTEXT","interventions require an established session")};
   const auto& command = preparedScalar.is_object() ? preparedScalar.at("memoryCommand") : request.at("command");
   const auto kind = command.at("kind").get<std::string>();
-  if (kind == "listBranches") return {okResponse(request,{{"kind","branches"},
-    {"currentBranchId",currentBranchId_},{"branches",branches_}})};
-  if (kind == "readMemoryIntervention") {
-    for (const auto& entry : interventions_) if (entry.response.at("result").at("intervention").at("id") == command.at("interventionId"))
-      return {okResponse(request,{{"kind","memoryIntervention"},{"intervention",entry.response.at("result").at("intervention")}})};
-    return {errorResponse(request,"HISTORY_EVICTED","memory intervention is unavailable in this session")};
-  }
-  if (kind == "listMemoryInterventions") {
-    const auto start = command.at("start").get<std::size_t>();
-    const auto begin = std::min(start,interventions_.size());
-    const auto end = begin + std::min(command.at("count").get<std::size_t>(),interventions_.size()-begin);
-    Json items = Json::array();
-    for (auto i=begin; i<end; ++i) items.push_back(interventions_[i].response.at("result").at("intervention"));
-    return {okResponse(request,{{"kind","memoryInterventions"},{"items",std::move(items)},
-      {"start",start},{"total",interventions_.size()},{"hasMore",end < interventions_.size()}})};
-  }
   if (!liveObservation_.is_object() || liveState_.value("phase","") != "stopped")
     return {errorResponse(request,"STALE_CONTEXT","memory edits require a stopped native session, outside an input wait")};
   const bool scalarBatch = preparedScalar.is_object() && preparedScalar.contains("scalars") &&
       preparedScalar.at("scalars").is_array();
   const auto reservationBytes = scalarBatch ? scalarBatchInterventionReservation : interventionReservation;
-  const auto budget = std::min<std::size_t>(4 * 1024 * 1024, options_.limits.maxWireBytes);
-  std::size_t reservedBytes = 0;
-  for (const auto& saved : interventions_) {
-    if (saved.reservationBytes > budget-reservedBytes)
-      return {errorResponse(request,"LIMIT_EXCEEDED","intervention audit retention budget is exhausted")};
-    reservedBytes += saved.reservationBytes;
-  }
-  if (interventions_.size() >= maxInterventions || reservationBytes > budget-reservedBytes || request.dump().size() > 4096)
-    return {errorResponse(request,"LIMIT_EXCEEDED","intervention audit retention budget is exhausted or request identity is too large")};
+  if (const auto failure = interventionBudgetError(request,reservationBytes)) return {*failure};
   if (scalarBatch) {
     // Before any mutation, leave room for a conservatively bounded raw batch
     // report (24 KiB), original request + response envelope (12 KiB), and the
@@ -160,15 +136,7 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
     mappings.push_back(std::move(mapping));
   }
 
-  // Reserve the bounded ledger slot before the callback can submit any write.
-  // This ledger is separate from the evictable history/inspection caches.
-  interventions_.reserve(maxInterventions);
-  const auto id = "intervention-" + std::to_string(interventions_.size()+1);
-  Json audit = {{"id",id},{"requestId",request.at("requestId")},{"profile",request.at("command").at("profile")},
-    {"processInstanceId",processInstanceId_},{"beforePoint",liveObservation_.at("point")},
-    {"beforeStop",liveObservation_.at("stop")},{"afterPoint",nullptr},{"afterStop",nullptr},
-    {"branchId",nullptr},{"contextStatus","unchanged"},
-    {"refreshError",nullptr},{"report",nullptr}};
+  Json audit = beginIntervention(request);
   if (batch) audit["mappings"] = std::move(mappings);
   else audit["mapping"] = std::move(mappings.front());
   const auto reader = [&](std::uint64_t start, std::size_t count) -> MemoryEditRead {
@@ -227,43 +195,6 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
       audit["scalar"][std::string(phase)+"Value"] = value ? *value : Json(nullptr);
     }
   }
-  std::vector<Json> events;
-  const auto requestId = request.at("requestId").get<std::string>();
-  const bool attempted = audit.at("report").at("writeAttempted").get<bool>();
-  if (attempted) {
-    currentBranchId_ = "branch-" + std::to_string(branches_.size());
-    branches_.push_back({{"id",currentBranchId_},{"parent",audit.at("beforePoint")},{"interventionId",id}});
-    audit["branchId"] = currentBranchId_;
-    events.push_back(event({{"kind","branchCreated"},{"branchId",currentBranchId_},
-      {"parent",audit.at("beforePoint")}},processInstanceId_,requestId));
-    try {
-      GdbStop refreshed; GdbError refreshError;
-      if (!engine_->live() || !engine_->refreshStoppedSnapshot(refreshed,refreshError) ||
-          !sameCompleteMaps(maps,refreshed.memoryMap))
-        throw std::runtime_error("post-write stopped context could not be confirmed");
-      auto observation = makeObservation(refreshed,"mutation");
-      auto state = makeState(observation,"stopped");
-      appendHistory(observation,state);
-      audit["afterPoint"] = observation.at("point"); audit["afterStop"] = observation.at("stop");
-      audit["contextStatus"] = "refreshed";
-      events.push_back(event({{"kind","observation"},{"observation",observation}},processInstanceId_,requestId));
-      events.push_back(event({{"kind","state"},{"state",state}},processInstanceId_,requestId));
-    } catch (...) {
-      // A sent write is never erased by a failed readback/snapshot. The audit
-      // remains retrievable, but no pre-write observation is presented as live.
-      engine_->stop(); liveObservation_ = nullptr;
-      audit["contextStatus"] = "failed";
-      audit["refreshError"] = {{"code","READ_FAILED"},{"message","post-write stopped context could not be confirmed; debugger closed"}};
-      publishFailedState(events,request);
-    }
-  } else if (!engine_->live()) {
-    liveObservation_ = nullptr; audit["contextStatus"] = "failed";
-    publishFailedState(events,request);
-  }
-  auto response = okResponse(request,{{"kind","memoryIntervention"},{"intervention",audit},{"throughSequence",sequence_}});
-  interventions_.push_back({request,response,reservationBytes});
-  std::vector<Json> frames{std::move(response)};
-  frames.insert(frames.end(),std::make_move_iterator(events.begin()),std::make_move_iterator(events.end()));
-  return frames;
+  return finishIntervention(request,std::move(audit),"memoryIntervention",reservationBytes,maps);
 }
 } // namespace phantom

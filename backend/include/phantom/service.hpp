@@ -76,6 +76,12 @@ class BackendService final {
   std::vector<Json> handleVariableLayout(const Json& request);
   std::vector<Json> handleVtable(const Json& request);
   std::vector<Json> handleMemoryIntervention(const Json& request, const Json& preparedScalar = nullptr);
+  std::vector<Json> handleRegisterIntervention(const Json& request);
+  std::vector<Json> handleInterventionQuery(const Json& request);
+  std::optional<Json> interventionBudgetError(const Json& request, std::size_t reservationBytes) const;
+  Json beginIntervention(const Json& request);
+  std::vector<Json> finishIntervention(const Json& request, Json audit, std::string_view resultKind,
+                                      std::size_t reservationBytes, const Json& requiredMaps = nullptr);
   std::vector<Json> handleScalarStorage(const Json& request);
   std::vector<Json> handleLaunch(const Json& request, const FrameSink& publish);
   std::vector<Json> handleExecution(const Json& request, std::string_view kind, const FrameSink& publish);

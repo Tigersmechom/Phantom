@@ -3,6 +3,7 @@
 
 #include "phantom/mi.hpp"
 #include "phantom/process.hpp"
+#include "phantom/register_edit.hpp"
 #include "variable_layout_script.hpp"
 #include "scalar_storage_script.hpp"
 
@@ -24,6 +25,7 @@
 #include <mutex>
 #include <poll.h>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <sys/ioctl.h>
@@ -1789,7 +1791,7 @@ struct GdbEngine::Impl {
     return true;
   }
 
-  bool prepareMemoryWrite(GdbError& error) {
+  bool prepareMemoryWrite(GdbError& error, std::string* stoppedThread = nullptr) {
     if (!live.load()) {
       error = {"INVALID_REQUEST", "no live debugger", false};
       return false;
@@ -1830,6 +1832,116 @@ struct GdbEngine::Impl {
       error = {"STALE_CONTEXT", "memory writes require a confirmed stopped inferior thread", false};
       return false;
     }
+    if (stoppedThread) *stoppedThread = id->text;
+    return true;
+  }
+
+  bool prepareRegisterWrite(std::string_view name, nlohmann::json& target,
+                            std::size_t& number, GdbError& error) {
+    if (!isNativeGprName(name)) {
+      error = {"INVALID_REQUEST", "register intervention requires an allowed full-width general register", false};
+      return false;
+    }
+    if (inputWaitActive) {
+      error = {"UNSUPPORTED", "register interventions are unavailable while waiting for input", false};
+      return false;
+    }
+    std::string thread;
+    if (!prepareMemoryWrite(error, &thread)) {
+      if (const auto at = error.message.find("memory write"); at != std::string::npos)
+        error.message.replace(at, 12, "register write");
+      return false;
+    }
+    const auto malformed = [&](std::string_view what) {
+      error = {"READ_FAILED", "GDB returned invalid register " + std::string(what), false};
+      return false;
+    };
+    if (thread.size() > 16 || thread.front() == '0' ||
+        thread.find_first_not_of("0123456789") != std::string::npos)
+      return malformed("thread identity");
+    MiRecord selected;
+    if (!command("-thread-select " + thread, false, selected, error)) return false;
+    const auto* selectedId = field(selected.fields, "new-thread-id");
+    if (selected.klass != "done" || mi::find_all(selected.fields, "new-thread-id").size() != 1 ||
+        !selectedId || selectedId->kind != mi::ValueKind::string || selectedId->text != thread)
+      return malformed("thread selection");
+    if (!command("-stack-select-frame 0", false, selected, error)) return false;
+    if (selected.klass != "done") return malformed("frame selection");
+    selectedFrame = 0;
+
+    MiRecord features;
+    if (!command("-list-features", false, features, error)) return false;
+    const auto* supported = field(features.fields, "features");
+    if (features.klass != "done" || mi::find_all(features.fields, "features").size() != 1 ||
+        !supported || supported->kind != mi::ValueKind::value_list || !supported->fields.empty())
+      return malformed("feature metadata");
+    bool pythonAvailable = false;
+    for (const auto& feature : supported->values) {
+      if (!feature || feature->kind != mi::ValueKind::string) return malformed("feature metadata");
+      pythonAvailable = pythonAvailable || feature->text == "python";
+    }
+    if (!pythonAvailable) {
+      error = {"UNSUPPORTED", "register interventions require GDB Python architecture metadata", false};
+      return false;
+    }
+
+    // Only the allowlisted literal name enters this trusted script. Reading
+    // the register's type does not evaluate a client expression, invoke a
+    // pretty-printer or call code in the inferior. MI numbers are deliberately
+    // not cached: every write verifies the actual target's current table.
+    const std::string script =
+        "import gdb, json\n"
+        "def _phantom_register_target(name):\n"
+        "    frame = gdb.selected_frame()\n"
+        "    value = frame.read_register(name)\n"
+        "    result = {'architecture': frame.architecture().name(), 'register': name, "
+        "'bits': value.type.sizeof * 8, 'threadId': str(gdb.selected_thread().global_num), "
+        "'frameLevel': frame.level()}\n"
+        "    print('PHANTOM_REGISTER_TARGET_V1:' + json.dumps(result, separators=(',', ':')))\n"
+        "_phantom_register_target(" + nlohmann::json(name).dump() + ")\n";
+    if (!command("-interpreter-exec console " + miQuote("python exec(" + nlohmann::json(script).dump() + ")"),
+                 false, selected, error, 0, true)) return false;
+    constexpr std::string_view prefix = "PHANTOM_REGISTER_TARGET_V1:";
+    if (!consoleOutput.starts_with(prefix) || consoleOutput.size() > prefix.size() + 1024 + 1)
+      return malformed("architecture metadata");
+    bool duplicate = false;
+    std::set<std::string> keys;
+    auto metadata = nlohmann::json::parse(consoleOutput.substr(prefix.size()),
+        [&](int, nlohmann::json::parse_event_t event, nlohmann::json& parsed) {
+          if (event == nlohmann::json::parse_event_t::key && !keys.insert(parsed.get<std::string>()).second)
+            duplicate = true;
+          return true;
+        }, false);
+    if (duplicate || !metadata.is_object() || metadata.size() != 5 ||
+        !metadata.contains("architecture") || !metadata["architecture"].is_string() ||
+        metadata.value("register", nlohmann::json(nullptr)) != name ||
+        !metadata.contains("bits") || !metadata["bits"].is_number_integer() ||
+        metadata.value("threadId", nlohmann::json(nullptr)) != thread ||
+        !metadata.contains("frameLevel") || !metadata["frameLevel"].is_number_integer() ||
+        metadata["frameLevel"] != 0)
+      return malformed("architecture metadata");
+    if (metadata["architecture"] != "i386:x86-64" || metadata["bits"] != 64) {
+      error = {"UNSUPPORTED", "register intervention requires a verified 64-bit native x86-64 general register", false};
+      return false;
+    }
+    MiRecord names;
+    if (!command("-data-list-register-names", false, names, error)) return false;
+    const auto* list = field(names.fields, "register-names");
+    if (names.klass != "done" || mi::find_all(names.fields, "register-names").size() != 1 ||
+        !list || list->kind != mi::ValueKind::value_list || !list->fields.empty() ||
+        list->values.empty() || list->values.size() > 4096)
+      return malformed("name table");
+    bool found = false;
+    std::set<std::string> seen;
+    for (std::size_t i = 0; i < list->values.size(); ++i) {
+      const auto& entry = list->values[i];
+      if (!entry || entry->kind != mi::ValueKind::string || entry->text.size() > 128 ||
+          (!entry->text.empty() && !seen.insert(entry->text).second)) return malformed("name table");
+      if (entry->text == name) { found = true; number = i; }
+    }
+    if (!found) return malformed("missing full-width register name");
+    metadata["architecture"] = "x86_64";
+    target = std::move(metadata);
     return true;
   }
 
@@ -2683,6 +2795,80 @@ bool GdbEngine::refreshStoppedSnapshot(GdbStop& result, GdbError& error) {
   if (!impl_->verifiedStoppedRecord(stopped, "intervention", error) ||
       !impl_->makeStop(stopped, result, error)) return false;
   result.processInstanceId = impl_->inferiorPid;
+  return true;
+}
+
+bool GdbEngine::prepareRegisterWrite(std::string_view name, nlohmann::json& target,
+                                     GdbError& error) {
+  error = {};
+  target = nullptr;
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  std::size_t number = 0;
+  return impl_->prepareRegisterWrite(name, target, number, error);
+}
+
+bool GdbEngine::readRegisterValue(std::string_view name, nlohmann::json& result,
+                                  GdbError& error) {
+  error = {};
+  result = nullptr;
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  nlohmann::json target;
+  std::size_t number = 0;
+  if (!impl_->prepareRegisterWrite(name, target, number, error)) return false;
+  MiRecord record;
+  const auto thread = target.at("threadId").get<std::string>();
+  if (!impl_->command("-data-list-register-values --thread " + thread + " --frame 0 x " +
+                      std::to_string(number), false, record, error)) return false;
+  const auto malformed = [&] {
+    error = {"READ_FAILED", "GDB returned an invalid or unavailable full-width register value", false};
+    return false;
+  };
+  const auto* list = field(record.fields, "register-values");
+  if (record.klass != "done" || mi::find_all(record.fields, "register-values").size() != 1 ||
+      !list || list->kind != mi::ValueKind::value_list || !list->fields.empty() ||
+      list->values.size() != 1 || !list->values.front()) return malformed();
+  const auto& entry = *list->values.front();
+  const auto* index = field(entry, "number");
+  const auto* value = field(entry, "value");
+  if (entry.kind != mi::ValueKind::tuple || entry.fields.size() != 2 ||
+      mi::find_all(entry.fields, "number").size() != 1 || mi::find_all(entry.fields, "value").size() != 1 ||
+      !index || index->kind != mi::ValueKind::string || index->text != std::to_string(number) ||
+      !value || value->kind != mi::ValueKind::string || value->text.size() < 3 ||
+      value->text.size() > 18 || !value->text.starts_with("0x") ||
+      value->text.find_first_not_of("0123456789abcdefABCDEF", 2) != std::string::npos) return malformed();
+  const auto parsed = parseAddress(value->text);
+  if (!parsed) return malformed();
+  std::ostringstream canonical;
+  canonical << "0x" << std::hex << std::setw(16) << std::setfill('0') << *parsed;
+  target["valueHex"] = canonical.str();
+  result = std::move(target);
+  return true;
+}
+
+bool GdbEngine::writeRegisterValue(std::string_view name, std::string_view valueHex,
+                                   bool& attempted, GdbError& error) {
+  attempted = false;
+  error = {};
+  if (!canonicalGprHex(valueHex)) {
+    error = {"INVALID_REQUEST", "register value must be 0x followed by 16 lowercase hexadecimal digits", false};
+    return false;
+  }
+  Impl::CaptureOnlyIo captureOnly(*impl_);
+  nlohmann::json target;
+  std::size_t number = 0;
+  if (!impl_->prepareRegisterWrite(name, target, number, error)) return false;
+  MiRecord response;
+  const auto thread = target.at("threadId").get<std::string>();
+  // GDB evaluates the value argument; canonicalGprHex permits exactly one
+  // unsigned numeric literal. No register name or caller expression is
+  // inserted into this mutating command, only a verified numeric MI index.
+  if (!impl_->command("-data-write-register-values --thread " + thread + " --frame 0 x " +
+                      std::to_string(number) + " " + std::string(valueHex),
+                      false, response, error, 0, false, &attempted)) return false;
+  if (response.klass != "done") {
+    error = {"READ_FAILED", "GDB did not confirm completion of the register write", false};
+    return false;
+  }
   return true;
 }
 

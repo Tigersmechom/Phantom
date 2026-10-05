@@ -30,6 +30,8 @@ import symbols_integration
 import vtable_integration
 import memory_edit_integration
 import memory_edit_failure_integration
+import register_edit_integration
+import register_edit_failure_integration
 import memory_batch_integration
 import memory_batch_failure_integration
 import scalar_storage_integration
@@ -113,6 +115,9 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
     capabilities = next(frame["capabilities"] for direction, frame in traffic
                         if direction == "received" and frame.get("kind") == "connectResult")
     scenarios = [(advanced_gateway_integration, [])]
+    if capabilities.get("registerWrite") == "native-x86_64-gpr-v1":
+        scenarios.append((register_edit_integration, []))
+        scenarios.append((register_edit_failure_integration, []))
     if capabilities.get("moduleInspection") == "linux-proc-maps-elf":
         library = module_library or executable.parent / "libphantom-module-map-library.so"
         if not library.is_file():
@@ -170,6 +175,10 @@ def typecheck_source(traffic: list[tuple[str, dict]]) -> tuple[str, dict[str, in
         'type ConnectRequest = Parameters<DebugBackendAdapter["connect"]>[0]',
         '  & { kind: "connect" };',
         '// Profile discrimination must reject exact floats on legacy writes.',
+        '// @ts-expect-error control registers require a separate execution profile',
+        'const controlRegister = {kind:"writeRegister",profile:"native-x86_64-gpr-v1",register:"rip",expectedValueHex:"0x0000000000000000",replacementValueHex:"0x0000000000000000"} satisfies BackendRequestDTO["command"];',
+        '// @ts-expect-error register bits cannot be represented by a JS number',
+        'const numericRegister = {kind:"writeRegister",profile:"native-x86_64-gpr-v1",register:"rax",expectedValueHex:"0x0000000000000000",replacementValueHex:0} satisfies BackendRequestDTO["command"];',
         '// @ts-expect-error float storage is v2-only',
         'const legacyFloat = {kind:"writeScalarStorage",profile:"native-dwarf-scalar-v1",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:"80000000"}} satisfies BackendRequestDTO["command"];',
         '// @ts-expect-error a host number cannot preserve NaN payload/signaling bits',

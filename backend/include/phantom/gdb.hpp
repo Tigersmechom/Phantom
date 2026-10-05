@@ -168,6 +168,23 @@ class GdbEngine {
   // command; false return with attempted=true can mean a partial write.
   bool writeMemoryBytes(std::string_view addressHex, std::string_view bytesHex,
                         bool& attempted, GdbError& error);
+  // Native x86-64 general-register interventions, excluding PC, stack/frame
+  // pointers, aliases, flags, vectors and system registers. Each call verifies
+  // one stopped thread, selects its innermost frame, and independently checks
+  // the actual architecture, width and dynamic MI register number. No call
+  // executes target code or exposes queued input/EOF. Input-wait stops and
+  // recording profiles other than native are unsupported.
+  // target = {architecture, register, bits, threadId, frameLevel}; a successful
+  // read adds valueHex, always 0x followed by 16 lowercase hexadecimal digits.
+  bool prepareRegisterWrite(std::string_view name, nlohmann::json& target,
+                            GdbError& error);
+  bool readRegisterValue(std::string_view name, nlohmann::json& result,
+                         GdbError& error);
+  // valueHex must already be canonical. attempted follows the same send-
+  // boundary convention as writeMemoryBytes; a failed attempted write still
+  // needs independent readback and an immutable service audit.
+  bool writeRegisterValue(std::string_view name, std::string_view valueHex,
+                          bool& attempted, GdbError& error);
   // Independently re-check the stop, capture without target execution or
   // input delivery, and replace issued variable handles for this new state.
   bool refreshStoppedSnapshot(GdbStop& result, GdbError& error);

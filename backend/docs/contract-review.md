@@ -228,7 +228,7 @@ native storage edits and intervention lineage are implemented below (2026-10-05)
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native single/batched raw-memory and single/batched typed integer/bool/float storage profiles. | Register writes, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
+| Runtime intervention | Implemented memory/scalar batches and native GPR writes: expected/current values, independent readback, refreshed stop and shared lineage/audit ledger; once-only retries. Generic intervention queries preserve typed memory/register subsets. | Control-register writes, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -509,3 +509,33 @@ branch/history behavior and stdin/EOF isolation are preserved. Native stopped
 single-thread and private VMA gates still apply; C++ lifetime/assignment and
 record-full interventions remain outside the contract. See
 [typed batch gateway](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-batches).
+
+## 2026-10-05: checked native GPR intervention and shared journal
+
+`writeRegister{profile:"native-x86_64-gpr-v1",register,expectedValueHex,
+replacementValueHex}` permits 14 full-width integer data registers in the live
+native x86-64 thread. Values are exactly `0x` plus 16 lowercase digits. PC,
+SP/BP, flags, segment/system/vector state, aliases and caller expressions are
+excluded. Native single-thread ordinary stop, GDB Python architecture/width
+evidence, current frame0/thread and dynamic MI name/index checks are required.
+The exact expected value is compared before one literal-only MI write; an
+independent readback runs even after a failed acknowledgement when GDB survives.
+
+`RegisterInterventionDTO` carries shared provenance/lineage/context fields,
+verified target metadata and a register-specific report without a memory
+mapping. Complete values remain strings, unavailable/malformed values remain
+null. Attempt, acknowledgement, readback, verification and final context status
+are independent. Possibly attempted writes advance one branch/stop; failed
+refresh closes the debugger while retaining audit. No atomicity, rollback,
+language assignment, program execution or stdin/EOF delivery is implied.
+
+Generic `readIntervention` / `listInterventions` query a union of memory and
+register audits, advertised by `interventionLog`. Register-specific queries
+and old memory queries filter this shared ledger by category. Paging counts
+filtered entries while keeping global IDs; wrong-category lookup is unavailable.
+Every profile shares request identity, ancestry and 128-record/4 MiB budgets,
+with 32 KiB register reservations and existing 64 KiB typed batches. New optional
+`maxInterventions` is the explicit global alias of `maxMemoryInterventions`.
+Once-only results survive changed stops, inferior exit and debugger death in
+the session. Details and examples:
+[register gateway](../../docs/INSPECTION_GATEWAYS.md#checked-native-register-interventions).

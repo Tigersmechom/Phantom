@@ -1,4 +1,5 @@
 #include "phantom/validation.hpp"
+#include "phantom/register_edit.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -334,7 +335,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeRegister" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
@@ -405,6 +406,22 @@ void validate_request(const Json& r, const ValidationLimits& l) {
     }
     return;
   }
+  if (kind == "writeRegister") {
+    only({"kind","profile","register","expectedValueHex","replacementValueHex"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-x86_64-gpr-v1"});
+    const auto& name = req(c,"register","command");
+    string_value(name,"command.register",32);
+    if (!isNativeGprName(name.get_ref<const std::string&>()))
+      invalid("command.register","only canonical native general-register names are supported");
+    for (const auto* key : {"expectedValueHex","replacementValueHex"}) {
+      const auto path = std::string("command.")+key;
+      const auto& value = req(c,key,"command");
+      string_value(value,path,18);
+      if (!canonicalGprHex(value.get_ref<const std::string&>()))
+        invalid(path,"expected 0x followed by exactly 16 lowercase hexadecimal digits");
+    }
+    return;
+  }
   if (kind == "writeMemory") {
     only({"kind","profile","addressHex","expectedBytesHex","replacementBytesHex"});
     enum_string(req(c,"profile","command"),"command.profile",{"native-private-memory-v1"});
@@ -432,10 +449,10 @@ void validate_request(const Json& r, const ValidationLimits& l) {
     }
     return;
   }
-  if (kind == "readMemoryIntervention") {
+  if (kind == "readMemoryIntervention" || kind == "readRegisterIntervention" || kind == "readIntervention") {
     only({"kind","interventionId"}); id(req(c,"interventionId","command"),"command.interventionId",l); return;
   }
-  if (kind == "listMemoryInterventions") {
+  if (kind == "listMemoryInterventions" || kind == "listRegisterInterventions" || kind == "listInterventions") {
     only({"kind","start","count"}); safe_uint(req(c,"start","command"),"command.start");
     positive_uint(req(c,"count","command"),"command.count",std::min<std::size_t>(128,l.maxPageSize)); return;
   }

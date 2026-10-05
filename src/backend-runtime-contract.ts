@@ -581,3 +581,40 @@ export type MemoryInterventionDTO = (MemoryInterventionBaseDTO & (
   | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO<ScalarStorageValueV1DTO, ScalarStorageTypeV1DTO> }
   | { profile: 'native-dwarf-scalar-v2'; scalar: ScalarStorageInterventionDTO }
 )) | MemoryBatchInterventionDTO | ScalarStorageBatchInterventionDTO;
+
+/** Full-width integer data registers of the verified native x86-64 thread.
+ *  IP, stack/frame pointers, flags, aliases and vector/system state are excluded. */
+export type NativeGprNameDTO = 'rax' | 'rbx' | 'rcx' | 'rdx' | 'rsi' | 'rdi'
+  | 'r8' | 'r9' | 'r10' | 'r11' | 'r12' | 'r13' | 'r14' | 'r15';
+export interface RegisterInterventionTargetDTO {
+  architecture: 'x86_64';
+  register: NativeGprNameDTO;
+  bits: 64;
+  threadId: string;
+  frameLevel: 0;
+}
+export interface RegisterInterventionReportDTO {
+  register: NativeGprNameDTO;
+  bits: 64;
+  /** Canonical numeric bit pattern: 0x and 16 lowercase digits, never JS number. */
+  expectedValueHex: string;
+  replacementValueHex: string;
+  beforeValueHex: string | null;
+  afterValueHex: string | null;
+  beforeMatchesExpected: boolean | null;
+  afterMatchesReplacement: boolean | null;
+  afterMatchesBefore: boolean | null;
+  outcome: MemoryInterventionBaseDTO['report']['outcome'];
+  writeAttempted: boolean;
+  writeAcknowledged: boolean;
+  debuggerAlive: boolean;
+  atomic: false;
+  rollbackAttempted: false;
+  errors: MemoryInterventionBaseDTO['report']['errors'];
+}
+export interface RegisterInterventionDTO extends Omit<MemoryInterventionBaseDTO, 'mapping' | 'report'> {
+  profile: 'native-x86_64-gpr-v1';
+  target: RegisterInterventionTargetDTO;
+  report: RegisterInterventionReportDTO;
+}
+export type InterventionDTO = MemoryInterventionDTO | RegisterInterventionDTO;

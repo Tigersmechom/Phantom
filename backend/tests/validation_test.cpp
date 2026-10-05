@@ -386,6 +386,53 @@ int main() {
     gateway["command"] = floatCommand; gateway["command"]["value"].erase(key);
     assert(validation_fails(gateway,"INVALID_REQUEST"));
   }
+  const Json registerCommand = {{"kind","writeRegister"},{"profile","native-x86_64-gpr-v1"},
+    {"register","rax"},{"expectedValueHex","0x0000000000000000"},{"replacementValueHex","0xffffffffffffffff"}};
+  for (const auto* name : {"rax","rbx","rcx","rdx","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15"}) {
+    gateway["command"] = registerCommand; gateway["command"]["register"] = name;
+    assert(!validation_fails(gateway));
+  }
+  auto missingRegisterStop = gateway; missingRegisterStop.erase("expectedStop");
+  assert(validation_fails(missingRegisterStop,"INVALID_REQUEST"));
+  for (const auto& name : Json::array({"", "rip", "rsp", "rbp", "eax", "$rax", "RAX", "eflags", "fs_base", "xmm0", "r16",
+       "rax;continue", "rax\n-exec-continue", "rax ", "раx", 0, nullptr})) {
+    gateway["command"] = registerCommand; gateway["command"]["register"] = name;
+    assert(validation_fails(gateway));
+  }
+  for (const auto* key : {"expectedValueHex","replacementValueHex"}) {
+    for (const auto& value : Json::array({"", "0x0", "0x000000000000000", "0x00000000000000000", "0xFFFFFFFFFFFFFFFF",
+         "0X0000000000000000", "000000000000000000", "-0x000000000000001", "0x100000000000000g", 42, true, nullptr})) {
+      gateway["command"] = registerCommand; gateway["command"][key] = value;
+      assert(validation_fails(gateway));
+    }
+  }
+  for (const auto* key : {"profile","register","expectedValueHex","replacementValueHex"}) {
+    gateway["command"] = registerCommand; gateway["command"].erase(key);
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"threadId","frameLevel","number","value","force","bits"}) {
+    gateway["command"] = registerCommand; gateway["command"][key] = 0;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  gateway["command"] = registerCommand; gateway["command"]["profile"] = "native-private-memory-v1";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  for (const auto* kind : {"readIntervention","readRegisterIntervention","readMemoryIntervention"}) {
+    gateway["command"] = {{"kind",kind},{"interventionId","intervention-1"}};
+    auto historical = gateway; historical.erase("expectedStop");
+    assert(!validation_fails(historical));
+    historical["command"].erase("interventionId");
+    assert(validation_fails(historical,"INVALID_REQUEST"));
+  }
+  for (const auto* kind : {"listInterventions","listRegisterInterventions","listMemoryInterventions"}) {
+    gateway["command"] = {{"kind",kind},{"start",phantom::max_json_safe_integer},{"count",128}};
+    assert(!validation_fails(gateway));
+    gateway["command"]["count"] = 129;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+    gateway["command"]["count"] = 0;
+    assert(validation_fails(gateway));
+    gateway["command"]["count"] = 1; gateway["command"]["start"] = -1;
+    assert(validation_fails(gateway));
+  }
   auto scalarItem = scalarCommand; scalarItem.erase("kind");
   auto floatItem = floatCommand; floatItem.erase("kind"); floatItem["snapshotId"] = "scalar-2";
   const Json scalarBatchCommand = {{"kind","writeScalarStorageBatch"},{"profile","native-dwarf-scalar-batch-v1"},

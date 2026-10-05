@@ -35,7 +35,10 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `writeMemory` | Required | Compare, write and verify bounded native storage bytes; retain intervention provenance. |
 | `writeMemoryBatch` | Required | Preflight disjoint ranges, apply in request order and retain partial/final evidence as one intervention. |
 | `writeScalarStorageBatch` | Required | Bind every scalar snapshot/type/address, then apply checked disjoint storage edits with per-phase values. |
-| `readMemoryIntervention` / `listMemoryInterventions` / `listBranches` | No | Read session intervention audits and branch ancestry. |
+| `writeRegister` | Required | Compare and edit one verified native 64-bit general register; retain before/write/readback evidence. |
+| `readMemoryIntervention` / `listMemoryInterventions` | No | Read memory/storage interventions only. |
+| `readRegisterIntervention` / `listRegisterInterventions` | No | Read register interventions only. |
+| `readIntervention` / `listInterventions` / `listBranches` | No | Read all session interventions and their shared branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
 
@@ -517,8 +520,9 @@ operations before writing; IDs are never silently evicted. Comparison
 conflicts/no-ops also occupy records. A successful new launch or workspace
 change clears the ledger and branches. Export needed audits before that.
 
-Register writes, runtime code injection and branching inside recorded execution
-remain separate work. Bounded multi-range byte edits are described below.
+Bounded general-register writes are described below. Runtime code injection,
+control-register edits and branching inside recorded execution remain separate
+work. Bounded multi-range byte edits are described below.
 The MI write command and recorder side effects are described in the official
 [GDB data manipulation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
 and [record/replay](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html)
@@ -822,3 +826,101 @@ changes, snapshot eviction or debugger death. A fresh request needs a current
 context and enough remaining ledger capacity. The ordinary single-scalar and
 raw-batch response shapes are unchanged. This API writes verified storage;
 `variableWrite` remains false until C++ assignment/lifetime guarantees exist.
+
+## Checked native register interventions
+
+`capabilities.registerWrite = "native-x86_64-gpr-v1"` enables `writeRegister`.
+Read the current value through `readRegisters`, then submit an exact expected
+value and replacement under the same session and `expectedStop`:
+
+```json
+{
+  "kind": "writeRegister",
+  "profile": "native-x86_64-gpr-v1",
+  "register": "rax",
+  "expectedValueHex": "0x0000000000000007",
+  "replacementValueHex": "0x000000000000002a"
+}
+```
+
+Both value fields require `0x` followed by exactly 16 lowercase hexadecimal
+digits in numeric order. Normalize an available `readRegisters` value to this
+width using exact integer/string handling; never JavaScript `Number`. Every
+64-bit pattern is allowed, including `0xffffffffffffffff`. Decimal expressions,
+negative strings, truncation, implicit extension and register aliases are rejected.
+
+This profile permits only `rax`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, and `r8` through
+`r15`. It requires native execution, one confirmed stopped thread, ordinary
+`stopped` phase, GDB Python metadata, actual `i386:x86-64` architecture and an
+eight-byte register. `rip`, `rsp`, `rbp`, flags, segment/system state, vector
+registers and partial aliases such as `eax` are excluded. The register belongs
+to the live thread's frame 0; callers cannot specify another thread/frame/index.
+Missing or contradictory metadata fails before writing. Record-full and input
+waits are unsupported. Other register inspection remains available as before.
+
+Each primitive explicitly selects and verifies the live thread/frame, validates
+architecture/width, and resolves a numeric index from the current MI register
+name table. No index is hardcoded or retained across operations. The trusted
+Python script reads metadata only; the mutating MI command receives one strict
+hexadecimal literal. These commands do not execute instructions, evaluate caller
+expressions, or deliver queued stdin/EOF. GDB's ordinary register display is
+frame-relative, which is why selecting frame 0 is necessary.
+[GDB register semantics](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Registers.html),
+[MI register command implementation](https://gnu.googlesource.com/binutils-gdb/+/d01e823438c7dc264d6885fbbfeace4d8955dcb7/gdb/mi/mi-main.c#909).
+
+The backend reads and compares the complete value, sends at most one write,
+then independently reads back even when GDB rejects acknowledgement after a
+possible effect. A conflict or equal replacement sends no write. There is no
+automatic retry, rollback or atomic compare-and-swap. Changing a data register
+can change later program behavior; this is machine-state intervention, not C++
+variable assignment or a claim about object lifetime.
+
+The synchronous result is `{kind:"registerIntervention",intervention,
+throughSequence}`. Its immutable audit has the common ID/request/process,
+before/after points/stops, branch, `contextStatus`, and `refreshError` fields,
+plus `profile:"native-x86_64-gpr-v1"`, `target`, and `report`. It has no memory
+`mapping`. Target identifies `{architecture:"x86_64",register,bits:64,
+threadId,frameLevel:0}`. Report contains the register/width, requested expected
+and replacement values, `beforeValueHex`/`afterValueHex`, comparison booleans,
+attempt/acknowledgement/liveness flags and phase-tagged bounded errors.
+Outcomes match single-memory edits: `conflict`, `unchanged`, `verified`,
+`readback-mismatch`, `unverified`, `read-before-failed`, `write-rejected`.
+
+Malformed/unavailable reads produce null values, never zero or a guessed prefix.
+A complete error-bearing read may retain a value but cannot authorize a write
+or verify readback. An error acknowledgement can coexist with `verified` when
+the later read proves the requested bits; inspect acknowledgement/errors too.
+Any possibly attempted write creates one lineage branch and refreshed stop,
+even on failed acknowledgement or unchanged readback. Failure to confirm the
+new stopped snapshot closes GDB, sets `contextStatus:"failed"`, and preserves
+the audit; old observations remain immutable. Conflict/no-op creates an audit
+without a branch. Physical output remains one process journal.
+
+Register audits reserve 32 KiB in the same non-evicting session ledger as memory
+audits. Original requests are bounded to 4096 bytes. All profiles share the
+128-record cap and `maxInterventionStoreBytes` (4 MiB default), including the
+64 KiB reservations of typed batches. `limits.maxInterventions` advertises this
+global cap; legacy `maxMemoryInterventions` remains its compatibility alias.
+Whole-request retries retain once-only behavior across changed stops, process
+exit and debugger loss, until a successful new launch or workspace change.
+
+## Shared intervention journal
+
+`capabilities.interventionLog:true` advertises the generic history gateway:
+
+- `readIntervention{interventionId}` returns
+  `{kind:"intervention",intervention}` for any supported profile.
+- `listInterventions{start,count}` returns
+  `{kind:"interventions",items,start,total,hasMore}` in original audit order.
+- `readRegisterIntervention` / `listRegisterInterventions` have the same arguments
+  and return `registerIntervention` / `registerInterventions`, restricted to
+  register edits. Existing memory read/list commands remain memory-only,
+  including typed scalar and memory-batch profiles.
+
+Inspect each audit's `profile` to choose a renderer. IDs are globally unique
+within the session and shared by `listBranches`. In category-specific lists,
+`start`, `total` and `hasMore` refer to the filtered category, not global ledger
+offsets; entries retain their original IDs and order. A wrong-category read
+returns `HISTORY_EVICTED`. Reads need the owning session but no live process or
+`expectedStop`, and produce no new events. Historical reads omit
+`throughSequence`; that field belongs to the original mutation response.

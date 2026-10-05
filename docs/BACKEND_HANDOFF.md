@@ -968,7 +968,7 @@ observation history, сохраняет границы eviction и не обещ
 Record-full регрессии 20.4 завершены. Срез 20.7 добавляет
 секции/символы ELF и статическое устройство переменных; срез 20.8 — чтение
 явно выбранного vptr с ограниченным ABI-декодированием. Следующий порядок:
-**ограниченные register/runtime interventions по 20.5 после storage-профилей 20.9–20.13**, параллельно — углубление object/lifetime
+**ограниченные runtime interventions по 20.5 после storage/register-профилей 20.9–20.14**, параллельно — углубление object/lifetime
 и ABI evidence по 20.2. Ограниченный
 instruction trace не заменяет recorder; runtime module metadata не доказывает
 семантическую принадлежность vtable или начало lifetime объекта.
@@ -1272,8 +1272,9 @@ input-wait, изоляция stdin/EOF, старая история и process-w
 нет. Пример и точные null/error semantics:
 [типизированный пакетный шлюз](INSPECTION_GATEWAYS.md#typed-scalar-batches).
 
-Следующие части P5: ограниченные register/runtime interventions и совместимое
-с recorder ветвление. Object lifetime и ND остаются отдельным направлением P2.
+Ограниченный профиль GPR добавлен в §20.14. Следующие части P5: runtime
+interventions и совместимое с recorder ветвление. Object lifetime и ND
+остаются отдельным направлением P2.
 
 Проверки 20.13: **49/49 Debug и 49/49 ASan/UBSan**, 7155 реальных сообщений
 через TypeScript 5.9.3, пять harness-проверок и четыре Node contract-теста.
@@ -1287,3 +1288,52 @@ ack, потерю readback, смерть GDB и два сбоя final sampling. 
 отказ до записи и доступность прежних retry. Тест предельного audit строит
 отчёт настоящим batch helper с худшим escaping: 59394 байта с исходным
 запросом и дополнительным запасом, в пределах 64 KiB.
+
+### 20.14. Изменение GPR и общий журнал вмешательств — 05.10.2026
+
+`writeRegister` с capability `registerWrite:"native-x86_64-gpr-v1"` меняет
+один из 14 полных 64-битных регистров rax/rbx/rcx/rdx/rsi/rdi/r8–r15.
+Запрос содержит ожидаемое и новое значение: `0x` + 16 lowercase hex digits.
+JS Number, выражения, сокращённые значения и псевдонимы не допускаются.
+Control/stack/frame/flags/segment/vector registers остаются за рамками профиля.
+
+На каждом чтении/подготовке/записи GDB подтверждает native/single stopped
+thread, frame0, реальную архитектуру i386:x86-64 и ширину 64. MI-номер
+получается из текущей таблицы имён, не предполагается заранее. Trusted Python
+читает только metadata, MI получает строго один числовой литерал. Все новые
+операции изолируют очередь stdin/EOF; input-wait и record-full отклоняются.
+
+Сравнение expected → одна попытка записи → независимый readback сохраняют
+точные 64 бита. Ошибка подтверждения не стирает возможный эффект. Audit
+`RegisterInterventionDTO` отдельно фиксирует before/after, attempt/ack,
+сравнения и фазовые ошибки. Conflict/no-op не создают ветвь; попытка записи
+создаёт одну ветвь и новый stop. Если обновление контекста не подтвердилось,
+GDB закрывается, live очищается, audit остаётся доступным. Автоматического
+отката, атомарности, C++ assignment/lifetime и обратимого внешнего мира нет.
+
+`readIntervention` / `listInterventions` дают общий журнал memory/register
+вмешательств (`interventionLog:true`); `readRegisterIntervention` /
+`listRegisterInterventions` выбирают регистры. Старые memory-запросы сохраняют
+свою категорию/DTO. Пагинация считает отфильтрованные записи, но ID и ветви
+общие. Запрос не той категории получает HISTORY_EVICTED. Общие helpers
+выделены для резервирования, обновления stop, ветвей и сохранения ответа;
+повтор запроса возвращает прежний результат даже после смены stop/смерти GDB.
+
+Register audit резервирует 32 KiB; typed batch по-прежнему 64 KiB. Общий предел
+128 записей/4 MiB виден как maxInterventions (старый maxMemoryInterventions
+остаётся совместимым alias). Перед мутацией проверяется весь смешанный бюджет.
+Контракт и пример: [шлюз регистров](INSPECTION_GATEWAYS.md#checked-native-register-interventions).
+
+Далее: исправление подтверждённой доставки stdin/EOF наблюдающими командами;
+ограниченные runtime helpers/syscalls и ветвление с recorder остаются P5.
+
+Проверки 20.14: все **53 Debug-теста** прошли (новый engine-тест повторён после
+исправления его ожидания INPUT_WAIT и fake-MI форматирования); **53/53
+ASan/UBSan**, 8791 реальных сообщений через TypeScript 5.9.3, пять harness-
+проверок и четыре Node contract-теста. Реальные тесты меняют все 14 GPR,
+проверяют full64/highbit/zero, остальные регистры/stack/PC, frame1→frame0,
+влияние правки на последующее C++ исполнение, stdin isolation, record/thread/
+input-wait guards. Проверены 13 fault-сценариев, malformed/duplicate GDB
+metadata, mixed-type paging, общие 128 записей, смешанный бюджет 32/64 KiB,
+неизменность истории и retry после завершения/потери debugger. Unit-тест
+проверяет худшие ошибки/UTF-8/escaping и 32 KiB audit reservation.

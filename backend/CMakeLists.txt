@@ -10,6 +10,9 @@ find_package(Threads REQUIRED)
 find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 
 add_library(phantom-core STATIC
+  src/service_intervention.cpp
+  src/service_register_edit.cpp
+  src/register_edit.cpp
   src/service_scalar_storage.cpp
   src/scalar_codec.cpp
   src/service_memory_edit.cpp
@@ -101,7 +104,7 @@ if(BUILD_TESTING)
   add_library(phantom-module-map-library SHARED fixtures/module-map-library.cpp)
   target_compile_options(phantom-module-map-library PRIVATE -g -fno-sanitize=all)
   target_link_options(phantom-module-map-library PRIVATE -fno-sanitize=all)
-  foreach(module IN ITEMS scalar-codec scalar-batch-budget memory-edit memory-batch elf elf-symbols module-symbols vtable process-inspection output-journal recorder-probe module-map)
+  foreach(module IN ITEMS register-edit scalar-codec scalar-batch-budget memory-edit memory-batch elf elf-symbols module-symbols vtable process-inspection output-journal recorder-probe module-map)
     string(REPLACE "-" "_" test_file "${module}")
     add_executable(phantom-${module}-test tests/${test_file}_test.cpp)
     target_link_libraries(phantom-${module}-test PRIVATE phantom-core)
@@ -125,7 +128,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure memory_edit memory_edit_failure memory_batch memory_batch_failure scalar_storage scalar_storage_failure scalar_batch scalar_batch_failure float_storage float_storage_failure output_journal recorder_probe recording layout vtable)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure register_edit register_edit_failure memory_edit memory_edit_failure memory_batch memory_batch_failure scalar_storage scalar_storage_failure scalar_batch scalar_batch_failure float_storage float_storage_failure output_journal recorder_probe recording layout vtable)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -205,6 +208,13 @@ if(BUILD_TESTING)
     "$<TARGET_FILE:phantom-gdb-test-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/gdb-test.cpp")
   set_tests_properties(gdb-memory-write PROPERTIES TIMEOUT 60)
+  add_executable(phantom-gdb-register-write-test tests/gdb_register_write_test.cpp)
+  target_link_libraries(phantom-gdb-register-write-test PRIVATE phantom-core)
+  add_dependencies(phantom-gdb-register-write-test phantom-gdb-test-fixture phantom-io-wrapper)
+  add_test(NAME gdb-register-write COMMAND "$<TARGET_FILE:phantom-gdb-register-write-test>"
+    "$<TARGET_FILE:phantom-gdb-test-fixture>" "$<TARGET_FILE:phantom-io-wrapper>"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/gdb-test.cpp")
+  set_tests_properties(gdb-register-write PROPERTIES TIMEOUT 90)
 
   add_test(NAME scaffold-cli
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_smoke.py"

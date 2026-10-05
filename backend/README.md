@@ -119,6 +119,12 @@ protocol capabilities.
   ещё раз непосредственно перед записью. Аудит содержит значения каждой
   стадии, включая итоговое чтение после частичного сбоя.
   [Типизированный пакет](../docs/INSPECTION_GATEWAYS.md#typed-scalar-batches).
+- `writeRegister` меняет один из 14 полных 64-битных GPR после проверки
+  architecture/thread/frame/type width и сравнения исходного значения.
+  Запись перечитывается даже при ошибке подтверждения; полный отчёт и ветвь
+  сохраняются. `readIntervention` / `listInterventions` объединяют записи
+  памяти и регистров; прежние memory-запросы сохраняют свой тип результата.
+  [Регистры и общий журнал](../docs/INSPECTION_GATEWAYS.md#checked-native-register-interventions).
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
   expression traces, source disassembly и verified restore выключены и отвечают
   `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес

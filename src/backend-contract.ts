@@ -1,4 +1,4 @@
-import type { ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { NativeGprNameDTO, RegisterInterventionDTO, InterventionDTO, ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -575,6 +575,8 @@ export interface ResourceLimitsDTO {
   maxScalarStorageBatchItems?: number;
   maxScalarStorageBatchBytes?: number;
   maxMemoryInterventions: number;
+  /** Global ledger record cap across memory and register profiles. */
+  maxInterventions?: number;
   maxInterventionStoreBytes: number;
   commandTimeoutMs: number;
   replayTimeoutMs: number;
@@ -595,6 +597,8 @@ export interface BackendCapabilitiesDTO {
   /** Absent on legacy servers; float bits require an explicit v2 inspection. */
   scalarStorageProfiles?: ScalarStorageProfileDTO[];
   scalarStorageBatch?: 'native-dwarf-scalar-batch-v1' | 'none';
+  registerWrite?: 'native-x86_64-gpr-v1' | 'none';
+  interventionLog?: boolean;
   interventionBranches: boolean;
   inputTracking: InputStateDTO['tracking'];
   interactiveInput: boolean;
@@ -659,6 +663,11 @@ export type BackendCommandDTO =
   | { kind: 'writeScalarStorageBatch'; profile: 'native-dwarf-scalar-batch-v1'; edits: ScalarStorageBatchEditDTO[] }
   | { kind: 'readMemoryIntervention'; interventionId: string }
   | { kind: 'listMemoryInterventions'; start: number; count: number }
+  | { kind: 'writeRegister'; profile: 'native-x86_64-gpr-v1'; register: NativeGprNameDTO; expectedValueHex: string; replacementValueHex: string }
+  | { kind: 'readRegisterIntervention'; interventionId: string }
+  | { kind: 'listRegisterInterventions'; start: number; count: number }
+  | { kind: 'readIntervention'; interventionId: string }
+  | { kind: 'listInterventions'; start: number; count: number }
   | { kind: 'listBranches' }
   | { kind: 'readMemory'; addressHex: string; byteCount: number }
   | { kind: 'readOutputJournal'; stream: 'stdout' | 'stderr'; fromByte: number; byteCount: number; point?: HistoryPointDTO }
@@ -700,6 +709,10 @@ export type BackendResultDTO =
   | { kind: 'memoryIntervention'; intervention: MemoryInterventionDTO; throughSequence?: number }
   | { kind: 'scalarStorage'; snapshot: ScalarStorageSnapshotDTO }
   | { kind: 'memoryInterventions'; items: MemoryInterventionDTO[]; start: number; total: number; hasMore: boolean }
+  | { kind: 'registerIntervention'; intervention: RegisterInterventionDTO; throughSequence?: number }
+  | { kind: 'registerInterventions'; items: RegisterInterventionDTO[]; start: number; total: number; hasMore: boolean }
+  | { kind: 'intervention'; intervention: InterventionDTO }
+  | { kind: 'interventions'; items: InterventionDTO[]; start: number; total: number; hasMore: boolean }
   | { kind: 'branches'; currentBranchId: string; branches: InterventionBranchDTO[] }
   | OutputJournalDTO
   | { kind: 'moduleSnapshot'; snapshot: ModuleSnapshotDTO }
