@@ -24,6 +24,13 @@ Json booleanType() {
   return {{"kind", "boolean"}, {"byteSize", 1}, {"bits", 8}, {"signed", nullptr},
           {"byteOrder", "little"}, {"representation", "boolean-01"}};
 }
+Json floatType(unsigned bits) {
+  return {{"kind", "float"}, {"byteSize", bits / 8}, {"bits", bits}, {"signed", nullptr},
+          {"byteOrder", "little"}, {"representation", bits == 32 ? "ieee754-binary32" : "ieee754-binary64"}};
+}
+Json floatValue(unsigned bits, std::string_view rawBitsHex) {
+  return {{"kind", "float"}, {"bits", bits}, {"rawBitsHex", rawBitsHex}};
+}
 Json value(unsigned bits, bool isSigned, std::string_view decimal) {
   return {{"kind", "integer"}, {"decimal", decimal}, {"bits", bits}, {"signed", isSigned}};
 }
@@ -101,6 +108,117 @@ void booleans() {
   reject(metadata, {{"kind", "boolean"}, {"value", true}, {"extra", 1}}, "invalid-value");
   reject(metadata, value(8, false, "1"), "type-mismatch");
   reject(type(8, false), {{"kind", "boolean"}, {"value", true}}, "type-mismatch");
+}
+
+void exactFloatBits() {
+  struct Pattern { const char *bits, *memory; };
+  // Numeric bit patterns and target memory byte order are deliberately given
+  // independently. No native float or double is created, even in these tests.
+  const std::array<Pattern, 20> binary32{{
+    {"00000000", "00000000"}, {"80000000", "00000080"}, // +/- zero
+    {"3f800000", "0000803f"}, {"bf800000", "000080bf"}, // +/- one
+    {"00000001", "01000000"}, {"80000001", "01000080"}, // minimum subnormals
+    {"007fffff", "ffff7f00"}, {"807fffff", "ffff7f80"}, // maximum subnormals
+    {"00800000", "00008000"}, {"80800000", "00008080"}, // minimum normals
+    {"7f7fffff", "ffff7f7f"}, {"ff7fffff", "ffff7fff"}, // maximum finite
+    {"7f800000", "0000807f"}, {"ff800000", "000080ff"}, // infinities
+    {"7fc12345", "4523c17f"}, {"ffc12345", "4523c1ff"}, // quiet NaN payloads
+    {"7f812345", "4523817f"}, {"ff812345", "452381ff"}, // signaling NaN payloads
+    {"7fffffff", "ffffff7f"}, {"ffffffff", "ffffffff"}, // all payload bits set
+  }};
+  const std::array<Pattern, 22> binary64{{
+    {"0000000000000000", "0000000000000000"}, {"8000000000000000", "0000000000000080"},
+    {"3ff0000000000000", "000000000000f03f"}, {"bff0000000000000", "000000000000f0bf"},
+    {"0000000000000001", "0100000000000000"}, {"8000000000000001", "0100000000000080"},
+    {"000fffffffffffff", "ffffffffffff0f00"}, {"800fffffffffffff", "ffffffffffff0f80"},
+    {"0010000000000000", "0000000000001000"}, {"8010000000000000", "0000000000001080"},
+    {"7fefffffffffffff", "ffffffffffffef7f"}, {"ffefffffffffffff", "ffffffffffffefff"},
+    {"7ff0000000000000", "000000000000f07f"}, {"fff0000000000000", "000000000000f0ff"},
+    {"7ff8123456789abc", "bc9a78563412f87f"}, {"fff8123456789abc", "bc9a78563412f8ff"},
+    {"7ff0123456789abc", "bc9a78563412f07f"}, {"fff0123456789abc", "bc9a78563412f0ff"},
+    {"7ff0000000000001", "010000000000f07f"}, {"fff0000000000001", "010000000000f0ff"},
+    {"7fffffffffffffff", "ffffffffffffff7f"}, {"ffffffffffffffff", "ffffffffffffffff"},
+  }};
+  for (const auto& pattern : binary32) roundtrip(floatType(32), floatValue(32, pattern.bits), pattern.memory);
+  for (const auto& pattern : binary64) roundtrip(floatType(64), floatValue(64, pattern.bits), pattern.memory);
+
+  std::uint64_t state = 0x6d38e992bacf7184ULL;
+  for (unsigned bits : {32, 64}) {
+    const auto metadata = floatType(bits);
+    for (unsigned sample = 0; sample < 2048; ++sample) {
+      state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+      std::string memory;
+      for (unsigned byte = 0; byte < bits / 8; ++byte) memory += static_cast<char>(state >> (byte * 8));
+      const auto decoded = phantom::decodeScalarStorage(metadata, memory);
+      require(decoded && decoded->size() == 3 && decoded->at("kind") == "float" && decoded->at("bits") == bits,
+              "float storage was not decoded as exact bit metadata");
+      const std::string numericBytes(memory.rbegin(), memory.rend());
+      require(decoded->at("rawBitsHex") == hex(numericBytes), "float numeric bit order is incorrect");
+      roundtrip(metadata, *decoded, hex(memory));
+    }
+  }
+}
+
+void malformedFloats() {
+  for (unsigned bits : {32, 64}) {
+    const auto metadata = floatType(bits);
+    const auto zero = std::string(bits / 4, '0');
+    const auto candidate = floatValue(bits, zero);
+    std::vector<std::string> malformed{"", "0x" + zero, "+" + zero, "-" + zero,
+      zero + "0", zero.substr(1), " " + zero.substr(1), zero.substr(1) + "\n",
+      "A" + zero.substr(1), "F" + zero.substr(1), "g" + zero.substr(1),
+      "１" + zero.substr(3), "nan", "inf", "-0", "0.0"};
+    malformed.push_back(std::string(1, '\0') + zero.substr(1));
+    malformed.push_back(std::string(1, static_cast<char>(0xff)) + zero.substr(1));
+    for (const auto& raw : malformed) reject(metadata, floatValue(bits, raw), "invalid-value");
+    for (const Json& wrong : {Json(nullptr), Json(true), Json(0), Json(0.0), Json::array(), Json::object()}) {
+      auto bad = candidate; bad["rawBitsHex"] = wrong;
+      reject(metadata, bad, "invalid-value");
+    }
+    for (const Json& wrong : {Json(8), Json(16), Json(128), Json(bits == 32 ? 64 : 32), Json(-32),
+                            Json(static_cast<double>(bits)), Json("32"), Json(nullptr), Json(true),
+                            Json(std::numeric_limits<std::uint64_t>::max())}) {
+      auto bad = candidate; bad["bits"] = wrong;
+      reject(metadata, bad, "type-mismatch");
+    }
+    for (auto key : {"bits", "rawBitsHex"}) {
+      auto missing = candidate; missing.erase(key);
+      reject(metadata, missing, "invalid-value");
+    }
+    for (auto key : {"text", "classification", "decimal", "signed", "extra"}) {
+      auto extra = candidate; extra[key] = "unsupported";
+      reject(metadata, extra, "invalid-value");
+    }
+    reject(metadata, {{"kind", "float"}, {"bits", bits}, {"text", "nan"}, {"classification", "nan"}}, "invalid-value");
+    reject(metadata, value(bits, true, "0"), "type-mismatch");
+    reject(metadata, {{"kind", "boolean"}, {"value", false}}, "type-mismatch");
+    reject(type(bits, true), candidate, "type-mismatch");
+    reject(booleanType(), candidate, "type-mismatch");
+
+    std::vector<Json> badTypes;
+    for (auto key : {"kind", "byteSize", "bits", "signed", "byteOrder", "representation"}) {
+      auto missing = metadata; missing.erase(key); badTypes.push_back(missing);
+    }
+    for (const auto& [field, wrong] : std::vector<std::pair<std::string, Json>>{
+        {"bits", bits == 32 ? 64 : 32}, {"byteSize", bits == 32 ? 8 : 4},
+        {"bits", static_cast<double>(bits)}, {"byteSize", static_cast<double>(bits / 8)},
+        {"signed", true}, {"signed", false}, {"signed", 0}, {"signed", "null"},
+        {"byteOrder", "big"}, {"byteOrder", "native"}, {"kind", "double"},
+        {"representation", bits == 32 ? "ieee754-binary64" : "ieee754-binary32"},
+        {"representation", "ieee754"}, {"representation", "twos-complement"},
+        {"representation", "unsigned-binary"}, {"extra", 1}}) {
+      auto bad = metadata; bad[field] = wrong; badTypes.push_back(bad);
+    }
+    for (unsigned width : {8, 16, 80, 128}) {
+      auto bad = metadata; bad["bits"] = width; bad["byteSize"] = width / 8; badTypes.push_back(bad);
+    }
+    for (const auto& bad : badTypes) {
+      reject(bad, candidate, "invalid-type");
+      require(!phantom::decodeScalarStorage(bad, std::string(bits / 8, '\0')), "invalid float metadata decoded");
+    }
+    for (std::size_t bytes : {std::size_t(0), std::size_t(bits / 8 - 1), std::size_t(bits / 8 + 1), std::size_t(256)})
+      require(!phantom::decodeScalarStorage(metadata, std::string(bytes, '\0')), "wrong float storage size decoded");
+  }
 }
 
 void malformedValues() {
@@ -214,6 +332,7 @@ int main() {
   try {
     integerBoundaries(); booleans(); malformedValues(); malformedMetadata();
     exhaustiveSmallIntegersAndSamples();
+    exactFloatBits(); malformedFloats();
     std::cout << "scalar codec tests passed\n";
     return 0;
   } catch (const std::exception& error) {

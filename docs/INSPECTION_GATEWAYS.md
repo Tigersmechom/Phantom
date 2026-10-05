@@ -513,7 +513,7 @@ operations before writing; IDs are never silently evicted. Comparison
 conflicts/no-ops also occupy records. A successful new launch or workspace
 change clears the ledger and branches. Export needed audits before that.
 
-Typed scalar writes, multi-range transactions, register writes, runtime code
+Multi-range transactions, register writes, runtime code
 injection and branching inside recorded execution remain separate work.
 The MI write command and recorder side effects are described in the official
 [GDB data manipulation](https://sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Data-Manipulation.html)
@@ -527,6 +527,14 @@ the checked memory intervention. It supports integer storage of 8/16/32/64
 bits and one-byte `bool` on the verified x86-64 little-endian target. It does
 not assert that a C++ object's lifetime has begun. The legacy `writeVariable`
 command and `variableWrite:false` stay unchanged.
+
+`capabilities.scalarStorageProfiles` additionally advertises
+`"native-dwarf-scalar-v2"`, which supports exact `float`/`double` bits as well
+as the v1 types. Select it explicitly with
+`inspectScalarStorage{locator,profile:"native-dwarf-scalar-v2"}`. Omitting
+`profile` still selects v1: float targets remain unavailable with null scalar
+metadata/bytes/value. A write's profile must match the issued snapshot;
+changing the profile at write time returns `INVALID_REQUEST` before any write.
 
 1. `inspectScalarStorage{locator}` inspects an unambiguous root locator emitted
    at this stop, including roots from paged `readVariables` in another frame.
@@ -562,10 +570,41 @@ representation. A noncanonical bool byte such as `02` has complete available
 storage but `value:null` and reason `invalid-scalar-representation`; replacing
 it with `00` or `01` still compares its original raw bytes.
 
+For a v2 `float` snapshot the exact negative-zero write is:
+
+```json
+{
+  "kind": "writeScalarStorage",
+  "profile": "native-dwarf-scalar-v2",
+  "snapshotId": "scalar-2",
+  "value": {"kind":"float","bits":32,"rawBitsHex":"80000000"}
+}
+```
+
+`rawBitsHex` is exactly 8 (binary32) or 16 (binary64) lowercase hexadecimal
+digits, most significant first, without `0x`. It represents the **numeric bit
+pattern**, whereas `storage.bytesHex` represents **bytes in memory order**:
+the example above has `bytesHex:"00000080"` on this little-endian profile.
+Float metadata has `kind:"float"`, `signed:null`, `byteOrder:"little"`, and
+coherent `byteSize:4,bits:32,representation:"ieee754-binary32"` or
+`byteSize:8,bits:64,representation:"ieee754-binary64"`.
+
+Every bit pattern is accepted, including signed zero, subnormals, infinities,
+and quiet/signaling NaNs with their sign/payload intact. Encoding, decoding and
+comparison operate on bytes, without host/inferior floating-point arithmetic
+or decimal conversions. Same bits are a no-op, even for NaN; changing zero's
+sign or a NaN payload is a real storage change. Decimal text, JSON numbers,
+classification fields and automatic width conversions are not accepted by
+this exact-write API. A future numeric UI must choose and display the intended
+bit pattern before submitting it.
+
 Both live scalar inspection and writing require native execution, exactly one
 confirmed stopped thread, and phase `stopped` outside an input wait. Const,
-volatile, atomic, reference, pointer, enum, aggregate, float and unsupported
-extended integer types are rejected. A register-only or optimized-out value
+volatile, atomic, reference, pointer, enum, aggregate and unsupported
+extended integer types are rejected. V1 additionally rejects floats; v2 only
+admits builtin `float` of four bytes and `double` of eight bytes, including
+typedefs. `long double` (even if compiled to eight bytes), half/quad precision
+and `_Atomic` float/double remain unsupported. A register-only or optimized-out value
 has no writable memory storage. Unknown/ambiguous/unissued locators are not
 resolved by guessing. Type names are labels, never assignment expressions or
 an authority for signedness.
@@ -573,15 +612,19 @@ an authority for signedness.
 The engine uses trusted GDB Python type APIs and compares unqualified types
 against built-in scalar types. This also rejects `_Atomic int`, which GDB can
 report with integer type code/name and whose qualifier is not removed by
-`Type.unqualified()`. `Type.is_signed`, other required metadata, the target
+`Type.unqualified()`. `Type.is_signed` for integer/bool, other required metadata, the target
 architecture and byte order must be available; older GDB versions may return
 an unavailable target instead of guessing. Capability advertises the profile,
 not a guarantee that every GDB/build/variable supplies this evidence.
 [Type API](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Types-In-Python.html),
 [value/address API](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Values-From-Inferior.html).
+The float representation follows the verified native x86-64 ABI;
+[Intel's format reference](https://www.intel.com/content/www/us/en/developer/articles/technical/floating-point-reference-sheet-for-intel-architecture.html)
+describes binary32/binary64 encodings. Matching a size or printed type name
+alone does not establish this evidence.
 
 The result remains `memoryIntervention`, now with profile
-`native-dwarf-scalar-v1` and a `scalar` section containing the original snapshot
+`native-dwarf-scalar-v1` or `native-dwarf-scalar-v2` and a `scalar` section containing the original snapshot
 ID, locator, verified target metadata, requested value and observed before/
 after scalar values. A missing or partial readback leaves `afterValue:null`;
 requested values never substitute for observed effects. Events, once-only
@@ -594,5 +637,5 @@ stdin/EOF. An edit invalidates other snapshots from the previous stop, including
 when the PC is unchanged. Raw and typed edits share the same branch ancestry.
 An externally changed value at the same stop causes a byte conflict, not an
 unconditional overwrite. C++ assignment semantics, object initialization,
-alternate-future restoration, floating-point edits and language side effects
+alternate-future restoration and language side effects
 remain outside this storage profile.

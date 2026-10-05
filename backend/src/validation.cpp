@@ -314,17 +314,34 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (kind == "setBreakpoints") { only({"kind","documentId","revisionId","breakpoints"}); id(req(c,"documentId","command"),"command.documentId",l); id(req(c,"revisionId","command"),"command.revisionId",l); const auto& bs=req(c,"breakpoints","command"); array_limit(bs,"command.breakpoints",l.maxBreakpoints); for(const auto& b:bs) breakpoint(b,l); return; }
   if (kind == "readVariables") { only({"kind","reference","start","count"}); id(req(c,"reference","command"),"command.reference",l); safe_uint(req(c,"start","command"),"command.start"); positive_uint(req(c,"count","command"),"command.count",l.maxPageSize); return; }
   if (kind == "inspectScalarStorage") {
-    only({"kind","locator"}); string_value(req(c,"locator","command"),"command.locator",272); return;
+    only({"kind","locator","profile"}); string_value(req(c,"locator","command"),"command.locator",272);
+    if (has(c,"profile")) enum_string(c.at("profile"),"command.profile",{"native-dwarf-scalar-v1","native-dwarf-scalar-v2"});
+    return;
   }
   if (kind == "readScalarStorage") {
     only({"kind","snapshotId"}); id(req(c,"snapshotId","command"),"command.snapshotId",l); return;
   }
   if (kind == "writeScalarStorage") {
     only({"kind","profile","snapshotId","value"});
-    enum_string(req(c,"profile","command"),"command.profile",{"native-dwarf-scalar-v1"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-dwarf-scalar-v1","native-dwarf-scalar-v2"});
     id(req(c,"snapshotId","command"),"command.snapshotId",l);
     const auto& value = req(c,"value","command");
-    enum_string(req(value,"kind","command.value"),"command.value.kind",{"integer","boolean"});
+    enum_string(req(value,"kind","command.value"),"command.value.kind",{"integer","boolean","float"});
+    if (value.at("kind") == "float") {
+      if (c.at("profile") != "native-dwarf-scalar-v2")
+        invalid("command.profile","exact floating-point storage requires native-dwarf-scalar-v2");
+      exact_keys(value,{"kind","bits","rawBitsHex"},"command.value");
+      const auto& bits = req(value,"bits","command.value");
+      safe_uint(bits,"command.value.bits",64);
+      if (bits != 32 && bits != 64)
+        invalid("command.value.bits","only binary32 and binary64 are supported");
+      const auto& raw = req(value,"rawBitsHex","command.value");
+      string_value(raw,"command.value.rawBitsHex",16);
+      const auto& hex = raw.get_ref<const std::string&>();
+      if (hex.size() != bits.get<unsigned>()/4 || hex.find_first_not_of("0123456789abcdef") != std::string::npos)
+        invalid("command.value.rawBitsHex","expected fixed-width lowercase hexadecimal bits without a prefix");
+      return;
+    }
     if (value.at("kind") == "integer") {
       string_value(req(value,"decimal","command.value"),"command.value.decimal",20);
       const auto& decimal = value.at("decimal").get_ref<const std::string&>();

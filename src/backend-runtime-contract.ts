@@ -452,49 +452,67 @@ export interface MemoryInterventionBaseDTO {
 }
 
 /** Typed storage edits do not claim a live C++ object or language assignment. */
-export type ScalarStorageValueDTO =
+export type ScalarStorageProfileDTO = 'native-dwarf-scalar-v1' | 'native-dwarf-scalar-v2';
+export type ScalarStorageValueV1DTO =
   | { kind: 'integer'; decimal: string; bits: 8 | 16 | 32 | 64; signed: boolean }
   | { kind: 'boolean'; value: boolean };
-export type ScalarStorageTypeDTO =
+export type ScalarStorageValueDTO = ScalarStorageValueV1DTO
+  /** Exact MSB-first bits: 8/16 lowercase hex digits, no 0x. Never a JS number.
+   *  This is numeric bit order, unlike little-endian storage.bytesHex.
+   *  Every NaN payload/signaling bit is preserved without FP evaluation. */
+  | { kind: 'float'; bits: 32 | 64; rawBitsHex: string };
+export type ScalarStorageTypeV1DTO =
   | { kind: 'integer'; byteSize: 1 | 2 | 4 | 8; bits: 8 | 16 | 32 | 64;
       signed: boolean; byteOrder: 'little'; representation: 'twos-complement' | 'unsigned-binary' }
   | { kind: 'boolean'; byteSize: 1; bits: 8; signed: null;
       byteOrder: 'little'; representation: 'boolean-01' };
-export interface ScalarStorageTargetDTO {
+export type ScalarStorageTypeDTO = ScalarStorageTypeV1DTO
+  | { kind: 'float'; byteSize: 4; bits: 32; signed: null;
+      byteOrder: 'little'; representation: 'ieee754-binary32' }
+  | { kind: 'float'; byteSize: 8; bits: 64; signed: null;
+      byteOrder: 'little'; representation: 'ieee754-binary64' };
+export interface ScalarStorageTargetDTO<T extends ScalarStorageTypeDTO = ScalarStorageTypeDTO> {
   available: boolean;
   source: 'gdb-python-dwarf';
   locator: string;
   lifetime: 'unknown';
   reason: string | null;
   typeName: string | null;
-  scalar: ScalarStorageTypeDTO | null;
+  scalar: T | null;
   addressHex: string | null;
 }
-export interface ScalarStorageSnapshotDTO {
+interface ScalarStorageSnapshotBaseDTO {
   id: string;
   type: 'scalarStorageSnapshot';
-  profile: 'native-dwarf-scalar-v1';
   point: HistoryPointDTO;
   stop: StopRefDTO;
   processInstanceId: string;
-  target: ScalarStorageTargetDTO;
-  storage: {
-    /** True means complete bytes; invalid bool representation still has bytes. */
-    available: boolean;
-    bytesHex: string | null;
-    value: ScalarStorageValueDTO | null;
-    reason: string | null;
-  };
 }
-export interface ScalarStorageInterventionDTO {
+interface ScalarStorageContentDTO<V extends ScalarStorageValueDTO> {
+  /** True means complete bytes; invalid bool representation still has bytes. */
+  available: boolean;
+  bytesHex: string | null;
+  value: V | null;
+  reason: string | null;
+}
+export type ScalarStorageSnapshotDTO = ScalarStorageSnapshotBaseDTO & (
+  | { profile: 'native-dwarf-scalar-v1'; target: ScalarStorageTargetDTO<ScalarStorageTypeV1DTO>;
+      storage: ScalarStorageContentDTO<ScalarStorageValueV1DTO> }
+  | { profile: 'native-dwarf-scalar-v2'; target: ScalarStorageTargetDTO;
+      storage: ScalarStorageContentDTO<ScalarStorageValueDTO> }
+);
+export interface ScalarStorageInterventionDTO<
+  V extends ScalarStorageValueDTO = ScalarStorageValueDTO,
+  T extends ScalarStorageTypeDTO = ScalarStorageTypeDTO> {
   snapshotId: string;
   locator: string;
-  target: ScalarStorageTargetDTO;
-  requestedValue: ScalarStorageValueDTO;
-  beforeValue: ScalarStorageValueDTO | null;
-  afterValue: ScalarStorageValueDTO | null;
+  target: ScalarStorageTargetDTO<T>;
+  requestedValue: V;
+  beforeValue: V | null;
+  afterValue: V | null;
 }
 export type MemoryInterventionDTO = MemoryInterventionBaseDTO & (
   | { profile: 'native-private-memory-v1'; scalar?: never }
-  | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO }
+  | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO<ScalarStorageValueV1DTO, ScalarStorageTypeV1DTO> }
+  | { profile: 'native-dwarf-scalar-v2'; scalar: ScalarStorageInterventionDTO }
 );

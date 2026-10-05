@@ -122,6 +122,7 @@ Json BackendService::capabilities() const {
       {"vtableInspection", "itanium-x86_64-absolute-v1"},
       {"memoryWrite", "native-private-memory-v1"}, {"interventionBranches", true},
       {"scalarStorage", "native-dwarf-scalar-v1"},
+      {"scalarStorageProfiles", {"native-dwarf-scalar-v1", "native-dwarf-scalar-v2"}},
       {"recordingProfiles", {"native", "gdb-record-full"}}, {"recordingCursor", true},
       {"limits", {{"maxOutputBytes", std::min<std::size_t>(1024u * 1024u, options_.limits.maxWireBytes / 16)},
                    {"maxHistoryBytes", options_.limits.maxWireBytes},

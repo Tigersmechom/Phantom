@@ -228,7 +228,7 @@ native storage edits and intervention lineage are implemented below (2026-10-05)
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Explicit native private-memory profile. | Typed scalar edits, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
+| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native raw-memory and typed integer/bool/float storage profiles. | Multi-range edits, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -424,3 +424,27 @@ reports require the original typed target, requested value and actual decoded
 before/after values. A partial read or invalid bool representation stays null.
 Unavailable metadata/storage never becomes an editable value. See the
 [scalar gateway](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
+
+## 2026-10-05: opt-in exact IEEE storage profile
+
+`scalarStorageProfiles` advertises v1 and `native-dwarf-scalar-v2`; the old
+`scalarStorage` capability still names v1. Optional `inspectScalarStorage.profile`
+defaults to v1. A snapshot retains its chosen profile and a write must match it.
+V1 never exposes float scalar metadata/values, including unavailable targets.
+V2 adds verified builtin float/4-byte and double/8-byte storage; int/bool support
+is unchanged. DTO profile unions preserve the narrower v1 payloads.
+
+V2 float values require `{kind:"float",bits:32|64,rawBitsHex}` with exactly
+8/16 lowercase hexadecimal digits in numeric MSB-first order and no prefix.
+The storage hex remains target memory byte order. Metadata uses
+`representation:"ieee754-binary32"|"ieee754-binary64"`, coherent width/size,
+`signed:null` and `byteOrder:"little"`. This exact storage DTO is deliberately
+separate from Observation's display float DTO; decimal/classification/host
+numeric values are not accepted in exact writes.
+
+All bit patterns preserve sign, subnormals, infinities, and quiet/signaling NaN
+payloads without FP evaluation. The shared audit decodes only observed complete
+bytes, never substitutes the requested value after partial/missing readback,
+and retains once-only handling on retries. C++ lifetime, language assignment,
+long double/extended formats, qualifiers/atomic types and record-full writes
+are not implied. See the [v2 examples and gates](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).

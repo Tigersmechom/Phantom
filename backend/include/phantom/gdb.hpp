@@ -149,10 +149,11 @@ class GdbEngine {
   // expressions, pretty-printers, inferior calls or pointer traversal.
   bool inspectVariableLayout(std::string_view locator, nlohmann::json& result,
                              GdbError& error);
-  // Conservative storage metadata for a root integral/bool locator emitted
+  // Conservative integral/bool/float/double metadata for a root locator emitted
   // at the current stop. This native x86-64 profile never evaluates caller
   // expressions or assigns through gdb.Value; the service reads/compares
-  // bytes and owns the audited write. Addresses do not establish lifetime.
+  // bytes, selects the public profile and owns the audited write. Addresses
+  // do not establish lifetime; floating-point values are never evaluated.
   bool inspectScalarStorage(std::string_view locator, nlohmann::json& result,
                             GdbError& error);
   bool readMemory(std::string_view addressHex, std::size_t byteCount,

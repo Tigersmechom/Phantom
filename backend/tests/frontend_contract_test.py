@@ -32,6 +32,8 @@ import memory_edit_integration
 import memory_edit_failure_integration
 import scalar_storage_integration
 import scalar_storage_failure_integration
+import float_storage_integration
+import float_storage_failure_integration
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -119,6 +121,9 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
     if capabilities.get("scalarStorage") == "native-dwarf-scalar-v1":
         scenarios.append((scalar_storage_integration, []))
         scenarios.append((scalar_storage_failure_integration, []))
+    if "native-dwarf-scalar-v2" in capabilities.get("scalarStorageProfiles", []):
+        scenarios.append((float_storage_integration, []))
+        scenarios.append((float_storage_failure_integration, []))
     if capabilities.get("memoryWrite") == "native-private-memory-v1":
         scenarios.append((memory_edit_integration, []))
         scenarios.append((memory_edit_failure_integration, []))
@@ -154,6 +159,11 @@ def typecheck_source(traffic: list[tuple[str, dict]]) -> tuple[str, dict[str, in
         '  & { kind: "connectResult"; session: SessionRefDTO | null };',
         'type ConnectRequest = Parameters<DebugBackendAdapter["connect"]>[0]',
         '  & { kind: "connect" };',
+        '// Profile discrimination must reject exact floats on legacy writes.',
+        '// @ts-expect-error float storage is v2-only',
+        'const legacyFloat = {kind:"writeScalarStorage",profile:"native-dwarf-scalar-v1",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:"80000000"}} satisfies BackendRequestDTO["command"];',
+        '// @ts-expect-error a host number cannot preserve NaN payload/signaling bits',
+        'const numericFloat = {kind:"writeScalarStorage",profile:"native-dwarf-scalar-v2",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:0}} satisfies BackendRequestDTO["command"];',
     ]
     counts: dict[str, int] = {}
     for index, (direction, frame) in enumerate(traffic):

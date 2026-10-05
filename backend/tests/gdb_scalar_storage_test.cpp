@@ -168,7 +168,7 @@ finally:
   bad = valid; bad["scalar"]["byteOrder"] = "big"; reject(bad, "unsupported byte order");
   bad = valid; bad["scalar"]["representation"] = "unsigned-binary"; reject(bad, "signedness/representation inconsistency");
   bad = valid; bad["scalar"]["representation"] = "sign-magnitude"; reject(bad, "unknown integer representation");
-  bad = valid; bad["scalar"]["kind"] = "float"; reject(bad, "unknown scalar kind");
+  bad = valid; bad["scalar"]["kind"] = "decimal-float"; reject(bad, "unknown scalar kind");
   bad = valid; bad["scalar"] = nullptr; reject(bad, "available without type evidence");
   bad = valid; bad["reason"] = "optimized-out"; reject(bad, "available with rejection reason");
   bad = valid; bad["available"] = false; reject(bad, "unavailable with memory address");
@@ -184,6 +184,26 @@ finally:
     Json result;
     require(!engine.inspectScalarStorage("frame:0:s32", result, error) && error.code == "READ_FAILED" &&
             result.is_null() && engine.live(), "accepted malformed metadata framing");
+  }
+  for (const unsigned bytes : {4U, 8U}) {
+    auto floating = valid;
+    floating["scalar"] = {{"kind", "float"}, {"byteSize", bytes}, {"bits", bytes * 8}, {"signed", nullptr},
+                          {"byteOrder", "little"}, {"representation", bytes == 4 ? "ieee754-binary32" : "ieee754-binary64"}};
+    response(floating);
+    require(inspect(engine, "s32") == floating, "valid float metadata rejected by response schema");
+    bad = floating; bad["scalar"]["signed"] = true; reject(bad, "float declares integer signedness");
+    bad = floating; bad["scalar"]["signed"] = false; reject(bad, "float declares unsigned integer semantics");
+    bad = floating; bad["scalar"]["representation"] = bytes == 4 ? "ieee754-binary64" : "ieee754-binary32";
+    reject(bad, "mismatched IEEE float width");
+    bad = floating; bad["scalar"]["representation"] = "x87-extended"; reject(bad, "unsupported float representation");
+    bad = floating; bad["scalar"]["representation"] = "unsigned-binary"; reject(bad, "float has integer representation");
+    bad = floating; bad["scalar"]["byteSize"] = bytes / 2; reject(bad, "inconsistent float byte size");
+    bad = floating; bad["scalar"]["bits"] = bytes * 8.0; reject(bad, "float metadata width is a JSON float");
+    bad = floating; bad["scalar"]["byteOrder"] = "big"; reject(bad, "big-endian float");
+    bad = floating; bad["scalar"]["byteSize"] = 2; bad["scalar"]["bits"] = 16;
+    bad["scalar"]["representation"] = "ieee754-binary16"; reject(bad, "unsupported half precision");
+    bad = floating; bad["scalar"]["byteSize"] = 16; bad["scalar"]["bits"] = 128;
+    bad["scalar"]["representation"] = "ieee754-binary128"; reject(bad, "unsupported quad precision");
   }
   bad = valid;
   bad["available"] = false; bad["addressHex"] = nullptr; bad["scalar"] = nullptr;
@@ -224,7 +244,7 @@ int main(int argc, char** argv) try {
   breakpoint(engine, request, "SCALAR_READY");
   resume(engine, stop);
   Json beforeRegisters, afterRegisters;
-  require(engine.readRegisters({"rip", "rsp", "rbp"}, beforeRegisters, error), "cannot read baseline registers");
+  require(engine.readRegisters({"rip", "rsp", "rbp", "mxcsr", "fctrl", "fstat"}, beforeRegisters, error), "cannot read baseline registers");
   const auto beforeInput = stop.input;
   const auto beforeLocation = stop.location;
   const auto beforeOutput = stop.stdoutSnapshot;
@@ -258,8 +278,25 @@ int main(int argc, char** argv) try {
   require(flag.at("available") == true && flag.at("scalar") == Json({{"kind", "boolean"}, {"byteSize", 1},
       {"bits", 8}, {"signed", nullptr}, {"byteOrder", "little"}, {"representation", "boolean-01"}}), "bool encoding wrong");
   require(inspect(engine, "character").at("available") == true, "plain char unsupported");
+  for (const auto* name : {"single", "floatAlias", "nan32", "floating", "doubleAlias", "nan64"}) {
+    const unsigned bytes = std::string_view(name) == "single" || std::string_view(name) == "floatAlias" ||
+        std::string_view(name) == "nan32" ? 4 : 8;
+    const auto target = inspect(engine, name);
+    require(target.at("available") == true && target.at("reason").is_null() && target.at("scalar") ==
+        Json({{"kind", "float"}, {"byteSize", bytes}, {"bits", bytes * 8}, {"signed", nullptr},
+              {"byteOrder", "little"}, {"representation", bytes == 4 ? "ieee754-binary32" : "ieee754-binary64"}}),
+        "wrong floating-point type evidence: " + target.dump());
+    if (std::string_view(name).starts_with("nan")) {
+      Json memory;
+      const auto address = target.at("addressHex").get<std::string>();
+      require(engine.readMemory(address, bytes, memory, error) && memory.at("unreadableBytes") == 0 &&
+          memory.at("bytesBase64") == (bytes == 4 ? "IwGAfw==" : "IwEAAAAA8H8="),
+          "inspection altered signaling NaN sign/quiet bit/payload");
+    }
+  }
   for (const auto name : {"constant", "changing", "both", "atomicValue", "reference", "rvalueReference",
-                           "pointer", "array", "floating", "enumeration", "wide", "hostile"}) {
+                           "pointer", "array", "enumeration", "wide", "hostile", "floatConstant", "doubleChanging",
+                           "floatBoth", "extended", "quad", "atomicFloat", "atomicDouble", "floatReference"}) {
     const auto target = inspect(engine, name);
     require(target.at("available") == false && target.at("addressHex").is_null() && target.at("reason").is_string(),
             "unsupported type gained writable storage: " + target.dump());
@@ -268,6 +305,16 @@ int main(int argc, char** argv) try {
     const auto atomic = inspect(engine, "cAtomic");
     require(atomic.at("available") == false && atomic.at("reason") == "scalar-representation-unsupported",
             "_Atomic int was confused with ordinary int: " + atomic.dump());
+  }
+  for (const auto* name : {"cAtomicFloat", "cAtomicDouble"}) {
+    if (!hasVariable(stop, name)) continue;
+    const auto atomic = inspect(engine, name);
+    require(atomic.at("available") == false && atomic.at("reason") == "scalar-representation-unsupported",
+            "_Atomic float/double was confused with builtin floating storage: " + atomic.dump());
+  }
+  if (hasVariable(stop, "half")) {
+    const auto half = inspect(engine, "half");
+    require(half.at("available") == false && half.at("reason") == "scalar-size-unsupported", "half-precision became supported float");
   }
   for (const auto locator : {"", "s32", "frame:00:s32", "frame:0:s32[0]", "frame:0:s32()", "frame:0:*pointer",
                              "frame:0:s32\n-exec-continue", "frame:4096:s32", "frame:-1:s32"}) {
@@ -278,7 +325,7 @@ int main(int argc, char** argv) try {
   require(engine.refreshStoppedSnapshot(stop, error), "cannot refresh scalar snapshot");
   require(stop.input == beforeInput && stop.location == beforeLocation && stop.stdoutSnapshot == beforeOutput,
           "metadata inspection delivered input or advanced execution");
-  require(engine.readRegisters({"rip", "rsp", "rbp"}, afterRegisters, error) && beforeRegisters == afterRegisters,
+  require(engine.readRegisters({"rip", "rsp", "rbp", "mxcsr", "fctrl", "fstat"}, afterRegisters, error) && beforeRegisters == afterRegisters,
           "metadata inspection changed registers");
 
   breakpoint(engine, request, "SCALAR_INNER");

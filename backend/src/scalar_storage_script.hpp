@@ -38,9 +38,9 @@ def _phantom_scalar_storage(level, name, locator):
             result['typeName'] = label.encode('utf-8')[:256].decode('utf-8', 'ignore')
             size = typ.sizeof
             code = typ.code
-            if code not in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_CHAR, gdb.TYPE_CODE_BOOL):
+            if code not in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_CHAR, gdb.TYPE_CODE_BOOL, gdb.TYPE_CODE_FLT):
                 reject('scalar-type-unsupported')
-            elif size not in (1, 2, 4, 8) or (code == gdb.TYPE_CODE_BOOL and size != 1):
+            elif size not in (1, 2, 4, 8) or (code == gdb.TYPE_CODE_BOOL and size != 1) or (code == gdb.TYPE_CODE_FLT and size not in (4, 8)):
                 reject('scalar-size-unsupported')
             elif typ.dynamic:
                 reject('dynamic-type-unsupported')
@@ -51,9 +51,12 @@ def _phantom_scalar_storage(level, name, locator):
                 # remove _Atomic on GDB 15. An atomic int has INT code and
                 # name "int". Require equality with a built-in keyword type,
                 # not a spelling/size guess or a user-supplied type name.
-                # This also excludes extended integers with padding or a
-                # representation outside this x86-64 profile.
-                builtins = ('bool', 'char', 'signed char', 'unsigned char',
+                # This also excludes extended integers/floats, long double
+                # (even with an eight-byte compiler ABI), and representations
+                # outside this x86-64 profile. Matching FLT code and size alone
+                # does not establish a supported binary32/binary64 type.
+                builtins = ('float', 'double') if code == gdb.TYPE_CODE_FLT else (
+                            'bool', 'char', 'signed char', 'unsigned char',
                             'short', 'unsigned short', 'int', 'unsigned int',
                             'long', 'unsigned long', 'long long',
                             'unsigned long long', 'wchar_t', 'char8_t',
@@ -61,23 +64,27 @@ def _phantom_scalar_storage(level, name, locator):
                 builtin = False
                 for keyword in builtins:
                     try:
-                        if typ == gdb.lookup_type(keyword):
+                        if typ == gdb.lookup_type(keyword) and (code != gdb.TYPE_CODE_FLT or
+                                size == {'float': 4, 'double': 8}[keyword]):
                             builtin = True
                             break
                     except gdb.error:
                         pass
                 if not builtin:
                     reject('scalar-representation-unsupported')
-                elif not hasattr(typ, 'is_signed'):
+                elif code != gdb.TYPE_CODE_FLT and not hasattr(typ, 'is_signed'):
                     reject('signedness-unavailable')
                 else:
-                    signed = typ.is_signed
-                    result['scalar'] = dict(kind='boolean' if code == gdb.TYPE_CODE_BOOL else 'integer',
-                                            byteSize=int(size), bits=int(size) * 8,
-                                            signed=None if code == gdb.TYPE_CODE_BOOL else bool(signed),
-                                            byteOrder='little',
-                                            representation='boolean-01' if code == gdb.TYPE_CODE_BOOL else
-                                                'twos-complement' if signed else 'unsigned-binary')
+                    if code == gdb.TYPE_CODE_FLT:
+                        kind, signed = 'float', None
+                        representation = 'ieee754-binary32' if size == 4 else 'ieee754-binary64'
+                    elif code == gdb.TYPE_CODE_BOOL:
+                        kind, signed, representation = 'boolean', None, 'boolean-01'
+                    else:
+                        kind, signed = 'integer', bool(typ.is_signed)
+                        representation = 'twos-complement' if signed else 'unsigned-binary'
+                    result['scalar'] = dict(kind=kind, byteSize=int(size), bits=int(size) * 8,
+                                            signed=signed, byteOrder='little', representation=representation)
                     # Availability predicates can fetch lazy values. Only a
                     # supported scalar of at most eight bytes reaches them.
                     if value.is_optimized_out:

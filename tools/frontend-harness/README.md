@@ -80,5 +80,8 @@ state и не считать пропущенную команду успешн�
 целые 8/16/32/64 бит и bool с проверкой настоящего GDB-типа, адреса и исходных
 байтов. Начните с inspection текущего locator и используйте полученный
 snapshotId; пример — в [контракте](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
+Явный `profile:"native-dwarf-scalar-v2"` в inspection и записи добавляет
+`float`/`double`: `rawBitsHex` хранит точный битовый рисунок, включая знак нуля
+и payload NaN. Доступность профиля — в `capabilities.scalarStorageProfiles`.
 Кнопок этой операции в стенде пока нет. Это typed storage-профиль с lifetime
 unknown; старый `writeVariable` остаётся выключен.

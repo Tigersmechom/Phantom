@@ -102,7 +102,9 @@ protocol capabilities.
   доступны через протокол. Только один остановленный поток, без record-full.
   [Контракт и границы](../docs/INSPECTION_GATEWAYS.md#checked-native-memory-interventions).
 - `inspectScalarStorage` / `writeScalarStorage` связывают проверенные GDB-типы
-  целых и bool с точными storage bytes и общей историей вмешательств. Тип,
+  целых и bool с точными storage bytes и общей историей вмешательств. Явный
+  профиль `native-dwarf-scalar-v2` добавляет float/double через точные биты,
+  включая signed zero и NaN payload без преобразований в число. Тип,
   адрес и исходные байты проверяются повторно; lifetime остаётся unknown.
   [Типизированный профиль](../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,

@@ -2552,6 +2552,9 @@ bool GdbEngine::inspectScalarStorage(std::string_view locator, nlohmann::json& r
       } else if (scalar.at("kind") == "integer") {
         if (!scalar.at("signed").is_boolean() || scalar.at("representation") !=
             (scalar.at("signed").get<bool>() ? "twos-complement" : "unsigned-binary")) return malformed();
+      } else if (scalar.at("kind") == "float") {
+        if ((size != 4 && size != 8) || !scalar.at("signed").is_null() ||
+            scalar.at("representation") != (size == 4 ? "ieee754-binary32" : "ieee754-binary64")) return malformed();
       } else return malformed();
     }
     if (target.at("available").get<bool>()) {

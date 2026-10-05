@@ -62,6 +62,8 @@ std::vector<Json> BackendService::handleScalarStorage(const Json& request) {
   if (kind == "writeScalarStorage") {
     const auto* saved = find(command.at("snapshotId").get<std::string>());
     if (!saved) return {errorResponse(request,"HISTORY_EVICTED","scalar storage snapshot is unavailable or evicted")};
+    if (saved->at("profile") != command.at("profile"))
+      return {errorResponse(request,"INVALID_REQUEST","scalar storage profile must match the inspected snapshot")};
     if (saved->at("point") != liveObservation_.at("point") || saved->at("stop") != liveObservation_.at("stop") ||
         saved->at("processInstanceId") != processInstanceId_)
       return {errorResponse(request,"STALE_CONTEXT","scalar storage snapshot does not belong to the current stop")};
@@ -88,6 +90,14 @@ std::vector<Json> BackendService::handleScalarStorage(const Json& request) {
   Json target; GdbError error;
   if (!engine_->inspectScalarStorage(command.at("locator").get<std::string>(),target,error))
     return engineError(request,error);
+  const auto profile = command.value("profile",std::string("native-dwarf-scalar-v1"));
+  // Legacy requests must never receive float metadata/values outside their
+  // advertised union, even for an unavailable optimized/register-only float.
+  if (profile == "native-dwarf-scalar-v1" && target.at("scalar").is_object() &&
+      target.at("scalar").at("kind") == "float") {
+    target["available"] = false; target["scalar"] = nullptr;
+    target["addressHex"] = nullptr; target["reason"] = "scalar-type-unsupported";
+  }
   Json storage = {{"available",false},{"bytesHex",nullptr},{"value",nullptr},{"reason","unsupported-target"}};
   if (target.at("available").get<bool>()) {
     const auto pid = engine_->inferiorPid();
@@ -123,7 +133,7 @@ std::vector<Json> BackendService::handleScalarStorage(const Json& request) {
     if (!completeEqualMaps(maps,readLinuxMemoryMap(*pid)))
       return {errorResponse(request,"READ_FAILED","memory mappings changed during scalar storage inspection")};
   }
-  Json snapshot = {{"type","scalarStorageSnapshot"},{"profile","native-dwarf-scalar-v1"},
+  Json snapshot = {{"type","scalarStorageSnapshot"},{"profile",profile},
     {"point",liveObservation_.at("point")},{"stop",liveObservation_.at("stop")},
     {"processInstanceId",processInstanceId_},{"target",std::move(target)},{"storage",std::move(storage)}};
   if (snapshot.dump().size()+1024 > options_.limits.maxWireBytes)

@@ -1117,7 +1117,8 @@ Audit хранит ID и metadata исходного typed snapshot, ожида�
 Старая история и typed snapshots неизменны; raw/typed правки используют общую
 ветвь происхождения и ledger. Метаданные и запись не доставляют stdin/EOF.
 
-Следующие отдельные задачи P5: exact float32/64 storage, согласованные
+Exact float32/64 storage реализован следующим срезом (§20.11). Следующие
+отдельные задачи P5: согласованные
 многоэлементные изменения с видимыми частичными результатами, bounded register/
 runtime interventions и совместимое с recorder ветвление. Сопоставление storage
 с объектным lifetime относится к P2; этот срез не объявляет P2/P5 завершёнными.
@@ -1131,3 +1132,50 @@ register-only, nested frames/shadowing, повреждённые GDB metadata, �
 readback, смерть GDB, dedup после eviction и сохранность stdin. В harness
 исправлена идентичность committed stdout: переключение ветвей одного процесса
 не уменьшает уже сброшенный вывод; pending меняется вместе с выбранным снимком.
+
+### 20.11. Точные биты float/double — 05.10.2026
+
+В `capabilities.scalarStorageProfiles` добавлен `native-dwarf-scalar-v2`.
+Он выбирается явно при `inspectScalarStorage`, а затем используется в
+`writeScalarStorage` с тем же snapshotId. Профиль записи обязан совпадать с
+профилем снимка. Запросы без профиля остаются v1 и не получают float metadata
+или values; прежняя capability `scalarStorage` сохранена. В TypeScript v1/v2
+разделены discriminated unions для команд, снимков и intervention audit.
+
+Новый профиль поддерживает прежние целые/bool и точное storage обычных
+`float`/`double` по подтверждённым x86-64 GDB metadata. Только четыре/восемь
+байтов и равенство builtin-типу; одного размера/имени недостаточно.
+`long double`, в том числе восьмибайтовый при `-mlong-double-64`, half/quad,
+const/volatile/_Atomic, ссылки, указатели и register-only storage не получают
+разрешения на запись. Lifetime по-прежнему unknown.
+
+Значение: `{kind:"float",bits:32|64,rawBitsHex:"..."}`. Ровно 8/16 строчных
+hex-цифр без `0x`, старшие биты первыми. Это отличается от little-endian
+`storage.bytesHex`: float32 `-0` имеет bits `80000000`, bytes `00000080`.
+Кодек не создаёт host float/double и не выполняет арифметику inferior;
+сохраняются subnormal, infinity, знак и payload quiet/signaling NaN.
+Десятичные строки, JSON number, classification и автоматические преобразования
+ширины не принимаются. Побитовое равенство даёт no-op даже для NaN; смена
+знака нуля или payload создаёт обычное вмешательство с новой ветвью/stop.
+
+Используется общий проверенный путь сравнения/записи/readback/аудита: полные
+наблюдаемые биты декодируются в before/afterValue, частичное чтение оставляет
+null, частичная запись показывает фактически прочитанный результат. Повтор
+запроса не пишет повторно после смены stop или смерти GDB. Inspection и
+refresh не сбрасывают signaling NaN в памяти, не исполняют код и не меняют
+floating-point control/status registers.
+
+Этот срез доступен через API; кнопки редактирования в harness не добавлены.
+Контракт с примером: [INSPECTION_GATEWAYS.md](INSPECTION_GATEWAYS.md#typed-scalar-storage).
+Далее P5: многоэлементные изменения с явными частичными результатами,
+ограниченные register/runtime interventions, ветвление с recorder. Полный
+P5 и доказательство объектного lifetime остаются отдельными задачами.
+
+Проверки 20.11: **43/43 Debug и 43/43 ASan/UBSan**, 5293 реальных сообщений
+через TypeScript 5.9.3, пять harness-проверок и четыре Node contract-теста.
+Кодек проверен на 42 заданных float bit patterns и 4096 случайных roundtrip,
+без host float arithmetic. Интеграционные сценарии покрывают v1/v2, границы
+binary32/64, различные NaN payload/sign, no-op, старые снимки и dedup, а также
+пять сбоев реального MI: ошибочный ack, partial write, потерю readback и смерть
+GDB во время записи/refresh. Отдельно проверен ABI `-mlong-double-64`: такой
+long double остаётся недоступен для typed записи.

@@ -1,9 +1,14 @@
 #include <atomic>
+#include <bit>
 #include <cstdint>
 
 using SignedAlias = std::int32_t;
 using ConstAlias = const SignedAlias;
 using VolatileAlias = volatile SignedAlias;
+using FloatAlias = float;
+using DoubleAlias = double;
+using ConstFloatAlias = const FloatAlias;
+using VolatileDoubleAlias = volatile DoubleAlias;
 enum class EnumValue : unsigned short { first = 3 };
 struct HostileScalar {
   static int calls;
@@ -43,6 +48,26 @@ int main() {
   int* pointer = &s32;
   int array[2] = {1, 2};
   double floating = 1.5;
+  float single = -0.0f;
+  FloatAlias floatAlias = 1.25f;
+  DoubleAlias doubleAlias = -2.5;
+  ConstFloatAlias floatConstant = 4.0f;
+  VolatileDoubleAlias doubleChanging = 5.0;
+  const volatile float floatBoth = 6.0f;
+  long double extended = 7.0L;
+  __float128 quad = 8;
+#if defined(__FLT16_MANT_DIG__)
+  _Float16 half = 9;
+#endif
+  std::atomic<float> atomicFloat{10.0f};
+  std::atomic<double> atomicDouble{11.0};
+#ifdef __clang__
+  _Atomic(float) cAtomicFloat = 12.0f;
+  _Atomic(double) cAtomicDouble = 13.0;
+#endif
+  float& floatReference = single;
+  float nan32 = std::bit_cast<float>(std::uint32_t{0x7f800123});
+  double nan64 = std::bit_cast<double>(std::uint64_t{0x7ff0000000000123});
   EnumValue enumeration = EnumValue::first;
   __int128 wide = 1;
   HostileScalar hostile{13};

@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <utility>
 
 namespace phantom {
 namespace {
 using Json = nlohmann::json;
 struct Type {
   bool boolean = false;
+  bool floating = false;
   bool isSigned = false;
   unsigned bits = 0;
   std::size_t bytes = 0;
@@ -42,6 +44,11 @@ std::optional<Type> parseType(const Json& scalar) {
     if (type.bits != 8 || !scalar.at("signed").is_null() ||
         scalar.at("representation") != "boolean-01") return std::nullopt;
     type.boolean = true;
+  } else if (scalar.at("kind") == "float") {
+    if ((type.bits != 32 && type.bits != 64) || !scalar.at("signed").is_null() ||
+        scalar.at("representation") != (type.bits == 32 ? "ieee754-binary32" : "ieee754-binary64"))
+      return std::nullopt;
+    type.floating = true;
   } else if (scalar.at("kind") == "integer") {
     if (!scalar.at("signed").is_boolean()) return std::nullopt;
     type.isSigned = scalar.at("signed").get<bool>();
@@ -61,7 +68,7 @@ bool encode(const Json& scalar, const Json& value, std::string& raw, std::string
   if (!value.is_object() || !value.contains("kind") || !value.at("kind").is_string()) {
     reason = "invalid-value"; return false;
   }
-  if (value.at("kind") != (type->boolean ? "boolean" : "integer")) {
+  if (value.at("kind") != (type->boolean ? "boolean" : type->floating ? "float" : "integer")) {
     reason = "type-mismatch"; return false;
   }
   if (type->boolean) {
@@ -69,6 +76,25 @@ bool encode(const Json& scalar, const Json& value, std::string& raw, std::string
       reason = "invalid-value"; return false;
     }
     raw.assign(1, value.at("value").get<bool>() ? '\1' : '\0');
+    return true;
+  }
+  if (type->floating) {
+    if (!exactKeys(value, {"kind", "bits", "rawBitsHex"}) || !value.at("rawBitsHex").is_string()) {
+      reason = "invalid-value"; return false;
+    }
+    if (!integerIs(value.at("bits"), type->bits)) {
+      reason = "type-mismatch"; return false;
+    }
+    const auto& text = value.at("rawBitsHex").get_ref<const std::string&>();
+    if (text.size() != type->bytes * 2 || text.find_first_not_of("0123456789abcdef") != std::string::npos) {
+      reason = "invalid-value"; return false;
+    }
+    const auto nibble = [](char digit) -> unsigned { return digit <= '9' ? digit - '0' : digit - 'a' + 10; };
+    raw.resize(type->bytes);
+    for (std::size_t i = 0; i < type->bytes; ++i) {
+      const auto offset = (type->bytes - i - 1) * 2;
+      raw[i] = static_cast<char>((nibble(text[offset]) << 4) | nibble(text[offset + 1]));
+    }
     return true;
   }
   if (!exactKeys(value, {"kind", "decimal", "bits", "signed"}) ||
@@ -120,6 +146,16 @@ std::optional<Json> decodeScalarStorage(const Json& scalar, std::string_view raw
   try {
     const auto type = parseType(scalar);
     if (!type || raw.size() != type->bytes) return std::nullopt;
+    if (type->floating) {
+      constexpr char digits[] = "0123456789abcdef";
+      std::string bits(type->bytes * 2, '0');
+      for (std::size_t i = 0; i < type->bytes; ++i) {
+        const auto byte = static_cast<unsigned char>(raw[type->bytes - i - 1]);
+        bits[i * 2] = digits[byte >> 4];
+        bits[i * 2 + 1] = digits[byte & 15];
+      }
+      return Json{{"kind", "float"}, {"bits", type->bits}, {"rawBitsHex", std::move(bits)}};
+    }
     std::uint64_t encoded = 0;
     for (std::size_t i = 0; i < raw.size(); ++i)
       encoded |= std::uint64_t{static_cast<unsigned char>(raw[i])} << (i * 8);

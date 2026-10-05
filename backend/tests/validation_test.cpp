@@ -284,6 +284,41 @@ int main() {
   assert(validation_fails(gateway));
   gateway["command"] = scalarCommand; gateway["command"]["addressHex"] = "0x1234";
   assert(validation_fails(gateway));
+  for (const auto* profile : {"native-dwarf-scalar-v1","native-dwarf-scalar-v2"}) {
+    gateway["command"] = {{"kind","inspectScalarStorage"},{"locator","frame:0:value"},{"profile",profile}};
+    assert(!validation_fails(gateway));
+    gateway["command"] = scalarCommand; gateway["command"]["profile"] = profile;
+    assert(!validation_fails(gateway));
+  }
+  for (const auto& profile : Json::array({nullptr,true,2,"auto","native-dwarf-scalar-v3"})) {
+    gateway["command"] = {{"kind","inspectScalarStorage"},{"locator","frame:0:value"},{"profile",profile}};
+    assert(validation_fails(gateway));
+  }
+  const Json floatCommand = {{"kind","writeScalarStorage"},{"profile","native-dwarf-scalar-v2"},
+    {"snapshotId","scalar-1"},{"value",{{"kind","float"},{"bits",32},{"rawBitsHex","80000000"}}}};
+  gateway["command"] = floatCommand;
+  assert(!validation_fails(gateway));
+  gateway["command"]["value"] = {{"kind","float"},{"bits",64},{"rawBitsHex","7ff0000000000001"}};
+  assert(!validation_fails(gateway));
+  gateway["command"]["profile"] = "native-dwarf-scalar-v1";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  for (const auto& bits : Json::array({0,16,128,32.0,true,"32",nullptr})) {
+    gateway["command"] = floatCommand; gateway["command"]["value"]["bits"] = bits;
+    assert(validation_fails(gateway));
+  }
+  for (const auto& raw : Json::array({"","8000000","800000000","0000000080000000","0x80000000","7F800001",
+      "7g800001","8000000 ","8000000\n","８0000000",80000000,nullptr})) {
+    gateway["command"] = floatCommand; gateway["command"]["value"]["rawBitsHex"] = raw;
+    assert(validation_fails(gateway));
+  }
+  for (const auto* key : {"text","classification","decimal","signed","addressHex"}) {
+    gateway["command"] = floatCommand; gateway["command"]["value"][key] = "0";
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"kind","bits","rawBitsHex"}) {
+    gateway["command"] = floatCommand; gateway["command"]["value"].erase(key);
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
   gateway.erase("expectedStop"); gateway["command"] = {{"kind","readScalarStorage"},{"snapshotId","scalar-1"}};
   assert(!validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before

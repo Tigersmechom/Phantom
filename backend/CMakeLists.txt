@@ -124,7 +124,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(${module} PROPERTIES TIMEOUT 15)
   endforeach()
-  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure memory_edit memory_edit_failure scalar_storage scalar_storage_failure output_journal recorder_probe recording layout vtable)
+  foreach(integration IN ITEMS address_profile advanced_gateway trace_failure memory_edit memory_edit_failure scalar_storage scalar_storage_failure float_storage float_storage_failure output_journal recorder_probe recording layout vtable)
     add_test(NAME ${integration}-integration COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/${integration}_integration.py" "$<TARGET_FILE:phantom-backend>")
     set_tests_properties(${integration}-integration PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
