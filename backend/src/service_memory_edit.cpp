@@ -83,10 +83,28 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   }
   if (!liveObservation_.is_object() || liveState_.value("phase","") != "stopped")
     return {errorResponse(request,"STALE_CONTEXT","memory edits require a stopped native session, outside an input wait")};
+  const bool scalarBatch = preparedScalar.is_object() && preparedScalar.contains("scalars") &&
+      preparedScalar.at("scalars").is_array();
+  const auto reservationBytes = scalarBatch ? scalarBatchInterventionReservation : interventionReservation;
   const auto budget = std::min<std::size_t>(4 * 1024 * 1024, options_.limits.maxWireBytes);
-  if (interventions_.size() >= maxInterventions || interventions_.size() >= budget/interventionReservation ||
-      request.dump().size() > 4096)
+  std::size_t reservedBytes = 0;
+  for (const auto& saved : interventions_) {
+    if (saved.reservationBytes > budget-reservedBytes)
+      return {errorResponse(request,"LIMIT_EXCEEDED","intervention audit retention budget is exhausted")};
+    reservedBytes += saved.reservationBytes;
+  }
+  if (interventions_.size() >= maxInterventions || reservationBytes > budget-reservedBytes || request.dump().size() > 4096)
     return {errorResponse(request,"LIMIT_EXCEEDED","intervention audit retention budget is exhausted or request identity is too large")};
+  if (scalarBatch) {
+    // Before any mutation, leave room for a conservatively bounded raw batch
+    // report (24 KiB), original request + response envelope (12 KiB), and the
+    // four independently decoded scalar phases (4 KiB). Metadata names can
+    // require JSON escaping, so account for their serialized size explicitly.
+    constexpr std::size_t reportAndEnvelopeAllowance = 40960;
+    if (reservationBytes < reportAndEnvelopeAllowance ||
+        preparedScalar.at("scalars").dump().size() > reservationBytes-reportAndEnvelopeAllowance)
+      return {errorResponse(request,"LIMIT_EXCEEDED","typed batch metadata exceeds the intervention audit reservation")};
+  }
   const bool batch = kind == "writeMemoryBatch";
   std::vector<MemoryBatchEdit> edits;
   const auto append = [&](const Json& item) {
@@ -160,6 +178,20 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
     return {rawBase64(result.at("bytesBase64")),engine_->live(),{}, {}};
   };
   const auto writer = [&](std::uint64_t start, std::string_view raw) -> MemoryEditWrite {
+    if (scalarBatch) {
+      // A previous write can change storage-location or unwind evidence used
+      // by a later locator. Resolve that locator again immediately before its
+      // mutation, even though every target passed the initial batch preflight.
+      const auto edit = std::find_if(edits.begin(),edits.end(),[&](const auto& candidate) { return candidate.address == start; });
+      if (edit == edits.end()) return {false,false,engine_->live(),"WRITE_FAILED","typed batch range is unavailable"};
+      const auto index = static_cast<std::size_t>(edit-edits.begin());
+      const auto& scalar = preparedScalar.at("scalars").at(index);
+      Json fresh; GdbError metadataError;
+      if (!engine_->inspectScalarStorage(scalar.at("locator").get<std::string>(),fresh,metadataError))
+        return {false,false,engine_->live(),metadataError.code.empty() ? "READ_FAILED" : metadataError.code,metadataError.message};
+      if (fresh != scalar.at("target"))
+        return {false,false,engine_->live(),"STALE_CONTEXT","scalar type or storage metadata changed before write"};
+    }
     if (!sameCompleteMaps(maps,readLinuxMemoryMap(*pid)))
       return {false,false,engine_->live(),"WRITE_FAILED","memory mappings changed before write"};
     bool attempted = false; GdbError writeError;
@@ -168,7 +200,24 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
   };
   audit["report"] = batch ? compareAndWriteMemoryBatch(edits,reader,writer) :
       compareAndWriteMemory(edits.front().address,edits.front().expectedRaw,edits.front().replacementRaw,reader,writer);
-  if (preparedScalar.is_object()) {
+  if (scalarBatch) {
+    audit["scalars"] = preparedScalar.at("scalars");
+    for (std::size_t index = 0; index < audit.at("scalars").size(); ++index) {
+      auto& scalar = audit["scalars"][index];
+      const auto& type = scalar.at("target").at("scalar");
+      const auto& item = audit.at("report").at("items").at(index);
+      const auto decode = [&](const Json& phase, const char* bytesKey) -> Json {
+        if (!phase.is_object()) return nullptr;
+        const auto& bytes = phase.at(bytesKey);
+        const auto value = bytes.is_string() ? decodeScalarStorage(type,rawHex(bytes.get<std::string>())) : std::nullopt;
+        return value ? *value : Json(nullptr);
+      };
+      scalar["preflightValue"] = decode(item.at("preflight"),"bytesHex");
+      scalar["beforeValue"] = decode(item.at("execution"),"beforeBytesHex");
+      scalar["afterValue"] = decode(item.at("execution"),"afterBytesHex");
+      scalar["finalValue"] = decode(item.at("final"),"bytesHex");
+    }
+  } else if (preparedScalar.is_object()) {
     audit["scalar"] = preparedScalar.at("scalar");
     const auto& type = audit.at("scalar").at("target").at("scalar");
     for (const auto* phase : {"before", "after"}) {
@@ -212,7 +261,7 @@ std::vector<Json> BackendService::handleMemoryIntervention(const Json& request, 
     publishFailedState(events,request);
   }
   auto response = okResponse(request,{{"kind","memoryIntervention"},{"intervention",audit},{"throughSequence",sequence_}});
-  interventions_.push_back({request,response});
+  interventions_.push_back({request,response,reservationBytes});
   std::vector<Json> frames{std::move(response)};
   frames.insert(frames.end(),std::make_move_iterator(events.begin()),std::make_move_iterator(events.end()));
   return frames;

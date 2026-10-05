@@ -1,4 +1,4 @@
-import type { MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
+import type { ScalarStorageBatchEditDTO, MemoryBatchEditDTO, ScalarStorageProfileDTO, ScalarStorageSnapshotDTO, ScalarStorageValueV1DTO, ScalarStorageValueDTO, MemoryInterventionDTO, InterventionBranchDTO, VtableSnapshotDTO, ModuleSymbolsSnapshotDTO, VariableLayoutSnapshotDTO, ModuleSnapshotDTO, RecorderProbeDTO, RecordingProfileDTO, RecordingStatusDTO } from './backend-runtime-contract';
 export type * from './backend-runtime-contract';
 
 /** Debugger protocol DTOs. This file does not implement or expose an IPC bridge. */
@@ -572,6 +572,8 @@ export interface ResourceLimitsDTO {
   maxMemoryWriteBytes: number;
   maxMemoryBatchRanges?: number;
   maxMemoryBatchBytes?: number;
+  maxScalarStorageBatchItems?: number;
+  maxScalarStorageBatchBytes?: number;
   maxMemoryInterventions: number;
   maxInterventionStoreBytes: number;
   commandTimeoutMs: number;
@@ -592,6 +594,7 @@ export interface BackendCapabilitiesDTO {
   scalarStorage: 'native-dwarf-scalar-v1' | 'none';
   /** Absent on legacy servers; float bits require an explicit v2 inspection. */
   scalarStorageProfiles?: ScalarStorageProfileDTO[];
+  scalarStorageBatch?: 'native-dwarf-scalar-batch-v1' | 'none';
   interventionBranches: boolean;
   inputTracking: InputStateDTO['tracking'];
   interactiveInput: boolean;
@@ -653,6 +656,7 @@ export type BackendCommandDTO =
   | { kind: 'readScalarStorage'; snapshotId: string }
   | { kind: 'writeScalarStorage'; profile: 'native-dwarf-scalar-v1'; snapshotId: string; value: ScalarStorageValueV1DTO }
   | { kind: 'writeScalarStorage'; profile: 'native-dwarf-scalar-v2'; snapshotId: string; value: ScalarStorageValueDTO }
+  | { kind: 'writeScalarStorageBatch'; profile: 'native-dwarf-scalar-batch-v1'; edits: ScalarStorageBatchEditDTO[] }
   | { kind: 'readMemoryIntervention'; interventionId: string }
   | { kind: 'listMemoryInterventions'; start: number; count: number }
   | { kind: 'listBranches' }

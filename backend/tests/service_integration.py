@@ -100,7 +100,7 @@ def main() -> int:
                     "sourceBreakpoints", "conditionalBreakpoints", "hitCountBreakpoints", "variableWrite",
                     "inputTracking", "interactiveInput", "expressionGroups", "history", "restore", "asm", "memoryRead", "memoryMap",
                     "eventReplay", "limits", "addressProfiles", "addressPolicies", "processInspection",
-                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "interventionBranches", "recorderProbe", "recordingProfiles", "recordingCursor",
+                    "registerRead", "instructionTrace", "memoryCapture", "memoryMapDiff", "outputJournal", "moduleInspection", "moduleSymbols", "variableLayout", "vtableInspection", "memoryWrite", "memoryWriteBatch", "scalarStorage", "scalarStorageProfiles", "scalarStorageBatch", "interventionBranches", "recorderProbe", "recordingProfiles", "recordingCursor",
                 },
                 "BackendCapabilitiesDTO",
             )
@@ -112,7 +112,7 @@ def main() -> int:
                 caps["limits"],
                 {"maxOutputBytes", "maxHistoryBytes", "maxResidentSnapshots", "maxVariablesPerPage",
                  "maxStringBytes", "maxMemoryReadBytes", "maxInstructionsPerRequest", "maxTraceInstructions",
-                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions", "maxMemoryWriteBytes", "maxMemoryBatchRanges", "maxMemoryBatchBytes", "maxMemoryInterventions", "maxInterventionStoreBytes",
+                 "maxTraceMemoryBytes", "maxCaptureBytes", "maxInspectionStoreBytes", "maxOutputJournalBytesPerStream", "maxOutputJournalReadBytes", "maxRecordedInstructions", "maxMemoryWriteBytes", "maxMemoryBatchRanges", "maxMemoryBatchBytes", "maxScalarStorageBatchItems", "maxScalarStorageBatchBytes", "maxMemoryInterventions", "maxInterventionStoreBytes",
                  "commandTimeoutMs", "replayTimeoutMs"},
                 "ResourceLimitsDTO",
             )

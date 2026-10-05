@@ -127,10 +127,15 @@ class BackendService final {
   Json branches_ = Json::array({{{"id", "main"}, {"parent", nullptr}, {"interventionId", nullptr}}});
   // Session ledger: never silently evicted. Capacity is reserved before writes;
   // a retry returns its original response without repeating events or effects.
-  struct InterventionEntry { Json request; Json response; };
-  std::vector<InterventionEntry> interventions_;
   static constexpr std::size_t maxInterventions = 128;
   static constexpr std::size_t interventionReservation = 32768;
+  static constexpr std::size_t scalarBatchInterventionReservation = 65536;
+  struct InterventionEntry {
+    Json request;
+    Json response;
+    std::size_t reservationBytes = interventionReservation;
+  };
+  std::vector<InterventionEntry> interventions_;
   Json executionLayout_ = nullptr;
   OutputJournal stdoutJournal_, stderrJournal_;
   bool outputJournalConsistent_ = true;

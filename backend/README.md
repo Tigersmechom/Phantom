@@ -113,6 +113,12 @@ protocol capabilities.
   включая signed zero и NaN payload без преобразований в число. Тип,
   адрес и исходные байты проверяются повторно; lifetime остаётся unknown.
   [Типизированный профиль](../docs/INSPECTION_GATEWAYS.md#typed-scalar-storage).
+- `writeScalarStorageBatch` связывает до восьми снимков целых/bool/float/double
+  (64 байта суммарно) с одной пакетной операцией. Типы, адреса и исходные байты
+  проверяются до изменений; адрес каждого изменяемого значения проверяется
+  ещё раз непосредственно перед записью. Аудит содержит значения каждой
+  стадии, включая итоговое чтение после частичного сбоя.
+  [Типизированный пакет](../docs/INSPECTION_GATEWAYS.md#typed-scalar-batches).
 - `variableWrite`, conditional/hit-count breakpoints, rr record/replay,
   expression traces, source disassembly и verified restore выключены и отвечают
   `UNSUPPORTED`. Чтение памяти и disassembly по PC принимают только явный адрес

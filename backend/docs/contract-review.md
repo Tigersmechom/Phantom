@@ -228,7 +228,7 @@ native storage edits and intervention lineage are implemented below (2026-10-05)
 | Output | `OutputJournal`: run/branch/stream, append-only committed byte offsets and retention gaps. `OutputView`: selected point, committed-through offset, separately identified pending snapshots and known/unknown ordering. | Native C/C++ probes and session journal are implemented. Journal retention is independent of history; record-full replay preserves committed bytes and marks unobserved output prefixes unknown. |
 | Execution layout | Implemented ELF/profile plus entry-time personality evidence. A broader manifest must capture runtime dependencies, inherited environment and allocator configuration, then verify rerun behavior. | Equal addresses and the current launch-input fingerprint alone never authorize restore. |
 | Changes inside a step | Implemented forward instruction-boundary trace for selected registers/ranges. Broader `ChangeIntervalPage` adds recorder/profile and semantic operation/thread ordering evidence. | rr or instrumentation must exist before the interval for complete historical queries. Boundary differences, captured stores and semantic assignments remain distinct. |
-| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native single/batched raw-memory and typed integer/bool/float storage profiles. | Typed batches, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
+| Runtime intervention | Implemented `MemoryInterventionDTO`: expected/current bytes, write/readback evidence, resulting stop and lineage branch; bounded dedup ledger. Native single/batched raw-memory and single/batched typed integer/bool/float storage profiles. | Register writes, code/syscall injection, recorder-compatible branches and replay remain separate P5 steps. |
 
 All memory addresses and offsets retain exact string representations; no
 JavaScript-number conversion. Ranges use explicit units: memory/output ranges
@@ -476,3 +476,36 @@ reservation with its request and envelope. Old history, physical output,
 single/typed writes and queued input retain their existing semantics.
 Complete outcomes, null semantics and examples:
 [batch gateway](../../docs/INSPECTION_GATEWAYS.md#batched-memory-interventions).
+
+## 2026-10-05: typed scalar storage batches
+
+`writeScalarStorageBatch{profile:"native-dwarf-scalar-batch-v1",edits}` adds
+1–8 disjoint current-stop scalar snapshots, with 64 total storage bytes or the
+smaller configured memory-read limit. Optional `scalarStorageBatch`,
+`maxScalarStorageBatchItems` and `maxScalarStorageBatchBytes` advertise it.
+Each entry has its own exact snapshot-matching v1/v2 profile and scalar value;
+v1 float remains a type/schema error. Duplicate IDs, aliases, stale contexts,
+unsupported storage and unencodable values cannot cause an earlier write.
+
+All issued targets are re-resolved before the raw batch preflight. Each actual
+write also re-resolves its target immediately before mutation; an earlier edit
+may have changed address/unwind evidence. Changed metadata stops later writes
+while preserving earlier effects. The common sequential batch engine retains
+its non-atomic, no-rollback, stop-on-first-failure behavior and final sampling.
+
+`ScalarStorageBatchInterventionDTO` extends the raw batch shape with a distinct
+profile and indexed `scalars[]` carrying original provenance, requested values
+and four independently decoded phases. Preflight/before/after/final values use
+only their corresponding complete raw bytes, with null for missing/partial or
+invalid scalar representations. Error-bearing complete bytes can be decoded;
+the raw phase's error still governs verification. No observed value is inferred
+from the request or a different phase. Float bits remain exact.
+
+The shared ledger reserves 64 KiB per typed batch and 32 KiB for old profiles,
+enforcing both the sum and 128-entry cap. Serialized provenance is bounded before
+mutation. Whole-request retry identity survives stop changes, inspection-cache
+eviction and debugger death in the same session. Existing single/raw shapes,
+branch/history behavior and stdin/EOF isolation are preserved. Native stopped
+single-thread and private VMA gates still apply; C++ lifetime/assignment and
+record-full interventions remain outside the contract. See
+[typed batch gateway](../../docs/INSPECTION_GATEWAYS.md#typed-scalar-batches).

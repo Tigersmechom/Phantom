@@ -4,7 +4,9 @@
 
 #include <charconv>
 #include <limits>
+#include <set>
 #include <stdexcept>
+#include <vector>
 
 namespace phantom {
 namespace {
@@ -59,31 +61,71 @@ std::vector<Json> BackendService::handleScalarStorage(const Json& request) {
   }
   if (!liveObservation_.is_object() || liveState_.value("phase","") != "stopped")
     return {errorResponse(request,"STALE_CONTEXT","scalar storage requires a stopped native session outside an input wait")};
-  if (kind == "writeScalarStorage") {
-    const auto* saved = find(command.at("snapshotId").get<std::string>());
-    if (!saved) return {errorResponse(request,"HISTORY_EVICTED","scalar storage snapshot is unavailable or evicted")};
-    if (saved->at("profile") != command.at("profile"))
-      return {errorResponse(request,"INVALID_REQUEST","scalar storage profile must match the inspected snapshot")};
-    if (saved->at("point") != liveObservation_.at("point") || saved->at("stop") != liveObservation_.at("stop") ||
-        saved->at("processInstanceId") != processInstanceId_)
-      return {errorResponse(request,"STALE_CONTEXT","scalar storage snapshot does not belong to the current stop")};
-    if (!saved->at("target").at("available").get<bool>() || !saved->at("storage").at("available").get<bool>())
-      return {errorResponse(request,"UNSUPPORTED","snapshot has no supported scalar storage with complete expected bytes")};
-    Json fresh; GdbError error;
-    const auto locator = saved->at("target").at("locator").get<std::string>();
-    if (!engine_->inspectScalarStorage(locator,fresh,error)) return engineError(request,error);
-    if (fresh != saved->at("target"))
-      return {errorResponse(request,"STALE_CONTEXT","scalar type or storage metadata changed since inspection")};
-    std::string replacement, reason;
-    if (!encodeScalarStorage(fresh.at("scalar"),command.at("value"),replacement,reason))
-      return {errorResponse(request,"INVALID_REQUEST","scalar value cannot be encoded: " + reason)};
+  if (kind == "writeScalarStorage" || kind == "writeScalarStorageBatch") {
+    const bool batch = kind == "writeScalarStorageBatch";
+    const Json entries = batch ? command.at("edits") : Json::array({command});
+    if (!entries.is_array() || entries.empty() || entries.size() > 8)
+      return {errorResponse(request,"INVALID_REQUEST","scalar batches require 1..8 snapshots")};
+    Json memoryEdits = Json::array(), scalars = Json::array();
+    std::set<std::string> snapshots;
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> ranges;
+    std::size_t totalBytes = 0;
+    for (const auto& entry : entries) {
+      const auto snapshotId = entry.at("snapshotId").get<std::string>();
+      if (!snapshots.insert(snapshotId).second)
+        return {errorResponse(request,"INVALID_REQUEST","scalar batch snapshot IDs must be unique")};
+      const auto* saved = find(snapshotId);
+      if (!saved) return {errorResponse(request,"HISTORY_EVICTED","scalar storage snapshot is unavailable or evicted")};
+      if (saved->at("profile") != entry.at("profile"))
+        return {errorResponse(request,"INVALID_REQUEST","scalar storage profile must match the inspected snapshot")};
+      if (saved->at("point") != liveObservation_.at("point") || saved->at("stop") != liveObservation_.at("stop") ||
+          saved->at("processInstanceId") != processInstanceId_)
+        return {errorResponse(request,"STALE_CONTEXT","scalar storage snapshot does not belong to the current stop")};
+      if (!saved->at("target").at("available").get<bool>() || !saved->at("storage").at("available").get<bool>())
+        return {errorResponse(request,"UNSUPPORTED","snapshot has no supported scalar storage with complete expected bytes")};
+      Json fresh; GdbError error;
+      const auto locator = saved->at("target").at("locator").get<std::string>();
+      if (!engine_->inspectScalarStorage(locator,fresh,error)) return engineError(request,error);
+      if (fresh != saved->at("target"))
+        return {errorResponse(request,"STALE_CONTEXT","scalar type or storage metadata changed since inspection")};
+      std::string replacement, reason;
+      if (!encodeScalarStorage(fresh.at("scalar"),entry.at("value"),replacement,reason))
+        return {errorResponse(request,"INVALID_REQUEST","scalar value cannot be encoded: " + reason)};
+      const auto& expected = saved->at("storage").at("bytesHex");
+      if (!expected.is_string() || expected.get_ref<const std::string&>().size() != replacement.size()*2)
+        return {errorResponse(request,"UNSUPPORTED","snapshot does not contain complete scalar storage bytes")};
+      const auto address = addressValue(fresh.at("addressHex"));
+      if (replacement.empty() || replacement.size() > 8 || address > UINT64_MAX-replacement.size())
+        return {errorResponse(request,"UNSUPPORTED","scalar storage extent is unavailable")};
+      const auto end = address+replacement.size();
+      for (const auto& [start,limit] : ranges)
+        if (address < limit && start < end)
+          return {errorResponse(request,"INVALID_REQUEST","scalar batch snapshots must refer to disjoint storage")};
+      ranges.emplace_back(address,end);
+      totalBytes += replacement.size();
+      if (totalBytes > 64 || totalBytes > options_.limits.maxMemoryReadBytes)
+        return {errorResponse(request,"LIMIT_EXCEEDED","scalar edits exceed the configured batch byte limit")};
+      memoryEdits.push_back({{"addressHex",fresh.at("addressHex")},{"expectedBytesHex",expected},
+        {"replacementBytesHex",bytesHex(replacement)}});
+      Json scalar = {{"snapshotId",saved->at("id")},{"locator",locator},{"target",std::move(fresh)},
+        {"requestedValue",entry.at("value")},{"beforeValue",nullptr},{"afterValue",nullptr}};
+      if (batch) {
+        scalar["index"] = scalars.size(); scalar["profile"] = saved->at("profile");
+        scalar["preflightValue"] = nullptr; scalar["finalValue"] = nullptr;
+      }
+      scalars.push_back(std::move(scalar));
+    }
     // The original public request reaches the common ledger unchanged. Its
-    // issued snapshot binds type/address/expected bytes; the raw write path
-    // still checks maps, compares bytes and records any partial effect.
-    Json prepared = {{"memoryCommand",{{"kind","writeMemory"},{"addressHex",fresh.at("addressHex")},
-      {"expectedBytesHex",saved->at("storage").at("bytesHex")},{"replacementBytesHex",bytesHex(replacement)}}},
-      {"scalar",{{"snapshotId",saved->at("id")},{"locator",locator},{"target",fresh},
-        {"requestedValue",command.at("value")},{"beforeValue",nullptr},{"afterValue",nullptr}}}};
+    // issued snapshots bind type/address/expected bytes. Every entry has been
+    // validated before the common raw path can compare or mutate any range.
+    Json prepared;
+    if (batch) prepared = {{"memoryCommand",{{"kind","writeMemoryBatch"},{"edits",std::move(memoryEdits)}}},
+                            {"scalars",std::move(scalars)}};
+    else {
+      auto memoryCommand = std::move(memoryEdits.front());
+      memoryCommand["kind"] = "writeMemory";
+      prepared = {{"memoryCommand",std::move(memoryCommand)},{"scalar",std::move(scalars.front())}};
+    }
     return handleMemoryIntervention(request,prepared);
   }
 

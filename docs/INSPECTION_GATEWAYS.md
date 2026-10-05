@@ -34,6 +34,7 @@ Include the current `protocolVersion`, unique `requestId`, `workspace` and
 | `readScalarStorage` | No | Read an immutable scalar storage snapshot. |
 | `writeMemory` | Required | Compare, write and verify bounded native storage bytes; retain intervention provenance. |
 | `writeMemoryBatch` | Required | Preflight disjoint ranges, apply in request order and retain partial/final evidence as one intervention. |
+| `writeScalarStorageBatch` | Required | Bind every scalar snapshot/type/address, then apply checked disjoint storage edits with per-phase values. |
 | `readMemoryIntervention` / `listMemoryInterventions` / `listBranches` | No | Read session intervention audits and branch ancestry. |
 | `readOutputJournal` | No | Read retained physical output bytes and gaps. |
 | `probeRecorders` | No | Exercise a separate supplied fixture; no live session is required. |
@@ -507,8 +508,10 @@ rejected. Event subscribers use sequence/replay as usual; a duplicate reply's
 `throughSequence` does not promise a second event delivery. No guarantee
 survives backend restart or a new session.
 
-The ledger is separate from evictable inspections: at most 128 records, with
-32 KiB reserved per record and `maxInterventionStoreBytes` (4 MiB default).
+The ledger is separate from evictable inspections: at most 128 records and
+`maxInterventionStoreBytes` (4 MiB default). Single writes and raw batches reserve
+32 KiB each; typed scalar batches reserve 64 KiB each. Mixed operations consume
+the sum of their reservations, so 64 typed batches fill the default byte budget.
 Encoded write requests are limited to 4096 bytes. A full ledger rejects new
 operations before writing; IDs are never silently evicted. Comparison
 conflicts/no-ops also occupy records. A successful new launch or workspace
@@ -611,8 +614,8 @@ the audit reservation. `readMemoryIntervention`, `listMemoryInterventions` and
 `listBranches` expose raw, typed and batch interventions together. A retry after
 a partial failure, changed stop or dead debugger returns the original audit
 without another write. Backend restart/new-session durability is not implied.
-This is a raw-storage gateway; typed multi-value assignment and object lifetime
-remain separate work.
+This is a raw-storage gateway. Typed storage batches are described below;
+C++ assignment semantics and object lifetime remain separate work.
 
 ## Typed scalar storage
 
@@ -733,3 +736,89 @@ An externally changed value at the same stop causes a byte conflict, not an
 unconditional overwrite. C++ assignment semantics, object initialization,
 alternate-future restoration and language side effects
 remain outside this storage profile.
+
+## Typed scalar batches
+
+`capabilities.scalarStorageBatch = "native-dwarf-scalar-batch-v1"` enables
+`writeScalarStorageBatch` with the current session and `expectedStop`:
+
+```json
+{
+  "kind": "writeScalarStorageBatch",
+  "profile": "native-dwarf-scalar-batch-v1",
+  "edits": [
+    {
+      "profile": "native-dwarf-scalar-v1",
+      "snapshotId": "scalar-1",
+      "value": {"kind":"integer","decimal":"42","bits":32,"signed":true}
+    },
+    {
+      "profile": "native-dwarf-scalar-v2",
+      "snapshotId": "scalar-2",
+      "value": {"kind":"float","bits":64,"rawBitsHex":"8000000000000000"}
+    }
+  ]
+}
+```
+
+Obtain each snapshot through `inspectScalarStorage` at the same live stop.
+The batch profile is distinct from each item's scalar profile; v1 and v2 may
+coexist, but each item must match its issued snapshot's profile exactly. V1
+still rejects floating-point values. Scalar encodings, qualifiers and type
+restrictions are unchanged. There are no implicit conversions.
+
+Limits are `maxScalarStorageBatchItems` (8) and `maxScalarStorageBatchBytes`
+(64, or the smaller configured memory-read limit). Empty batches, duplicate
+snapshot IDs, and distinct snapshots whose storage overlaps are rejected.
+Adjacent storage and unsorted addresses are allowed; request order is preserved.
+Before any write, every snapshot must be retained, available and bound to the
+current point/stop/process. Every locator's GDB type/address is resolved again,
+every replacement is encoded, and all mappings and original bytes are checked.
+Invalid metadata/value requests fail without creating an intervention;
+byte-comparison failures retain a `preflight-failed` intervention with no writes.
+
+The common batch engine then performs fresh per-item compare/write/readback and
+final sampling of all ranges. Immediately before each actual write, GDB resolves
+that item's type/address **again**: an earlier write might have changed evidence
+used to locate a later variable. Changed metadata stops execution before that
+write, retaining earlier effects. The raw execution report records this as
+`write-rejected`, `writeAttempted:false`, with a `STALE_CONTEXT` error. Missing
+metadata has its own error. This adds a storage-location check; it does not prove
+C++ lifetime, exclude external interference or make the package atomic.
+
+The response remains `memoryIntervention`, with
+`profile:"native-dwarf-scalar-batch-v1"`, `mappings[]`, the existing
+`MemoryBatchReportDTO`, and `scalars[]` aligned by `index` with `report.items[]`.
+Each scalar records its original `snapshotId`, `profile`, `locator`, `target`
+metadata and `requestedValue`, plus four independently decoded values:
+
+| Field | Raw evidence used |
+| --- | --- |
+| `preflightValue` | `report.items[index].preflight.bytesHex` |
+| `beforeValue` | `report.items[index].execution.beforeBytesHex` |
+| `afterValue` | `report.items[index].execution.afterBytesHex` |
+| `finalValue` | `report.items[index].final.bytesHex` |
+
+Absent phases, partial reads and invalid scalar representations yield `null`.
+A complete byte sequence can have a decoded value alongside a read error;
+inspect the raw phase's error/comparison fields to determine verification.
+Final bytes never fill in missing immediate readback. All-no-op batches have
+before/preflight values but null after/final values because no post-write reads
+were needed. Float values preserve exact bits, including signaling NaN payloads.
+
+Native execution, one stopped thread, ordinary `stopped` phase and the same
+private writable non-executable VMA gates apply. Input waits and record-full
+writes remain unsupported. The operation neither executes program code nor
+delivers queued stdin/EOF. Any attempted write creates one branch and one
+refreshed stop for the entire package; all older observations/snapshots remain
+immutable. A partial failure is retained without automatic rollback or retry.
+
+Typed batches reserve 64 KiB in the shared non-evicting ledger. Serialized
+metadata is checked before mutation; the reservation includes the original
+request (at most 4096 bytes), raw report, provenance, decoded phases and response
+envelope. The total byte budget and 128-record limit still apply across all
+profiles. An identical whole-request retry returns the same audit after stop
+changes, snapshot eviction or debugger death. A fresh request needs a current
+context and enough remaining ledger capacity. The ordinary single-scalar and
+raw-batch response shapes are unchanged. This API writes verified storage;
+`variableWrite` remains false until C++ assignment/lifetime guarantees exist.

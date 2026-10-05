@@ -386,6 +386,63 @@ int main() {
     gateway["command"] = floatCommand; gateway["command"]["value"].erase(key);
     assert(validation_fails(gateway,"INVALID_REQUEST"));
   }
+  auto scalarItem = scalarCommand; scalarItem.erase("kind");
+  auto floatItem = floatCommand; floatItem.erase("kind"); floatItem["snapshotId"] = "scalar-2";
+  const Json scalarBatchCommand = {{"kind","writeScalarStorageBatch"},{"profile","native-dwarf-scalar-batch-v1"},
+    {"edits",Json::array({scalarItem,floatItem})}};
+  gateway["command"] = scalarBatchCommand;
+  assert(!validation_fails(gateway));
+  auto missingScalarBatchStop = gateway; missingScalarBatchStop.erase("expectedStop");
+  assert(validation_fails(missingScalarBatchStop,"INVALID_REQUEST"));
+  for (const auto& entries : Json::array({nullptr,true,1,"snapshots",Json::object(),Json::array()})) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["edits"] = entries;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto& entry : Json::array({nullptr,false,1,"scalar-1",Json::array(),Json::object()})) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1] = entry;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"profile","snapshotId","value"}) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1].erase(key);
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* key : {"kind","addressHex","expectedBytesHex","locator","index"}) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1][key] = "forged";
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  for (const auto* profile : {"native-private-memory-batch-v1","native-dwarf-scalar-v2","auto"}) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["profile"] = profile;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1]["profile"] = "native-dwarf-scalar-v1";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1]["snapshotId"] = "scalar-1";
+  assert(validation_fails(gateway,"INVALID_REQUEST"));
+  for (const auto& value : Json::array({
+      {{"kind","boolean"},{"value",1}},
+      {{"kind","integer"},{"bits",64},{"signed",false},{"decimal","00"}},
+      {{"kind","integer"},{"bits",64.0},{"signed",true},{"decimal","1"}},
+      {{"kind","float"},{"bits",32},{"rawBitsHex","7F800000"}},
+      {{"kind","float"},{"bits",32},{"rawBitsHex",0}},
+      {{"kind","float"},{"bits",64},{"rawBitsHex","00000000"}},
+      {{"kind","float"},{"bits",32},{"rawBitsHex","80000000"},{"text","-0"}}
+    })) {
+    gateway["command"] = scalarBatchCommand; gateway["command"]["edits"][1]["value"] = value;
+    assert(validation_fails(gateway,"INVALID_REQUEST"));
+  }
+  gateway["command"] = scalarBatchCommand;
+  gateway["command"]["edits"][0]["value"] = {{"kind","boolean"},{"value",false}};
+  assert(!validation_fails(gateway));
+  Json eightScalars = Json::array();
+  for (unsigned i=0; i<8; ++i) {
+    auto entry = scalarItem; entry["snapshotId"] = "scalar-"+std::to_string(i+1);
+    eightScalars.push_back(entry);
+  }
+  gateway["command"] = scalarBatchCommand; gateway["command"]["edits"] = eightScalars;
+  assert(!validation_fails(gateway)); // 8 exact 64-bit values, 64 bytes.
+  auto ninth = scalarItem; ninth["snapshotId"] = "scalar-9";
+  gateway["command"]["edits"].push_back(ninth);
+  assert(validation_fails(gateway,"LIMIT_EXCEEDED"));
   gateway.erase("expectedStop"); gateway["command"] = {{"kind","readScalarStorage"},{"snapshotId","scalar-1"}};
   assert(!validation_fails(gateway));
   // A configured smaller budget must be advertised and rejected before
@@ -404,6 +461,11 @@ int main() {
   gateway["command"]["edits"][1]["replacementBytesHex"] = std::string(34,'f');
   try { phantom::validate_request(gateway,small); assert(false); }
   catch (const ValidationError& e) { assert(e.code == "LIMIT_EXCEEDED"); }
+  gateway["command"] = scalarBatchCommand; gateway["command"]["edits"] = eightScalars;
+  try { phantom::validate_request(gateway,small); assert(false); }
+  catch (const ValidationError& e) { assert(e.code == "LIMIT_EXCEEDED"); }
+  gateway["command"]["edits"].erase(gateway["command"]["edits"].begin()+4,gateway["command"]["edits"].end());
+  phantom::validate_request(gateway,small);
   Json trace = append;
   trace["command"] = {{"kind","traceInstructions"},{"count",16},{"memoryRanges",Json::array()}};
   phantom::validate_request(trace, small);
@@ -426,6 +488,8 @@ int main() {
     assert(budgets.at("maxCaptureBytes") == 32);
     assert(budgets.at("maxMemoryBatchRanges") == 8);
     assert(budgets.at("maxMemoryBatchBytes") == 32);
+    assert(budgets.at("maxScalarStorageBatchItems") == 8);
+    assert(budgets.at("maxScalarStorageBatchBytes") == 32);
   }
   std::filesystem::remove_all(directory);
   std::cout << "validation tests passed\n";

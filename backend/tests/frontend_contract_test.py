@@ -34,6 +34,8 @@ import memory_batch_integration
 import memory_batch_failure_integration
 import scalar_storage_integration
 import scalar_storage_failure_integration
+import scalar_batch_integration
+import scalar_batch_failure_integration
 import float_storage_integration
 import float_storage_failure_integration
 
@@ -123,6 +125,9 @@ def capture(executable: Path, module_library: Path | None = None) -> list[tuple[
     if capabilities.get("scalarStorage") == "native-dwarf-scalar-v1":
         scenarios.append((scalar_storage_integration, []))
         scenarios.append((scalar_storage_failure_integration, []))
+    if capabilities.get("scalarStorageBatch") == "native-dwarf-scalar-batch-v1":
+        scenarios.append((scalar_batch_integration, []))
+        scenarios.append((scalar_batch_failure_integration, []))
     if "native-dwarf-scalar-v2" in capabilities.get("scalarStorageProfiles", []):
         scenarios.append((float_storage_integration, []))
         scenarios.append((float_storage_failure_integration, []))
@@ -169,6 +174,8 @@ def typecheck_source(traffic: list[tuple[str, dict]]) -> tuple[str, dict[str, in
         'const legacyFloat = {kind:"writeScalarStorage",profile:"native-dwarf-scalar-v1",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:"80000000"}} satisfies BackendRequestDTO["command"];',
         '// @ts-expect-error a host number cannot preserve NaN payload/signaling bits',
         'const numericFloat = {kind:"writeScalarStorage",profile:"native-dwarf-scalar-v2",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:0}} satisfies BackendRequestDTO["command"];',
+        '// @ts-expect-error each batch item retains its scalar profile restriction',
+        'const legacyBatchFloat = {kind:"writeScalarStorageBatch",profile:"native-dwarf-scalar-batch-v1",edits:[{profile:"native-dwarf-scalar-v1",snapshotId:"test",value:{kind:"float",bits:32,rawBitsHex:"80000000"}}]} satisfies BackendRequestDTO["command"];',
     ]
     counts: dict[str, int] = {}
     for index, (direction, frame) in enumerate(traffic):

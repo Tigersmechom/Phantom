@@ -56,6 +56,42 @@ void enum_string(const Json& j, std::string_view p, std::initializer_list<std::s
 }
 void array_limit(const Json& j, std::string_view p, std::size_t n) { expect_array(j,p); if (j.size() > n) limit(std::string(p), "array exceeds configured limit"); }
 
+std::size_t scalar_storage_edit(const Json& entry, const std::string& path, const ValidationLimits& limits) {
+  enum_string(req(entry,"profile",path),path+".profile",{"native-dwarf-scalar-v1","native-dwarf-scalar-v2"});
+  id(req(entry,"snapshotId",path),path+".snapshotId",limits);
+  const auto& value = req(entry,"value",path);
+  const auto valuePath = path+".value";
+  enum_string(req(value,"kind",valuePath),valuePath+".kind",{"integer","boolean","float"});
+  if (value.at("kind") == "float") {
+    if (entry.at("profile") != "native-dwarf-scalar-v2")
+      invalid(path+".profile","exact floating-point storage requires native-dwarf-scalar-v2");
+    exact_keys(value,{"kind","bits","rawBitsHex"},valuePath);
+    const auto& bits = req(value,"bits",valuePath);
+    safe_uint(bits,valuePath+".bits",64);
+    if (bits != 32 && bits != 64)
+      invalid(valuePath+".bits","only binary32 and binary64 are supported");
+    const auto& raw = req(value,"rawBitsHex",valuePath);
+    string_value(raw,valuePath+".rawBitsHex",16);
+    const auto& hex = raw.get_ref<const std::string&>();
+    if (hex.size() != bits.get<unsigned>()/4 || hex.find_first_not_of("0123456789abcdef") != std::string::npos)
+      invalid(valuePath+".rawBitsHex","expected fixed-width lowercase hexadecimal bits without a prefix");
+    return bits.get<unsigned>()/8;
+  }
+  if (value.at("kind") == "integer") {
+    string_value(req(value,"decimal",valuePath),valuePath+".decimal",20);
+    const auto& decimal = value.at("decimal").get_ref<const std::string&>();
+    const auto digits = std::string_view(decimal).substr(decimal.front() == '-' ? 1 : 0);
+    if (digits.empty() || (digits.front() == '0' && decimal != "0"))
+      invalid(valuePath+".decimal","expected canonical decimal integer");
+    const auto& bits = req(value,"bits",valuePath);
+    safe_uint(bits,valuePath+".bits",64);
+    if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
+      invalid(valuePath+".bits","only 8, 16, 32 and 64 bit integers are supported");
+  }
+  validate_scalar_value(value,limits);
+  return value.at("kind") == "boolean" ? 1 : value.at("bits").get<unsigned>()/8;
+}
+
 std::pair<std::uint64_t,std::uint64_t> memory_edit_range(const Json& range,
     const std::string& path, const ValidationLimits& limits) {
   const auto& address = req(range,"addressHex",path);
@@ -298,7 +334,7 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   if (has(r, "expectedStop")) stop(r["expectedStop"], l);
   const auto& c = req(r, "command", "request"); string_value(req(c, "kind", "command"), "command.kind", 64);
   const std::string kind = c.at("kind").get<std::string>();
-  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
+  if ((kind == "step" || kind == "continue" || kind == "readVariables" || kind == "writeVariable" || kind == "inspectScalarStorage" || kind == "writeScalarStorage" || kind == "writeScalarStorageBatch" || kind == "writeMemory" || kind == "writeMemoryBatch" || kind == "readMemory" || kind == "appendInput" || kind == "closeInput" || kind == "readRecording" || kind == "seekRecording" || kind == "reverseInstruction" || kind == "inspectModuleSymbols" || kind == "inspectVariableLayout" || kind == "inspectVtable" || kind == "inspectModules" || kind == "inspectProcess" || kind == "readRegisters" || kind == "captureMemory" || kind == "traceInstructions") && !has(r, "expectedStop"))
     invalid("request.expectedStop", "required for this live-process command");
   auto only = [&](std::initializer_list<std::string_view> allowed) { std::set<std::string> a; for (auto k : allowed) a.emplace(k); for (auto it = c.begin(); it != c.end(); ++it) if (!a.count(it.key())) invalid("command." + it.key(), "field not allowed for this command"); };
   if (kind == "listBranches" || kind == "capabilities" || kind == "continue" || kind == "pause" || kind == "stop" || kind == "getState" || kind == "inspectProcess" || kind == "inspectModules" || kind == "probeRecorders" || kind == "readRecording" || kind == "reverseInstruction") { only({"kind"}); return; }
@@ -348,37 +384,26 @@ void validate_request(const Json& r, const ValidationLimits& l) {
   }
   if (kind == "writeScalarStorage") {
     only({"kind","profile","snapshotId","value"});
-    enum_string(req(c,"profile","command"),"command.profile",{"native-dwarf-scalar-v1","native-dwarf-scalar-v2"});
-    id(req(c,"snapshotId","command"),"command.snapshotId",l);
-    const auto& value = req(c,"value","command");
-    enum_string(req(value,"kind","command.value"),"command.value.kind",{"integer","boolean","float"});
-    if (value.at("kind") == "float") {
-      if (c.at("profile") != "native-dwarf-scalar-v2")
-        invalid("command.profile","exact floating-point storage requires native-dwarf-scalar-v2");
-      exact_keys(value,{"kind","bits","rawBitsHex"},"command.value");
-      const auto& bits = req(value,"bits","command.value");
-      safe_uint(bits,"command.value.bits",64);
-      if (bits != 32 && bits != 64)
-        invalid("command.value.bits","only binary32 and binary64 are supported");
-      const auto& raw = req(value,"rawBitsHex","command.value");
-      string_value(raw,"command.value.rawBitsHex",16);
-      const auto& hex = raw.get_ref<const std::string&>();
-      if (hex.size() != bits.get<unsigned>()/4 || hex.find_first_not_of("0123456789abcdef") != std::string::npos)
-        invalid("command.value.rawBitsHex","expected fixed-width lowercase hexadecimal bits without a prefix");
-      return;
+    scalar_storage_edit(c,"command",l); return;
+  }
+  if (kind == "writeScalarStorageBatch") {
+    only({"kind","profile","edits"});
+    enum_string(req(c,"profile","command"),"command.profile",{"native-dwarf-scalar-batch-v1"});
+    const auto& edits = req(c,"edits","command");
+    array_limit(edits,"command.edits",8);
+    if (edits.empty()) invalid("command.edits","at least one scalar snapshot is required");
+    std::set<std::string> snapshots;
+    std::size_t bytes = 0;
+    for (std::size_t i=0; i<edits.size(); ++i) {
+      const auto path = "command.edits["+std::to_string(i)+"]";
+      exact_keys(edits[i],{"profile","snapshotId","value"},path);
+      bytes += scalar_storage_edit(edits[i],path,l);
+      if (!snapshots.insert(edits[i].at("snapshotId").get<std::string>()).second)
+        invalid(path+".snapshotId","duplicate scalar snapshot ID");
+      if (bytes > std::min<std::size_t>(64,l.maxMemoryReadBytes))
+        limit("command.edits","total scalar storage batch byte limit exceeded");
     }
-    if (value.at("kind") == "integer") {
-      string_value(req(value,"decimal","command.value"),"command.value.decimal",20);
-      const auto& decimal = value.at("decimal").get_ref<const std::string&>();
-      const auto digits = std::string_view(decimal).substr(decimal.front() == '-' ? 1 : 0);
-      if (digits.empty() || (digits.front() == '0' && decimal != "0"))
-        invalid("command.value.decimal","expected canonical decimal integer");
-      const auto& bits = req(value,"bits","command.value");
-      safe_uint(bits,"command.value.bits",64);
-      if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
-        invalid("command.value.bits","only 8, 16, 32 and 64 bit integers are supported");
-    }
-    validate_scalar_value(value,l); return;
+    return;
   }
   if (kind == "writeMemory") {
     only({"kind","profile","addressHex","expectedBytesHex","replacementBytesHex"});

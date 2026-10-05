@@ -554,8 +554,30 @@ export interface ScalarStorageInterventionDTO<
   beforeValue: V | null;
   afterValue: V | null;
 }
+export type ScalarStorageBatchEditDTO =
+  | { profile: 'native-dwarf-scalar-v1'; snapshotId: string; value: ScalarStorageValueV1DTO }
+  | { profile: 'native-dwarf-scalar-v2'; snapshotId: string; value: ScalarStorageValueDTO };
+/** Each value decodes only its corresponding raw phase's complete bytes.
+ *  Null also covers invalid scalar representation; never infer lifetime. */
+export type ScalarStorageBatchItemDTO = { index: number } & (
+  | (ScalarStorageInterventionDTO<ScalarStorageValueV1DTO, ScalarStorageTypeV1DTO> & {
+      profile: 'native-dwarf-scalar-v1';
+      preflightValue: ScalarStorageValueV1DTO | null;
+      finalValue: ScalarStorageValueV1DTO | null;
+    })
+  | (ScalarStorageInterventionDTO & {
+      profile: 'native-dwarf-scalar-v2';
+      preflightValue: ScalarStorageValueDTO | null;
+      finalValue: ScalarStorageValueDTO | null;
+    })
+);
+export interface ScalarStorageBatchInterventionDTO extends Omit<MemoryBatchInterventionDTO, 'profile'> {
+  profile: 'native-dwarf-scalar-batch-v1';
+  /** Aligned by index with report.items and mappings. */
+  scalars: ScalarStorageBatchItemDTO[];
+}
 export type MemoryInterventionDTO = (MemoryInterventionBaseDTO & (
   | { profile: 'native-private-memory-v1'; scalar?: never }
   | { profile: 'native-dwarf-scalar-v1'; scalar: ScalarStorageInterventionDTO<ScalarStorageValueV1DTO, ScalarStorageTypeV1DTO> }
   | { profile: 'native-dwarf-scalar-v2'; scalar: ScalarStorageInterventionDTO }
-)) | MemoryBatchInterventionDTO;
+)) | MemoryBatchInterventionDTO | ScalarStorageBatchInterventionDTO;
